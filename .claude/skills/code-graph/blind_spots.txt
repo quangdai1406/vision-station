@@ -1,0 +1,6 @@
+`station/app.py` builds everything (Store, Outbox, StationSession, MesClient, UI) from a config dict; most collaborators are passed in, so imports under-report who talks to whom.
+`StationSession` is duck-typed against its store, outputs, cameras and model (Protocols in `station/contracts.py`); a new driver needs no import edge.
+`session.snapshot()` and the page script in `station/ui.py` agree on dict keys (`verdict`, `images[].b64`, ...) with no import between them. Change both together; `tests/test_ui.py` and `tests/test_e2e.py` guard it.
+`tools/FORMAT.md` is the contract between `tools/capture.py` (writer) and `tools/report.py` / `tools/analysis.py` (readers): session.json keys and the npz layout.
+The MES endpoint `/api/machine/inspection-events` lives in the AISI_MES repo (`docs/vision-station-integration.md` there); `station/mes_client.py` mirrors it as plain text.
+Config keys are plain strings in `config.example.json` and `station/app.py`.
