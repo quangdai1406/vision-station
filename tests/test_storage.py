@@ -204,6 +204,101 @@ class TestSavePart(StoreTestCase):
             self.assertEqual(self.store.verify_part(path), [])
 
 
+def make_pairs_record(pairs, session_id="S-P1", part_id="P-P1", final=Verdict.GOOD):
+    """A PartRecord whose frames/results are exactly the given (camera, side) pairs."""
+    frames, results = [], []
+    for seq, (cam, side) in enumerate(pairs):
+        frames.append(
+            Frame(
+                camera_id=cam,
+                side=side,
+                seq=seq,
+                timestamp_utc=STARTED,
+                data=f"{session_id}-{cam}-{side.value}-{seq}".encode() * 40,
+                ext="png",
+            )
+        )
+        results.append(ImageResult(camera_id=cam, side=side, score=0.1))
+    return make_record(session_id, part_id, final, frames=frames, results=results)
+
+
+ONE_CAMERA = [("C1", Side.TOP), ("C1", Side.BOTTOM)]
+
+
+class TestPartialStation(StoreTestCase):
+    def setUp(self):
+        super().setUp()
+        self.partial = Store(self.root, allow_partial=True)
+
+    def test_default_store_rejects_two_frames(self):
+        with self.assertRaises(ValueError):
+            self.store.save_part(make_pairs_record(ONE_CAMERA))
+
+    def test_partial_saves_one_camera_part(self):
+        path = self.partial.save_part(make_pairs_record(ONE_CAMERA))
+        self.assertEqual(path, self.root / "store" / "L1" / "2026" / "10" / "23" / "P-P1")
+        self.assertEqual(
+            {p.name for p in path.iterdir()},
+            {
+                "SITE_L1_20261023_083012_P-P1_C1_TOP.png",
+                "SITE_L1_20261023_083012_P-P1_C1_BOTTOM.png",
+                "part.json",
+                "manifest.sha256",
+            },
+        )
+        doc = json.loads((path / "part.json").read_text(encoding="utf-8"))
+        self.assertEqual(doc["camera_count"], 1)
+        self.assertIs(doc["partial_station"], True)
+        self.assertEqual(len(doc["images"]), 2)
+        self.assertEqual(self.partial.verify_part(path), [])
+
+    def test_four_camera_part_is_not_partial(self):
+        path = self.partial.save_part(make_record())
+        doc = json.loads((path / "part.json").read_text(encoding="utf-8"))
+        self.assertEqual(doc["camera_count"], 4)
+        self.assertIs(doc["partial_station"], False)
+        self.assertEqual(self.partial.verify_part(path), [])
+
+    def test_default_part_json_has_new_keys(self):
+        path = self.store.save_part(make_record())
+        doc = json.loads((path / "part.json").read_text(encoding="utf-8"))
+        self.assertEqual(doc["camera_count"], 4)
+        self.assertIs(doc["partial_station"], False)
+
+    def test_partial_idempotent_second_save(self):
+        first = self.partial.save_part(make_pairs_record(ONE_CAMERA))
+        before = (first / "part.json").read_bytes()
+        second = self.partial.save_part(make_pairs_record(ONE_CAMERA, final=Verdict.BAD))
+        self.assertEqual(first, second)
+        self.assertEqual((second / "part.json").read_bytes(), before)
+        self.assertEqual(self.partial.counters()["total"], 1)
+
+    def test_rejected_shapes(self):
+        cases = {
+            "duplicate pair": [("C1", Side.TOP), ("C1", Side.TOP),
+                               ("C1", Side.BOTTOM), ("C1", Side.BOTTOM)],
+            "unequal TOP/BOTTOM sets": [("C1", Side.TOP), ("C2", Side.TOP),
+                                        ("C1", Side.BOTTOM), ("C3", Side.BOTTOM)],
+            "odd count": [("C1", Side.TOP), ("C1", Side.BOTTOM), ("C2", Side.TOP)],
+            "empty": [],
+            "ten frames": [(f"C{i}", s) for i in range(1, 6) for s in (Side.TOP, Side.BOTTOM)],
+        }
+        for name, pairs in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError):
+                    self.partial.save_part(make_pairs_record(pairs, session_id=f"S-{name}"))
+        self.assertEqual(self.partial.counters()["total"], 0)
+
+    def test_partial_results_must_match_frames(self):
+        rec = make_pairs_record(ONE_CAMERA)
+        rec.results = [
+            ImageResult(camera_id="C2", side=Side.TOP, score=0.1),
+            ImageResult(camera_id="C1", side=Side.BOTTOM, score=0.1),
+        ]
+        with self.assertRaises(ValueError):
+            self.partial.save_part(rec)
+
+
 class TestEventsAndQueries(StoreTestCase):
     def test_events_cannot_be_updated_or_deleted(self):
         event_id = self.store.append_event("test", {"a": 1}, session_id="S-1")

@@ -157,6 +157,41 @@ class FuseTests(unittest.TestCase):
     def test_good_reason_text(self):
         self.assertEqual(fuse(all_good_part(), TH).reason, "no image above T_low")
 
+    def test_expected_two_accepts_one_camera_part(self):
+        results = [img("C1", 0.0, Side.TOP), img("C1", 0.0, Side.BOTTOM)]
+        pv = fuse(results, TH, expected=2)
+        self.assertIs(pv.verdict, Verdict.GOOD)
+        self.assertEqual(pv.results, tuple(results))
+
+    def test_expected_two_still_fuses_bad_and_review(self):
+        bad = [img("C1", 0.0, Side.TOP), img("C1", 0.9, Side.BOTTOM)]
+        self.assertIs(fuse(bad, TH, expected=2).verdict, Verdict.BAD)
+        review = [img("C1", 0.5, Side.TOP), img("C1", 0.0, Side.BOTTOM)]
+        self.assertIs(fuse(review, TH, expected=2).verdict, Verdict.REVIEW)
+
+    def test_expected_two_rejects_eight_results(self):
+        with self.assertRaises(ValueError):
+            fuse(all_good_part(), TH, expected=2)
+
+    def test_default_rejects_two_results(self):
+        results = [img("C1", 0.0, Side.TOP), img("C1", 0.0, Side.BOTTOM)]
+        with self.assertRaises(ValueError):
+            fuse(results, TH)
+
+    def test_expected_odd_or_small_rejected(self):
+        results = all_good_part()
+        for bad_expected in (0, 1, 3, 5, 7, -2):
+            with self.subTest(expected=bad_expected):
+                with self.assertRaises(ValueError):
+                    fuse(results[:bad_expected] if bad_expected > 0 else [], TH,
+                         expected=bad_expected)
+
+    def test_expected_non_int_rejected(self):
+        for bad in (2.0, "2", None, True):
+            with self.subTest(expected=bad):
+                with self.assertRaises(ValueError):
+                    fuse(all_good_part()[:2], TH, expected=bad)
+
 
 class ThresholdsTests(unittest.TestCase):
     def test_t_low_above_t_img_raises(self):

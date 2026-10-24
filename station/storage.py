@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from typing import Iterator
 
 from station.contracts import (
+    CAMERA_IDS,
     IMAGES_PER_PART,
     PartRecord,
     Side,
@@ -146,10 +147,19 @@ def _insert_rows(conn: sqlite3.Connection, doc: dict, path: str) -> None:
 
 
 class Store:
-    def __init__(self, root: pathlib.Path, site: str = "SITE", line: str = "L1") -> None:
+    def __init__(
+        self,
+        root: pathlib.Path,
+        site: str = "SITE",
+        line: str = "L1",
+        allow_partial: bool = False,
+    ) -> None:
+        # allow_partial is for proof-of-concept stations with fewer than 4
+        # cameras only. The default keeps the 8-image, 4-camera rule.
         self.root = pathlib.Path(root)
         self.site = _component(site, "site")
         self.line = _component(line, "line")
+        self.allow_partial = bool(allow_partial)
         self.db_path = self.root / "station.db"
         self.store_dir = self.root / "store"
         self._lock = threading.RLock()
@@ -170,19 +180,40 @@ class Store:
 
     # --------------------------------------------------------------- parts
     def save_part(self, record: PartRecord) -> pathlib.Path:
+        """Write one finished part.
+
+        Default: exactly 8 frames and 8 results (4 cameras x 2 sides).
+        With allow_partial: an even count from 2 to 8, where TOP and BOTTOM
+        cover the same camera ids, each (camera_id, side) pair once.
+        """
         frames = list(record.frames)
         results = list(record.results)
-        if len(frames) != IMAGES_PER_PART or len(results) != IMAGES_PER_PART:
+        if self.allow_partial:
+            count = len(frames)
+            if count % 2 or not 2 <= count <= IMAGES_PER_PART:
+                raise ValueError(
+                    f"a partial part needs an even number of frames from 2 to "
+                    f"{IMAGES_PER_PART}, got {count}"
+                )
+            expected = count
+        else:
+            expected = IMAGES_PER_PART
+        if len(frames) != expected or len(results) != expected:
             raise ValueError(
-                f"a part needs exactly {IMAGES_PER_PART} frames and "
-                f"{IMAGES_PER_PART} results, got {len(frames)} frames "
+                f"a part needs exactly {expected} frames and "
+                f"{expected} results, got {len(frames)} frames "
                 f"and {len(results)} results"
             )
         keys = [(_component(f.camera_id, "camera_id"), Side(f.side).value) for f in frames]
-        if len(set(keys)) != IMAGES_PER_PART:
+        if len(set(keys)) != expected:
             raise ValueError("each camera must appear exactly once per side")
+        if self.allow_partial:
+            top = {cam for cam, side in keys if side == Side.TOP.value}
+            bottom = {cam for cam, side in keys if side == Side.BOTTOM.value}
+            if top != bottom:
+                raise ValueError("TOP and BOTTOM must cover the same camera ids")
         by_key = {(r.camera_id, Side(r.side).value): r for r in results}
-        if set(by_key) != set(keys) or len(by_key) != IMAGES_PER_PART:
+        if set(by_key) != set(keys) or len(by_key) != expected:
             raise ValueError("results must match frames one-to-one")
         if Verdict(record.final_verdict) is Verdict.REVIEW:
             raise ValueError("final_verdict must be GOOD or BAD (REVIEW is resolved first)")
@@ -239,6 +270,7 @@ class Store:
         date_stamp = started.strftime("%Y%m%d")
         time_stamp = started.strftime("%H%M%S")
         part_id = record.part_id
+        camera_count = len({f.camera_id for f in frames})
 
         staged: list[tuple[str, bytes]] = []  # (file name, bytes) in capture order
         images: list[dict] = []
@@ -300,6 +332,8 @@ class Store:
                 "by": record.override.by,
             },
             "disposition": record.disposition,
+            "camera_count": camera_count,
+            "partial_station": camera_count < len(CAMERA_IDS),
             "images": images,
         }
         manifest = "".join(

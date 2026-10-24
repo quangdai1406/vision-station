@@ -26,16 +26,26 @@ def classify_image(result: ImageResult, th: Thresholds) -> Verdict:
     return Verdict.GOOD
 
 
-def fuse(results: Sequence[ImageResult], th: Thresholds) -> PartVerdict:
-    """Combine the 8 image results of one part into one verdict.
+def fuse(
+    results: Sequence[ImageResult],
+    th: Thresholds,
+    expected: int = IMAGES_PER_PART,
+) -> PartVerdict:
+    """Combine the image results of one part into one verdict.
 
+    `expected` is the image count for the station: 8 for the real 4-camera
+    station (the default), 2 * camera count for a proof-of-concept station.
     Any BAD image makes the part BAD. Otherwise any REVIEW image makes the
     part REVIEW. Only a part with no BAD and no REVIEW images is GOOD.
     """
+    if isinstance(expected, bool) or not isinstance(expected, int):
+        raise ValueError(f"expected must be an int, got {expected!r}")
+    if expected < 2 or expected % 2 != 0:
+        raise ValueError(f"expected must be an even number >= 2, got {expected}")
     items = tuple(results)
-    if len(items) != IMAGES_PER_PART:
+    if len(items) != expected:
         raise ValueError(
-            f"fuse needs exactly {IMAGES_PER_PART} results, got {len(items)}"
+            f"fuse needs exactly {expected} results, got {len(items)}"
         )
 
     classes = [classify_image(r, th) for r in items]

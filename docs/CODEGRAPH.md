@@ -10,7 +10,7 @@ python3 .claude/skills/code-graph/scripts/gen_codegraph_doc.py [--check]
 
 Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` tests need numpy, no camera or network). Station core is standard library only; `tools/` imports numpy/opencv lazily.
 
-21 code files, 19 test files, 80 import edges.
+22 code files, 20 test files, 83 import edges.
 
 ## Modules
 
@@ -20,16 +20,17 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `station/__main__.py` | 88 | 1 | 1 | Entry point. |
 | `station/app.py` | 662 | 4 | 2 | Wire the station together: config, build, run, and MES sync. |
 | `station/auth.py` | 178 | 7 | 4 | Password hashing, user store, role policy and in-memory session tokens. |
-| `station/cameras.py` | 276 | 5 | 3 | Camera sources for the inspection station. |
-| `station/contracts.py` | 153 | 19 | 11 | Shared types and interfaces for the camera inspection station. |
-| `station/fusion.py` | 77 | 2 | 4 | Per-image classification and per-part fusion. |
+| `station/cameras.py` | 291 | 5 | 3 | Camera sources for the inspection station. |
+| `station/contracts.py` | 170 | 21 | 12 | Shared types and interfaces for the camera inspection station. |
+| `station/fusion.py` | 87 | 2 | 4 | Per-image classification and per-part fusion. |
+| `station/golden.py` | 411 | 1 | 1 | Compare-with-a-good-part model for the one-camera proof of concept. |
 | `station/inference.py` | 161 | 5 | 3 | Inference models for the inspection station. |
 | `station/mes_client.py` | 280 | 4 | 4 | MES client for the camera inspection station. |
 | `station/outbox.py` | 214 | 2 | 3 | Durable outbox for inspection events waiting to be posted to the MES. |
 | `station/outputs.py` | 122 | 5 | 3 | Output drivers for lights and the alarm (implements contracts.OutputDriver). |
-| `station/session.py` | 530 | 2 | 3 | One inspection session: from the first press of a part to a completed record. |
-| `station/storage.py` | 429 | 3 | 3 | Storage for finished inspection parts and the append-only event log. |
-| `station/ui.py` | 716 | 2 | 3 | HTTP server for the inspection station: a JSON API plus one HTML page. |
+| `station/session.py` | 565 | 2 | 3 | One inspection session: from the first press of a part to a completed record. |
+| `station/storage.py` | 463 | 3 | 3 | Storage for finished inspection parts and the append-only event log. |
+| `station/ui.py` | 791 | 2 | 3 | HTTP server for the inspection station: a JSON API plus one HTML page. |
 | `station/users_cli.py` | 131 | 2 | 1 | `python -m station users add <username> <role>`: create or update a station login. |
 | `tools/__init__.py` | 6 | 5 | 4 | Repeatability and threshold-selection tools. See FORMAT.md. |
 | `tools/analysis.py` | 263 | 3 | 3 | Numpy-only image repeatability metrics. Shapes and return keys: see tools/FORMAT.md. |
@@ -40,7 +41,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 
 ## Hubs (change with care)
 
-- `station/contracts.py`: imported by 19 files
+- `station/contracts.py`: imported by 21 files
 - `station/auth.py`: imported by 7 files
 - `station/cameras.py`: imported by 5 files
 - `station/inference.py`: imported by 5 files
@@ -58,6 +59,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 - `station/cameras.py` -> `station/contracts.py`
 - `station/contracts.py` -> (no internal imports)
 - `station/fusion.py` -> `station/contracts.py`
+- `station/golden.py` -> `station/contracts.py`
 - `station/inference.py` -> `station/contracts.py`
 - `station/mes_client.py` -> `station/contracts.py`
 - `station/outbox.py` -> `station/mes_client.py`
@@ -81,6 +83,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 - `tests/test_cameras.py` -> `station/cameras.py`, `station/contracts.py`
 - `tests/test_e2e.py` -> `station/app.py`, `station/auth.py`, `station/cameras.py`, `station/contracts.py`, `station/inference.py`, `station/outputs.py`
 - `tests/test_fusion.py` -> `station/contracts.py`, `station/fusion.py`
+- `tests/test_golden.py` -> `station/contracts.py`, `station/golden.py`
 - `tests/test_inference.py` -> `station/contracts.py`, `station/inference.py`
 - `tests/test_mes_client.py` -> `station/contracts.py`, `station/mes_client.py`
 - `tests/test_outbox.py` -> `station/mes_client.py`, `station/outbox.py`
@@ -101,7 +104,7 @@ None.
 
 ## External packages (code files importing each)
 
-`__future__` (16), `typing` (16), `json` (11), `pathlib` (8), `sys` (7), `argparse` (6), `datetime` (6), `os` (6), `time` (6), `dataclasses` (5), `numpy` (4), `re` (4), `threading` (4), `csv` (3), `cv2` (3), `urllib` (3), `base64` (2), `contextlib` (2), `enum` (2), `hashlib` (2), `http` (2), `math` (2), `sqlite3` (2), `tempfile` (2), `uuid` (2), `collections` (1), `getpass` (1), `hmac` (1), `io` (1), `mimetypes` (1), `onnxruntime` (1), `secrets` (1), `shutil` (1), `traceback` (1), `unicodedata` (1)
+`__future__` (17), `typing` (17), `json` (12), `pathlib` (8), `sys` (7), `argparse` (6), `dataclasses` (6), `datetime` (6), `os` (6), `time` (6), `numpy` (5), `cv2` (4), `re` (4), `threading` (4), `csv` (3), `math` (3), `urllib` (3), `base64` (2), `contextlib` (2), `enum` (2), `hashlib` (2), `http` (2), `io` (2), `sqlite3` (2), `tempfile` (2), `uuid` (2), `collections` (1), `getpass` (1), `hmac` (1), `mimetypes` (1), `onnxruntime` (1), `secrets` (1), `shutil` (1), `traceback` (1), `unicodedata` (1), `zipfile` (1)
 
 ## What the graph cannot see
 

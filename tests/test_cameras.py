@@ -124,6 +124,30 @@ class FakeCameraSetTests(unittest.TestCase):
         frames = FakeCameraSet().capture(Side.TOP)
         self.assertRegex(frames[0].timestamp_utc, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
+    def test_default_camera_ids_are_all_four(self):
+        cams = FakeCameraSet()
+        self.assertEqual(cams.camera_ids, CAMERA_IDS)
+        self.assertEqual(len(cams.capture(Side.TOP)), 4)
+
+    def test_single_camera_set_returns_one_frame_per_side(self):
+        cams = FakeCameraSet(camera_ids=("C1",))
+        self.assertEqual(cams.camera_ids, ("C1",))
+        for side in (Side.TOP, Side.BOTTOM):
+            frames = cams.capture(side)
+            self.assertEqual(len(frames), 1)
+            self.assertEqual(frames[0].camera_id, "C1")
+            self.assertEqual(frames[0].seq, 0)
+            self.assertEqual(frames[0].side, side)
+        self.assertEqual(cams.capture_counts[Side.TOP], 1)
+
+    def test_two_camera_set_uses_given_ids_in_order(self):
+        frames = FakeCameraSet(camera_ids=("C2", "C4")).capture("BOTTOM")
+        self.assertEqual([(f.camera_id, f.seq) for f in frames], [("C2", 0), ("C4", 1)])
+
+    def test_empty_camera_ids_rejected(self):
+        with self.assertRaises(ValueError):
+            FakeCameraSet(camera_ids=())
+
 
 class OpenCvCameraSetTests(unittest.TestCase):
     def test_open_sets_manual_modes_and_manual_values(self):
@@ -159,9 +183,53 @@ class OpenCvCameraSetTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             OpenCvCameraSet([0, 1, 2, 3], cv2_module=FakeCv2(), manual_settings={"gain": 1})
 
-    def test_wrong_device_count_rejected(self):
-        with self.assertRaises(CameraError):
-            OpenCvCameraSet([0, 1, 2], cv2_module=FakeCv2())
+    def test_device_count_outside_1_to_4_rejected(self):
+        for indexes in ([], [0, 1, 2, 3, 4]):
+            with self.subTest(count=len(indexes)):
+                with self.assertRaises(CameraError) as ctx:
+                    OpenCvCameraSet(indexes, cv2_module=FakeCv2())
+                self.assertIn("1 to 4", str(ctx.exception))
+
+    def test_one_two_and_four_devices_name_the_right_ids(self):
+        for indexes, expected in (
+            ([5], ("C1",)),
+            ([5, 6], ("C1", "C2")),
+            ([0, 1, 2, 3], ("C1", "C2", "C3", "C4")),
+        ):
+            with self.subTest(count=len(indexes)):
+                cv2 = FakeCv2()
+                cams = OpenCvCameraSet(indexes, cv2_module=cv2, now_utc=_fixed_clock())
+                self.assertEqual(cams.camera_ids, expected)
+                frames = cams.capture(Side.TOP)
+                self.assertEqual([f.camera_id for f in frames], list(expected))
+                self.assertEqual([f.seq for f in frames], list(range(len(expected))))
+                self.assertEqual([c.index for c in cv2.captures], list(indexes))
+                self.assertEqual([e[1] for e in cv2.log if e[0] == "grab"], list(indexes))
+                cams.release()
+
+    def test_single_device_failure_names_c1(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet([7], cv2_module=cv2)
+        cv2.VideoCapture = lambda index: _closed(cv2, index)
+        with self.assertRaises(CameraError) as ctx:
+            cams.capture(Side.BOTTOM)
+        self.assertIn("C1", str(ctx.exception))
+
+    def test_two_device_grab_failure_names_c2(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet([0, 1], cv2_module=cv2)
+        cams.open()
+        cv2.captures[1].grab_ok = False
+        with self.assertRaises(CameraError) as ctx:
+            cams.capture(Side.TOP)
+        self.assertIn("C2", str(ctx.exception))
+
+    def test_release_closes_only_opened_devices_for_two_cameras(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet([4, 9], cv2_module=cv2)
+        cams.open()
+        cams.release()
+        self.assertEqual(sorted(e[1] for e in cv2.log if e[0] == "release"), [4, 9])
 
     def test_capture_grabs_all_before_any_retrieve(self):
         cv2 = FakeCv2()

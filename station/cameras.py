@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Optional, Sequence
 
-from station.contracts import CAMERA_IDS, CameraError, Frame, Side
+from station.contracts import CAMERA_IDS, CameraError, Frame, Side, camera_ids_for
 
 NowUtc = Callable[[], str]
 FrameBytes = Callable[[str, Side, int], bytes]
@@ -37,11 +37,11 @@ def _default_frame_bytes(camera_id: str, side: Side, n: int) -> bytes:
 class FakeCameraSet:
     """Deterministic CameraSet for tests and the demo.
 
-    capture(side) returns one Frame per camera in CAMERA_IDS order. The data
-    is b'FAKE:<camera>:<side>:<n>' where n is the zero-based number of the
-    capture call for that side, unless frame_bytes(camera_id, side, n)
-    supplies the bytes. Every call is counted in capture_counts, including
-    calls that raise.
+    capture(side) returns one Frame per camera in camera_ids order (default
+    CAMERA_IDS). The data is b'FAKE:<camera>:<side>:<n>' where n is the
+    zero-based number of the capture call for that side, unless
+    frame_bytes(camera_id, side, n) supplies the bytes. Every call is counted
+    in capture_counts, including calls that raise.
     """
 
     def __init__(
@@ -49,11 +49,20 @@ class FakeCameraSet:
         fail_sides: Sequence[Side | str] = (),
         frame_bytes: Optional[FrameBytes] = None,
         clock: NowUtc = utc_now_iso,
+        camera_ids: Sequence[str] = CAMERA_IDS,
     ) -> None:
+        ids = tuple(camera_ids)
+        if not ids:
+            raise ValueError("camera_ids must not be empty")
         self._fail_sides = frozenset(Side(s) for s in fail_sides)
         self._frame_bytes = frame_bytes or _default_frame_bytes
         self._clock = clock
+        self._camera_ids: tuple[str, ...] = ids
         self.capture_counts: dict[Side, int] = {Side.TOP: 0, Side.BOTTOM: 0}
+
+    @property
+    def camera_ids(self) -> tuple[str, ...]:
+        return self._camera_ids
 
     def capture(self, side: Side) -> Sequence[Frame]:
         side = Side(side)
@@ -70,7 +79,7 @@ class FakeCameraSet:
                 data=self._frame_bytes(cam, side, n),
                 ext="png",
             )
-            for seq, cam in enumerate(CAMERA_IDS)
+            for seq, cam in enumerate(self._camera_ids)
         ]
 
 
@@ -85,12 +94,13 @@ def _import_cv2() -> Any:
 
 
 class OpenCvCameraSet:
-    """CameraSet backed by four OpenCV VideoCapture devices.
+    """CameraSet backed by 1 to 4 OpenCV VideoCapture devices.
 
-    device_indexes map in order to C1..C4. Devices are opened on the first
-    capture() (or by an explicit open()). Each capture grabs all four cameras
-    first, then retrieves and PNG-encodes them, so the frames are close in
-    time. last_skew_s holds max-min of the grab times for the last capture.
+    device_indexes map in order to camera_ids_for(len(device_indexes)): one
+    device is C1, two are C1 and C2, and so on up to C4. Devices are opened on
+    the first capture() (or by an explicit open()). Each capture grabs all
+    cameras first, then retrieves and PNG-encodes them, so the frames are close
+    in time. last_skew_s holds max-min of the grab times for the last capture.
     """
 
     def __init__(
@@ -104,15 +114,16 @@ class OpenCvCameraSet:
         manual_settings: Optional[Mapping[str, Optional[float]]] = None,
     ) -> None:
         indexes = list(device_indexes)
-        if len(indexes) != len(CAMERA_IDS):
+        if not 1 <= len(indexes) <= len(CAMERA_IDS):
             raise CameraError(
-                f"expected {len(CAMERA_IDS)} camera devices, got {len(indexes)}"
+                f"expected 1 to {len(CAMERA_IDS)} camera devices, got {len(indexes)}"
             )
         manual = dict(manual_settings or {})
         unknown = set(manual) - set(_MANUAL_KEYS)
         if unknown:
             raise ValueError(f"unknown manual setting(s): {sorted(unknown)}")
         self._indexes = indexes
+        self._camera_ids: tuple[str, ...] = camera_ids_for(len(indexes))
         self._width = width
         self._height = height
         self._cv2 = cv2_module if cv2_module is not None else _import_cv2()
@@ -121,13 +132,17 @@ class OpenCvCameraSet:
         self._caps: Optional[list[Any]] = None
         self.last_skew_s: Optional[float] = None
 
+    @property
+    def camera_ids(self) -> tuple[str, ...]:
+        return self._camera_ids
+
     def open(self) -> None:
         if self._caps is not None:
             return
         cv2 = self._cv2
         caps: list[Any] = []
         try:
-            for cam, index in zip(CAMERA_IDS, self._indexes):
+            for cam, index in zip(self._camera_ids, self._indexes):
                 cap = cv2.VideoCapture(index)
                 caps.append(cap)
                 self._open_one(cam, index, cap)
@@ -165,10 +180,10 @@ class OpenCvCameraSet:
         cv2 = self._cv2
         assert caps is not None
 
-        # Stage 1: grab all four before retrieving any, to keep them close in time.
+        # Stage 1: grab all cameras before retrieving any, to keep them close in time.
         grab_times: list[float] = []
         stamps: list[str] = []
-        for cam, cap in zip(CAMERA_IDS, caps):
+        for cam, cap in zip(self._camera_ids, caps):
             try:
                 ok = cap.grab()
             except Exception as exc:
@@ -181,7 +196,7 @@ class OpenCvCameraSet:
 
         # Stage 2: retrieve and encode.
         frames: list[Frame] = []
-        for seq, (cam, cap, stamp) in enumerate(zip(CAMERA_IDS, caps, stamps)):
+        for seq, (cam, cap, stamp) in enumerate(zip(self._camera_ids, caps, stamps)):
             try:
                 ok, image = cap.retrieve()
             except Exception as exc:
@@ -206,16 +221,16 @@ class OpenCvCameraSet:
                 )
             )
 
-        if len(frames) != len(CAMERA_IDS):
+        if len(frames) != len(self._camera_ids):
             raise CameraError(
-                f"expected {len(CAMERA_IDS)} frames, got {len(frames)}"
+                f"expected {len(self._camera_ids)} frames, got {len(frames)}"
             )
         return frames
 
     def release(self) -> None:
         caps, self._caps = self._caps or [], None
         errors: list[str] = []
-        for cam, cap in zip(CAMERA_IDS, caps):
+        for cam, cap in zip(self._camera_ids, caps):
             try:
                 cap.release()
             except Exception as exc:

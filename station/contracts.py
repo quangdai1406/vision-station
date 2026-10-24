@@ -45,6 +45,23 @@ CAMERA_IDS = ("C1", "C2", "C3", "C4")
 IMAGES_PER_PART = 8  # 4 cameras x 2 sides
 
 
+def camera_ids_for(count: int) -> tuple[str, ...]:
+    """Camera ids for a station with `count` cameras (1..4). Fewer than 4 is proof-of-concept only."""
+    if not 1 <= count <= len(CAMERA_IDS):
+        raise ValueError(f"camera count must be 1..{len(CAMERA_IDS)}, got {count}")
+    return CAMERA_IDS[:count]
+
+
+def images_for(camera_ids: "tuple[str, ...] | list[str]") -> int:
+    """Images per part for these cameras: every camera, top and bottom."""
+    return 2 * len(camera_ids)
+
+
+def is_full_station(camera_ids: "tuple[str, ...] | list[str]") -> bool:
+    """True only for the real 4-camera, 8-image station (the only mode that may post to the MES by default)."""
+    return tuple(camera_ids) == CAMERA_IDS
+
+
 @dataclass(frozen=True)
 class Frame:
     camera_id: str

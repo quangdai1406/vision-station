@@ -34,6 +34,9 @@ class FakeSession:
         self.errors = {}
         self.press_result = True
         self.verdict = None
+        # None means the key is absent, as in a snapshot from before the change.
+        self.partial_station = None
+        self.camera_ids = None
 
     def _call(self, name, **kwargs):
         self.calls.append((name, kwargs))
@@ -57,7 +60,7 @@ class FakeSession:
         }
         if include_images:
             image["b64"] = IMAGE_B64
-        return {
+        out = {
             "state": "IDLE",
             "counters": {"total": 3, "good": 2, "bad": 1},
             "part_id": "P-100",
@@ -68,6 +71,11 @@ class FakeSession:
             "results": [{"camera_id": "C1", "side": "TOP", "score": 0.9, "defects": defects}],
             "images": [image],
         }
+        if self.partial_station is not None:
+            out["partial_station"] = self.partial_station
+        if self.camera_ids is not None:
+            out["camera_ids"] = list(self.camera_ids)
+        return out
 
     def press(self):
         self._call("press")
@@ -425,6 +433,68 @@ class PageTests(UiTestCase):
         headers = dict(self.call("GET", "/").headers)
         self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+
+    def test_enter_key_presses_part_with_focus_guards(self):
+        html = self.page()
+        self.assertIn('addEventListener("keydown"', html)
+        self.assertIn('"Enter"', html)
+        self.assertIn("ev.repeat", html)
+        self.assertIn("document.activeElement", html)
+        for tag in ("INPUT", "TEXTAREA", "SELECT", "BUTTON"):
+            self.assertIn('tag === "%s"' % tag, html)
+        self.assertIn("pressing", html)
+        self.assertIn('PATHS.press', html)
+        self.assertNotIn('"Escape"', html)
+
+    def test_press_button_label_and_hint(self):
+        html = self.page()
+        self.assertIn(">Press (Enter)</button>", html)
+        self.assertIn("Enter key or click: start TOP scan, flip the part, "
+                      "press again for the BOTTOM scan.", html)
+
+    def test_poc_banner_text_and_partial_gate(self):
+        html = self.page()
+        self.assertIn('id="poc"', html)
+        self.assertIn("partial_station", html)
+        self.assertIn("PROOF OF CONCEPT: ", html)
+        # the sentence is split across JS string literals; check each fragment
+        self.assertIn("This station does not meet the 8-image rule. ", html)
+        self.assertIn("Results are not for production decisions.", html)
+        self.assertIn("el.poc.textContent", html)
+        self.assertIn("el.poc.hidden = !partial", html)
+        # the banner sits above the verdict
+        self.assertLess(html.index('id="poc"'), html.index('id="verdict"'))
+
+    def test_tiles_built_from_camera_ids_with_c1_to_c4_default(self):
+        html = self.page()
+        self.assertIn("camera_ids", html)
+        self.assertIn('DEFAULT_CAMERAS = ["C1", "C2", "C3", "C4"]', html)
+        self.assertIn("ensureTiles(cams)", html)
+        self.assertIn("--cols", html)
+
+
+class PartialStationTests(UiTestCase):
+    def test_partial_station_keys_pass_through_state(self):
+        self.session.partial_station = True
+        self.session.camera_ids = ["C1"]
+        token = self.login(OP_USER, OP_PW)
+        body = self.js(self.call("GET", "/api/state", token=token))
+        self.assertIs(body["partial_station"], True)
+        self.assertEqual(body["camera_ids"], ["C1"])
+        full = self.js(self.call("GET", "/api/state?images=1", token=token))
+        self.assertIs(full["partial_station"], True)
+        self.assertEqual(full["camera_ids"], ["C1"])
+        self.assertEqual(full["images"][0]["b64"], IMAGE_B64)
+
+    def test_old_snapshot_without_new_keys_still_works(self):
+        token = self.login(OP_USER, OP_PW)
+        reply = self.call("GET", "/api/state", token=token)
+        self.assertEqual(reply.status, 200)
+        body = self.js(reply)
+        self.assertNotIn("partial_station", body)
+        self.assertNotIn("camera_ids", body)
+        self.assertEqual(body["state"], "IDLE")
+        self.assertEqual(self.call("GET", "/").status, 200)
 
 
 if __name__ == "__main__":

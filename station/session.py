@@ -42,6 +42,10 @@ Output failures (decided here):
     and nothing is raised out of press(). The operator can still ack, override or
     resolve, and the part is saved on completion.
 
+Camera set: camera_ids defaults to all four cameras (the full station). A subset
+is a proof-of-concept partial station: it is flagged in snapshot() and in the
+'press' and 'verdict' events (partial_station, camera_ids), and is_partial is True.
+
 Snapshot: see StationSession.snapshot for the exact shape the UI reads.
 """
 from __future__ import annotations
@@ -60,6 +64,8 @@ from station.contracts import (
     ImageResult,
     InvalidTransition,
     Override,
+    images_for,
+    is_full_station,
     PartRecord,
     PartVerdict,
     Side,
@@ -106,6 +112,18 @@ def _enum_value(x: Any) -> Optional[str]:
     return None if x is None else x.value
 
 
+def _validate_camera_ids(camera_ids: Sequence[str]) -> tuple[str, ...]:
+    ids = tuple(camera_ids)
+    unknown = [c for c in ids if c not in CAMERA_IDS]
+    if unknown:
+        raise ValueError(f"unknown camera ids {unknown}; must be a subset of {list(CAMERA_IDS)}")
+    if not ids:
+        raise ValueError("camera_ids must not be empty")
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"camera_ids must be unique, got {list(ids)}")
+    return ids
+
+
 class StationSession:
     def __init__(
         self,
@@ -132,7 +150,10 @@ class StationSession:
         fuse_fn: Optional[Callable[[Sequence[ImageResult], Thresholds], PartVerdict]] = None,
         on_complete: Optional[Callable[[PartRecord], None]] = None,
         initial_counters: Optional[dict[str, int]] = None,
+        camera_ids: Sequence[str] = CAMERA_IDS,
     ) -> None:
+        self._camera_ids = _validate_camera_ids(camera_ids)
+        self._expected_images = images_for(self._camera_ids)
         self._cameras = cameras
         self._model = model
         self._outputs = outputs
@@ -183,12 +204,12 @@ class StationSession:
         if self.state is State.IDLE:
             self._outputs.clear()
             self._begin_part()
-            self._log("press", {"side": Side.TOP.value, "part_id": self._part_id},
+            self._log("press", {"side": Side.TOP.value, "part_id": self._part_id, **self._station_fields()},
                       session_id=self._session_id)
             if self._run_side(Side.TOP, fail_state=State.IDLE):
                 self.state = State.WAIT_FLIP
         else:
-            self._log("press", {"side": Side.BOTTOM.value, "part_id": self._part_id},
+            self._log("press", {"side": Side.BOTTOM.value, "part_id": self._part_id, **self._station_fields()},
                       session_id=self._session_id)
             self._run_bottom()
         return True
@@ -272,14 +293,15 @@ class StationSession:
         final_verdict (set only once the part is saved), verdict (what the big
         indicator shows: REVIEW in SUPERVISOR_REVIEW, else final_verdict, else
         machine_verdict; GOOD is never shown before it is saved; None when no
-        part), fault, results (one per captured image, so far), and images
-        (one metadata entry per captured frame, up to 8, with score and defects
-        merged in from the matching result; 'b64' only when include_images).
+        part), fault, results (one per captured image, so far), images
+        (one metadata entry per captured frame, up to expected_images, with score
+        and defects merged in from the matching result; 'b64' only when
+        include_images), partial_station (bool) and camera_ids (list of str).
         """
         results = self._all_results()
         by_key = {(r.camera_id, r.side): r for r in results}
         images: list[dict[str, Any]] = []
-        for f in self._all_frames()[:IMAGES_PER_PART]:
+        for f in self._all_frames()[:self._expected_images]:
             r = by_key.get((f.camera_id, f.side))
             entry: dict[str, Any] = {
                 "camera_id": f.camera_id,
@@ -302,9 +324,19 @@ class StationSession:
             "fault": self._fault,
             "results": [_result_dict(r) for r in results],
             "images": images,
+            "partial_station": self.is_partial,
+            "camera_ids": list(self._camera_ids),
         }
 
+    @property
+    def is_partial(self) -> bool:
+        """True for a proof-of-concept station (fewer than the 4 cameras of the full station)."""
+        return not is_full_station(self._camera_ids)
+
     # ----------------------------------------------------------------- helpers
+
+    def _station_fields(self) -> dict[str, Any]:
+        return {"partial_station": self.is_partial, "camera_ids": list(self._camera_ids)}
 
     def _display_verdict(self) -> Optional[str]:
         if self.state is State.SUPERVISOR_REVIEW:
@@ -355,25 +387,27 @@ class StationSession:
                 )
             retakes += 1
 
-    @staticmethod
-    def _check_frame_set(side: Side, frames: list[Frame]) -> None:
-        if len(frames) != len(CAMERA_IDS):
-            raise CameraError(f"{side.value}: expected {len(CAMERA_IDS)} frames, got {len(frames)}")
-        if sorted(f.camera_id for f in frames) != sorted(CAMERA_IDS):
+    def _check_frame_set(self, side: Side, frames: list[Frame]) -> None:
+        if len(frames) != len(self._camera_ids):
+            raise CameraError(f"{side.value}: expected {len(self._camera_ids)} frames, got {len(frames)}")
+        if sorted(f.camera_id for f in frames) != sorted(self._camera_ids):
             raise CameraError(
-                f"{side.value}: camera ids {sorted(f.camera_id for f in frames)} do not match {list(CAMERA_IDS)}"
+                f"{side.value}: camera ids {sorted(f.camera_id for f in frames)} do not match {list(self._camera_ids)}"
             )
 
     def _fuse_and_route(self) -> None:
         results = self._all_results()
         try:
-            if len(results) != IMAGES_PER_PART:
-                raise StationError(f"need {IMAGES_PER_PART} results to fuse, have {len(results)}")
+            if len(results) != self._expected_images:
+                raise StationError(f"need {self._expected_images} results to fuse, have {len(results)}")
             fuse = self._fuse_fn
             if fuse is None:
                 from station.fusion import fuse as default_fuse
                 fuse = default_fuse
-            pv = fuse(results, self._thresholds)
+            if self._expected_images != IMAGES_PER_PART:
+                pv = fuse(results, self._thresholds, expected=self._expected_images)
+            else:
+                pv = fuse(results, self._thresholds)
             if pv.verdict not in (Verdict.GOOD, Verdict.BAD, Verdict.REVIEW):
                 raise StationError(f"fusion returned unknown verdict {pv.verdict!r}")
         except Exception as exc:
@@ -381,7 +415,8 @@ class StationSession:
             return
 
         self._machine = pv.verdict
-        self._log("verdict", {"verdict": pv.verdict.value, "reason": pv.reason, "part_id": self._part_id},
+        self._log("verdict", {"verdict": pv.verdict.value, "reason": pv.reason, "part_id": self._part_id,
+                              **self._station_fields()},
                   session_id=self._session_id)
         if pv.verdict is Verdict.GOOD:
             self._finish(Verdict.GOOD, override=None, disposition=None, lights=("show_good",))

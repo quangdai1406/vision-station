@@ -286,18 +286,21 @@ _PAGE = """<!doctype html>
   --bg: #f3f4f6; --fg: #1b1d21; --card: #ffffff; --muted: #5f6570; --line: #d5d9df;
   --good: #137a3e; --bad: #b42318; --review: #d89b00; --none: #8b929c;
   --btn: #1f2937; --btn-fg: #ffffff;
+  --poc: #f5a524;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg: #121417; --fg: #e6e8eb; --card: #1c1f24; --muted: #9aa1ab; --line: #333840;
     --good: #2fbf6b; --bad: #ff5a4f; --review: #f5b041; --none: #5b626d;
     --btn: #e6e8eb; --btn-fg: #121417;
+    --poc: #f5b041;
   }
 }
 :root[data-theme="dark"] {
   --bg: #121417; --fg: #e6e8eb; --card: #1c1f24; --muted: #9aa1ab; --line: #333840;
   --good: #2fbf6b; --bad: #ff5a4f; --review: #f5b041; --none: #5b626d;
   --btn: #e6e8eb; --btn-fg: #121417;
+  --poc: #f5b041;
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
@@ -320,8 +323,11 @@ main { padding: 16px; max-width: 980px; margin: 0 auto; }
 .counters { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; text-align: center; }
 .counters span { display: block; font-size: 14px; color: var(--muted); }
 .counters b { display: block; font-size: 28px; }
-.tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
-@media (min-width: 700px) { .tiles { grid-template-columns: repeat(4, 1fr); } }
+.tiles { display: grid; grid-template-columns: repeat(var(--cols-m, 2), 1fr); gap: 8px; }
+@media (min-width: 700px) { .tiles { grid-template-columns: repeat(var(--cols, 4), 1fr); } }
+.poc { background: var(--poc); color: #1b1d21; font-weight: 700; border-radius: 10px;
+  padding: 12px 16px; margin-bottom: 16px; }
+.hint { margin: 8px 0 0; }
 .side-row + .side-row { margin-top: 16px; }
 .side-row h3 { font-size: 14px; color: var(--muted); letter-spacing: 1px; margin: 0 0 8px; }
 .tile { margin: 0; min-width: 0; }
@@ -359,6 +365,7 @@ label { display: block; font-size: 14px; color: var(--muted); }
   </section>
 
   <section id="app" hidden>
+    <div id="poc" class="poc" role="status" hidden></div>
     <div class="card">
       <div id="state" class="muted">State: -</div>
       <div id="verdict" class="verdict v-NONE">-</div>
@@ -370,9 +377,10 @@ label { display: block; font-size: 14px; color: var(--muted); }
     </div>
     <div id="tiles" class="card"></div>
     <div class="card">
-      <button data-action="press">Press</button>
+      <button data-action="press">Press (Enter)</button>
       <button data-action="ack">Acknowledge alarm</button>
       <button data-action="clear_fault">Clear fault</button>
+      <p id="press-hint" class="muted hint">Enter key or click: start TOP scan, flip the part, press again for the BOTTOM scan.</p>
     </div>
     <div class="card">
       <label for="reason">Reason (required for resolve and override)</label>
@@ -388,7 +396,7 @@ label { display: block; font-size: 14px; color: var(--muted); }
 (function () {
   "use strict";
   var POLL_MS = 1000;
-  var CAMERAS = ["C1", "C2", "C3", "C4"];
+  var DEFAULT_CAMERAS = ["C1", "C2", "C3", "C4"];
   var SIDES = ["TOP", "BOTTOM"];
   var PLACEHOLDER_W = 320;
   var PLACEHOLDER_H = 240;
@@ -403,7 +411,8 @@ label { display: block; font-size: 14px; color: var(--muted); }
     login: $("login-box"), app: $("app"), form: $("login-form"), who: $("who"),
     logout: $("logout"), error: $("error"), state: $("state"), verdict: $("verdict"),
     total: $("c-total"), good: $("c-good"), bad: $("c-bad"), tiles: $("tiles"),
-    reason: $("reason")
+    reason: $("reason"), poc: $("poc"),
+    press: document.querySelector('[data-action="press"]')
   };
 
   var timer = null;
@@ -545,23 +554,47 @@ label { display: block; font-size: 14px; color: var(--muted); }
     });
   };
 
+  // One column per camera id of the snapshot (camera_ids). Older snapshots without
+  // the key get the default C1..C4.
   var tiles = [];
-  SIDES.forEach(function (side) {
-    var row = document.createElement("div");
-    var title = document.createElement("h3");
-    var grid = document.createElement("div");
-    row.className = "side-row";
-    title.textContent = side;
-    grid.className = "tiles";
-    row.appendChild(title);
-    row.appendChild(grid);
-    CAMERAS.forEach(function (cam) {
-      var t = new Tile(side, cam);
-      tiles.push(t);
-      grid.appendChild(t.figure);
+  var tileKey = null;
+
+  function cameraList(s) {
+    if (!Array.isArray(s.camera_ids)) { return DEFAULT_CAMERAS.slice(); }
+    var out = [];
+    s.camera_ids.forEach(function (c) {
+      if (typeof c === "string" && c.length > 0 && c.length <= 32) { out.push(c); }
     });
-    el.tiles.appendChild(row);
-  });
+    return out;
+  }
+
+  // Rebuilds the tile grid only when the camera list changes.
+  function ensureTiles(cams) {
+    var key = cams.join("|");
+    if (key === tileKey) { return; }
+    tileKey = key;
+    tiles = [];
+    while (el.tiles.firstChild) { el.tiles.removeChild(el.tiles.firstChild); }
+    var n = Math.max(1, cams.length);
+    SIDES.forEach(function (side) {
+      var row = document.createElement("div");
+      var title = document.createElement("h3");
+      var grid = document.createElement("div");
+      row.className = "side-row";
+      title.textContent = side;
+      grid.className = "tiles";
+      grid.style.setProperty("--cols", String(n));
+      grid.style.setProperty("--cols-m", String(Math.min(2, n)));
+      row.appendChild(title);
+      row.appendChild(grid);
+      cams.forEach(function (cam) {
+        var t = new Tile(side, cam);
+        tiles.push(t);
+        grid.appendChild(t.figure);
+      });
+      el.tiles.appendChild(row);
+    });
+  }
 
   function render(s, fresh) {
     el.login.hidden = true;
@@ -589,6 +622,18 @@ label { display: block; font-size: 14px; color: var(--muted); }
     el.total.textContent = c.total || 0;
     el.good.textContent = c.good || 0;
     el.bad.textContent = c.bad || 0;
+
+    var cams = cameraList(s);
+    ensureTiles(cams);
+
+    // Proof-of-concept banner: only for a partial station (not the 8-image rule).
+    var partial = s.partial_station === true;
+    el.poc.hidden = !partial;
+    if (partial) {
+      el.poc.textContent = "PROOF OF CONCEPT: " + cams.length + " camera(s). "
+        + "This station does not meet the 8-image rule. "
+        + "Results are not for production decisions.";
+    }
 
     var images = Array.isArray(s.images) ? s.images : [];
     tiles.forEach(function (t) {
@@ -662,11 +707,32 @@ label { display: block; font-size: 14px; color: var(--muted); }
     }).then(null, function (err) { handleError(g, err); });
   }
 
+  // Press the part: from the Press button or the Enter key. One request at a time.
+  var pressing = false;
+
+  function pressPart() {
+    if (pressing) { return; }
+    pressing = true;
+    setError("");
+    request("POST", PATHS.press, {}).then(function (data) {
+      pressing = false;
+      if (data && data.accepted === false) {
+        setError("Press was not accepted in the current state.");
+      }
+      schedule(0);
+    }, function (err) {
+      pressing = false;
+      if (err.status === 401) { showLogin(); return; }
+      setError(err.message);
+    });
+  }
+
   document.addEventListener("click", function (ev) {
     var target = ev.target;
     var btn = target && target.closest ? target.closest("[data-action]") : null;
     if (!btn || btn.disabled) { return; }
     var action = btn.getAttribute("data-action");
+    if (action === "press") { pressPart(); return; }
     var body = {};
     if (action === "resolve" || action === "override") {
       var reason = el.reason.value.trim();
@@ -674,16 +740,24 @@ label { display: block; font-size: 14px; color: var(--muted); }
       body = { verdict: btn.getAttribute("data-verdict"), reason: reason };
     }
     setError("");
-    request("POST", PATHS[action], body).then(function (data) {
-      if (action === "press" && data && data.accepted === false) {
-        setError("Press was not accepted in the current state.");
-      }
+    request("POST", PATHS[action], body).then(function () {
       if (action === "resolve" || action === "override") { el.reason.value = ""; }
       schedule(0);
     }, function (err) {
       if (err.status === 401) { showLogin(); return; }
       setError(err.message);
     });
+  });
+
+  // Enter presses the part, unless focus is in a field or button (typing a reason,
+  // or Enter on a focused button, must not press twice). Other keys do nothing.
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key !== "Enter" || ev.repeat) { return; }
+    if (el.app.hidden || !el.press || el.press.disabled || pressing) { return; }
+    var focus = document.activeElement;
+    var tag = focus && focus.tagName ? focus.tagName : "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON") { return; }
+    pressPart();
   });
 
   el.form.addEventListener("submit", function (ev) {
@@ -707,6 +781,7 @@ label { display: block; font-size: 14px; color: var(--muted); }
     });
   });
 
+  ensureTiles(DEFAULT_CAMERAS);
   poll();
 })();
 </script>

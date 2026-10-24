@@ -31,16 +31,19 @@ def make_frames(side, n=4):
 
 
 class FakeCameras:
-    def __init__(self):
+    def __init__(self, default_n=4):
         self.sides = []
-        self.script = []  # per call: None -> 4 frames, int -> that many frames, exception -> raise
+        self.default_n = default_n
+        self.script = []  # per call: None -> default_n frames, int -> that many frames, list -> those frames, exception -> raise
 
     def capture(self, side):
         self.sides.append(side)
         action = self.script.pop(0) if self.script else None
         if isinstance(action, BaseException):
             raise action
-        return make_frames(side, action or 4)
+        if isinstance(action, list):
+            return action
+        return make_frames(side, action or self.default_n)
 
 
 class FakeModel:
@@ -134,15 +137,29 @@ class _Ids:
         return f"{self.prefix}-{self.n}"
 
 
+class RecordingFuse:
+    """Fuse fake that accepts any result count and records the keyword arguments it was called with."""
+
+    def __init__(self, verdict=Verdict.GOOD):
+        self.verdict = verdict
+        self.calls = []
+        self.kwargs = []
+
+    def __call__(self, results, th, **kwargs):
+        self.calls.append(list(results))
+        self.kwargs.append(kwargs)
+        return PartVerdict(verdict=self.verdict, results=tuple(results), reason="fake")
+
+
 class Harness:
     def __init__(self, fuse_verdict=Verdict.GOOD, frame_ok=None, max_retakes=2,
-                 on_complete=None, initial_counters=None):
-        self.cameras = FakeCameras()
+                 on_complete=None, initial_counters=None, camera_ids=CAMERA_IDS, fuse=None):
+        self.cameras = FakeCameras(default_n=len(camera_ids))
         self.model = FakeModel()
         self.outputs = FakeOutputs()
         self.store = FakeStore()
         self.clock = FakeClock()
-        self.fuse = FakeFuse(fuse_verdict)
+        self.fuse = fuse if fuse is not None else FakeFuse(fuse_verdict)
         self.completed = []
         self.session = StationSession(
             self.cameras, self.model, self.outputs, self.store, TH,
@@ -153,6 +170,7 @@ class Harness:
             session_id_factory=_Ids("sess"), fuse_fn=self.fuse,
             on_complete=on_complete or self.completed.append,
             initial_counters=initial_counters,
+            camera_ids=camera_ids,
         )
 
     def press_at(self, t):
@@ -489,7 +507,7 @@ class SnapshotTests(_Base):
         self.assertEqual(
             set(snap),
             {"state", "counters", "part_id", "machine_verdict", "final_verdict",
-             "verdict", "results", "fault", "images"},
+             "verdict", "results", "fault", "images", "partial_station", "camera_ids"},
         )
         self.assertEqual(snap["state"], "IDLE")
         self.assertEqual(snap["counters"], {"total": 0, "good": 0, "bad": 0})
@@ -1027,6 +1045,148 @@ class InitialCounterTests(_Base):
     def test_default_counters_are_zero(self):
         h = self.harness()
         self.assertEqual(h.session.counters, {"total": 0, "good": 0, "bad": 0})
+
+
+def _events(h, kind):
+    return [e[1] for e in h.store.events if e[0] == kind]
+
+
+class PartialStationTests(_Base):
+    """Proof-of-concept station with fewer than 4 cameras (1 camera here)."""
+
+    def partial(self, fuse_verdict=Verdict.GOOD, **kw):
+        return self.harness(fuse_verdict=fuse_verdict, camera_ids=("C1",),
+                            fuse=RecordingFuse(fuse_verdict), **kw)
+
+    def test_one_camera_good_part_completes_with_two_images(self):
+        h = self.partial(Verdict.GOOD)
+        s = h.session
+        self.assertTrue(h.press_at(0.0))
+        self.assertEqual(s.state, State.WAIT_FLIP)
+        self.assertEqual(len(s.snapshot()["results"]), 1)
+        self.assertTrue(h.press_at(1.0))
+
+        self.assertEqual(s.state, State.IDLE)
+        self.assertEqual(h.outputs.calls[-1], "show_good")
+        self.assertEqual(len(h.store.saved), 1)
+        self.assertEqual(s.counters, {"total": 1, "good": 1, "bad": 0})
+        self.assertEqual(len(h.completed), 1)
+        rec = h.store.saved[0]
+        self.assertEqual(len(rec.frames), 2)
+        self.assertEqual(len(rec.results), 2)
+        self.assertEqual([f.side for f in rec.frames], [Side.TOP, Side.BOTTOM])
+        self.assertEqual([r.camera_id for r in rec.results], ["C1", "C1"])
+        self.assertEqual(rec.final_verdict, Verdict.GOOD)
+        self.assertEqual(h.cameras.sides, [Side.TOP, Side.BOTTOM])
+        self.assertEqual(h.model.calls, 2)
+
+        snap = s.snapshot()
+        self.assertIs(snap["partial_station"], True)
+        self.assertEqual(snap["camera_ids"], ["C1"])
+
+    def test_fuse_receives_expected_two_for_one_camera(self):
+        h = self.partial(Verdict.GOOD)
+        h.complete_part(0.0)
+        self.assertEqual(h.fuse.kwargs, [{"expected": 2}])
+        self.assertEqual(len(h.fuse.calls[0]), 2)
+
+    def test_one_camera_bad_part_needs_ack_alarm(self):
+        h = self.partial(Verdict.BAD)
+        h.complete_part(0.0)
+        self.assertEqual(h.session.state, State.VERDICT)
+        self.assertEqual(h.outputs.calls[-1], "show_bad")
+        self.assertEqual(h.store.saved, [])
+        self.assertEqual(h.session.counters, {"total": 0, "good": 0, "bad": 0})
+        h.session.ack_alarm()
+        self.assertEqual(h.session.state, State.IDLE)
+        self.assertEqual(len(h.store.saved), 1)
+        self.assertEqual(h.store.saved[0].final_verdict, Verdict.BAD)
+        self.assertEqual(h.session.counters, {"total": 1, "good": 0, "bad": 1})
+
+    def test_one_camera_review_never_lights_green_before_resolution(self):
+        h = self.partial(Verdict.REVIEW)
+        h.complete_part(0.0)
+        self.assertEqual(h.session.state, State.SUPERVISOR_REVIEW)
+        self.assertEqual(h.outputs.calls[-1], "show_review")
+        self.assertNotIn("show_good", h.outputs.calls)
+        self.assertEqual(h.store.saved, [])
+        self.assertIsNone(h.session.snapshot()["final_verdict"])
+        self.assertEqual(h.session.counters["total"], 0)
+
+    def test_camera_returning_unconfigured_id_is_a_fault(self):
+        h = self.partial(Verdict.GOOD)
+        h.cameras.script = [[Frame(camera_id="C2", side=Side.TOP, seq=0,
+                                   timestamp_utc=TS, data=b"TOP-C2")]]
+        self.assertTrue(h.press_at(0.0))
+        self.assertEqual(h.session.state, State.FAULT)
+        fault = h.session.snapshot()["fault"]
+        self.assertIn("C2", fault)
+        self.assertIn("C1", fault)
+        self.assertEqual(h.model.calls, 0)
+        self.assertEqual(h.fuse.calls, [])
+        self.assertEqual(h.store.saved, [])
+        self.assertEqual(h.session.counters["total"], 0)
+
+    def test_one_camera_short_capture_is_a_fault(self):
+        h = self.partial(Verdict.GOOD)
+        h.cameras.script = [[]]
+        self.assertTrue(h.press_at(0.0))
+        self.assertEqual(h.session.state, State.FAULT)
+        self.assertIn("expected 1 frames", h.session.snapshot()["fault"])
+        self.assertEqual(h.fuse.calls, [])
+
+    def test_invalid_camera_ids_raise_value_error(self):
+        for bad in ((), ("C1", "C1"), ("C1", "C9"), ("C9",)):
+            with self.subTest(camera_ids=bad):
+                with self.assertRaises(ValueError):
+                    self.harness(camera_ids=bad)
+
+    def test_partial_flag_is_in_snapshot_and_in_press_and_verdict_events(self):
+        h = self.partial(Verdict.GOOD)
+        h.complete_part(0.0)
+        presses = _events(h, "press")
+        verdicts = _events(h, "verdict")
+        self.assertEqual(len(presses), 2)
+        self.assertEqual(len(verdicts), 1)
+        for payload in presses + verdicts:
+            self.assertIs(payload["partial_station"], True)
+            self.assertEqual(payload["camera_ids"], ["C1"])
+
+    def test_is_partial_is_read_only_and_true_for_partial_station(self):
+        h = self.partial()
+        self.assertIs(h.session.is_partial, True)
+        with self.assertRaises(AttributeError):
+            h.session.is_partial = False
+        self.assertIs(self.harness().session.is_partial, False)
+        self.assertIs(self.harness(camera_ids=("C1", "C2", "C3")).session.is_partial, True)
+
+
+class FullStationDefaultTests(_Base):
+    def test_default_session_is_full_station(self):
+        h = self.harness(fuse_verdict=Verdict.GOOD)
+        self.assertIs(h.session.is_partial, False)
+        snap = h.session.snapshot()
+        self.assertIs(snap["partial_station"], False)
+        self.assertEqual(snap["camera_ids"], list(CAMERA_IDS))
+
+    def test_default_session_calls_fuse_without_expected_keyword(self):
+        fuse = RecordingFuse(Verdict.GOOD)
+        h = self.harness(fuse=fuse)
+        h.complete_part(0.0)
+        self.assertEqual(fuse.kwargs, [{}])
+        self.assertEqual(len(fuse.calls[0]), 8)
+        self.assertEqual(h.store.saved[0].final_verdict, Verdict.GOOD)
+
+    def test_default_press_and_verdict_events_carry_full_station_fields(self):
+        h = self.harness(fuse_verdict=Verdict.GOOD)
+        h.complete_part(0.0)
+        presses = _events(h, "press")
+        verdicts = _events(h, "verdict")
+        self.assertEqual(len(presses), 2)
+        self.assertEqual(len(verdicts), 1)
+        for payload in presses + verdicts:
+            self.assertIs(payload["partial_station"], False)
+            self.assertEqual(payload["camera_ids"], list(CAMERA_IDS))
 
 
 if __name__ == "__main__":
