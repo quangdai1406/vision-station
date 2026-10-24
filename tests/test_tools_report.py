@@ -1,5 +1,6 @@
 """Tests for tools/report.py. Synthetic session folders in a temp dir; numpy tests are skipped without numpy."""
 import contextlib
+import csv
 import io
 import json
 import re
@@ -25,11 +26,13 @@ NEED_NUMPY = unittest.skipUnless(HAS_NUMPY, "numpy is not installed")
 
 
 def _build_session(root, name, mode, *, shifts=None, frames=6, h=48, w=64,
-                   autofocus_applied=True, seed=1, base=None, sigma=2.0):
+                   autofocus_applied=True, seed=1, base=None, sigma=2.0,
+                   offsets=None, autofocus_readback=None):
     """Write a session folder that follows tools/FORMAT.md. Placement uses integer (dx, dy) shifts.
 
     base: optional fixed image for a stationary session (pure noise, no drift); the
-    frame size then comes from base.
+    frame size then comes from base. offsets: optional per-frame brightness offsets
+    (stationary only, one per frame). autofocus_readback: optional read-back value for autofocus.
     """
     rng = np.random.default_rng(seed)
     if base is None:
@@ -39,6 +42,9 @@ def _build_session(root, name, mode, *, shifts=None, frames=6, h=48, w=64,
         base = np.asarray(base, dtype=np.float64)
         h, w = base.shape
         stationary_seq = [base] * frames
+    if offsets is not None:
+        assert len(offsets) == frames
+        stationary_seq = [f + float(offsets[t]) for t, f in enumerate(stationary_seq)]
     if mode == "placement":
         seq = [np.roll(base, (dy, dx), axis=(0, 1)) for dx, dy in shifts]
     else:
@@ -65,7 +71,9 @@ def _build_session(root, name, mode, *, shifts=None, frames=6, h=48, w=64,
                                  "white_balance": 4500, "gain": 10}},
         "cameras": {"0": {
             "actual_width": w, "actual_height": h, "actual_fps": 10.0,
-            "readback": {"autofocus": 0 if autofocus_applied else 1, "focus": 30,
+            "readback": {"autofocus": (autofocus_readback if autofocus_readback is not None
+                                       else (0 if autofocus_applied else 1)),
+                         "focus": 30,
                          "auto_exposure": 0, "exposure": 100, "auto_wb": 0,
                          "white_balance": 4500, "gain": 10},
             "applied_ok": {"autofocus": autofocus_applied, "auto_exposure": True,
@@ -131,7 +139,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("WARNING", cam_section)
         auto_row = [ln for ln in cam_section.splitlines() if ln.startswith("| Autofocus |")]
         self.assertTrue(auto_row)
-        self.assertIn("NO (ignored)", auto_row[0])
+        self.assertIn("not confirmed", auto_row[0])
         self.assertIn("reports auto", cam_section)  # session warning copied verbatim
 
     def test_no_warning_block_when_all_applied(self):
@@ -304,10 +312,171 @@ class ReportTests(unittest.TestCase):
             report.summarize_session(sdir)
         self.assertIn("session.json", str(cm.exception))
 
+    @staticmethod
+    def _table_cells(section, label):
+        rows = [ln for ln in section.splitlines() if ln.startswith(f"| {label} |")]
+        if not rows:
+            raise AssertionError(f"no table row for {label!r}")
+        return [c.strip() for c in rows[0].strip().strip("|").split("|")]
+
+    def test_dark_first_frame_is_flagged_with_sensitivity_view(self):
+        sdir = _build_session(self.root, "out_dark", "stationary",
+                              offsets=[-40.0, 0, 0, 0, 0, 0])
+        self.assertEqual(_quiet_main([str(sdir)])[0], 0)
+        out = sdir / "report"
+        data = json.loads(self._read(out / "report.json"))
+        e = data["sessions"][0]["per_device"]["0"]
+        self.assertEqual([f["index"] for f in e["outliers"]["flagged"]], [0])
+        self.assertIsNotNone(e["excluding_flagged"])
+        md = self._read(out / "report.md")
+        self.assertIsNone(re.search(r"\b(pass|fail)", md, re.IGNORECASE))
+        sec3 = _section(md, "## 3. Stationary results", "## 4. Placement results")
+        self.assertIn("frame 0 (mean brightness", sec3)
+        self.assertIn("Sensitivity view", sec3)
+        self.assertIn("1 flagged frame changes these numbers", sec3)
+        all_range = float(self._table_cells(sec3, "Brightness range (% of mean)")[1])
+        excl_range = float(self._table_cells(sec3, "Brightness range (% of mean)")[2])
+        self.assertLess(excl_range, all_range)
+        for label in ("Temporal noise mean (gray levels)", "Temporal noise p95 (gray levels)",
+                      "Residual, no alignment: mean", "Residual, no alignment: p95",
+                      "Residual, no alignment: max"):
+            cells = self._table_cells(sec3, label)
+            self.assertLess(float(cells[2]), float(cells[1]), label)
+        sec5 = _section(md, "## 5. Noise floor", "## 6.")
+        self.assertIn("all frames (headline)", sec5)
+        self.assertIn("excluding flagged frames (sensitivity)", sec5)
+        with open(out / "summary.csv", newline="", encoding="utf-8") as fh:
+            row = list(csv.DictReader(fh))[0]
+        self.assertEqual(row["flagged_frames"], "1")
+        self.assertEqual(row["flagged_frame_indices"], "0")
+        self.assertTrue(row["excl_flagged_brightness_range_pct"])
+        self.assertLess(float(row["excl_flagged_brightness_range_pct"]), all_range)
+
+    def test_no_flagged_frames_means_no_sensitivity_view_and_empty_csv_columns(self):
+        sdir = _build_session(self.root, "out_none", "stationary")
+        self.assertEqual(_quiet_main([str(sdir)])[0], 0)
+        out = sdir / "report"
+        md = self._read(out / "report.md")
+        self.assertIn("Flagged: none.", md)
+        self.assertNotIn("Sensitivity view", md)
+        self.assertNotIn("excluding flagged frames (sensitivity)", md)
+        with open(out / "summary.csv", newline="", encoding="utf-8") as fh:
+            row = list(csv.DictReader(fh))[0]
+        self.assertEqual(row["flagged_frame_indices"], "")
+        self.assertEqual(row["excl_flagged_brightness_range_pct"], "")
+        self.assertEqual(row["excl_flagged_residual_unaligned_max"], "")
+
+    def test_skip_first_removes_frame_zero_and_says_so(self):
+        sdir = _build_session(self.root, "skip1", "stationary",
+                              offsets=[-40.0, 0, 0, 0, 0, 0])
+        self.assertEqual(_quiet_main([str(sdir), "--skip-first", "1"])[0], 0)
+        out = sdir / "report"
+        data = json.loads(self._read(out / "report.json"))
+        self.assertEqual(data["settings"]["skip_first"], 1)
+        e = data["sessions"][0]["per_device"]["0"]
+        self.assertEqual(e["frames_used"], 5)
+        self.assertEqual(len(e["brightness"]["mean_per_frame"]), 5)
+        gray, _ = analysis.load_session_gray(sdir, 0)
+        expected = analysis.brightness_stats(gray[1:])["range_pct"]
+        self.assertAlmostEqual(e["brightness"]["range_pct"], expected, places=9)
+        self.assertEqual(e["outliers"]["flagged"], [])
+        md = self._read(out / "report.md")
+        self.assertIn("Frames skipped at the start (--skip-first): 1", md)
+        self.assertIn("Frames used: 5 of 6", md)
+        self.assertNotIn("Sensitivity view", md)
+
+    def test_skip_first_leaving_too_few_frames_is_an_input_error(self):
+        sdir = _build_session(self.root, "skip_all", "stationary", frames=6)
+        rc, _, err = _quiet_main([str(sdir), "--skip-first", "5"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--skip-first 5", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_noisy_flat_image_suppresses_drift_line_with_real_response(self):
+        sdir = _build_session(self.root, "flat_noise", "stationary",
+                              base=np.full((48, 64), 128.0), frames=12, sigma=3.0, seed=11)
+        self.assertEqual(_quiet_main([str(sdir)])[0], 0)
+        out = sdir / "report"
+        data = json.loads(self._read(out / "report.json"))
+        est = data["sessions"][0]["per_device"]["0"]["shift_estimate"]
+        self.assertFalse(est["reported"])
+        self.assertLess(est["median_response"], report.DEFAULT_MIN_SHIFT_RESPONSE)
+        md = self._read(out / "report.md")
+        sec3 = _section(md, "## 3. Stationary results", "## 4. Placement results")
+        match = re.search(r"Apparent drift/vibration not reported: image too flat or too noisy "
+                          r"to measure shift \(median peak response ([0-9.]+), needs at least "
+                          r"0\.10\)\.", sec3)
+        self.assertIsNotNone(match)
+        self.assertAlmostEqual(float(match.group(1)), est["median_response"], delta=0.0006)
+        self.assertNotIn("shift spread std dx", sec3)
+
+    def test_textured_stable_image_still_shows_drift_line(self):
+        sdir = _build_session(self.root, "tex_stable", "stationary", seed=21)
+        self.assertEqual(_quiet_main([str(sdir)])[0], 0)
+        out = sdir / "report"
+        data = json.loads(self._read(out / "report.json"))
+        est = data["sessions"][0]["per_device"]["0"]["shift_estimate"]
+        self.assertTrue(est["reported"])
+        self.assertGreaterEqual(est["median_response"], report.DEFAULT_MIN_SHIFT_RESPONSE)
+        md = self._read(out / "report.md")
+        sec3 = _section(md, "## 3. Stationary results", "## 4. Placement results")
+        self.assertIn("- Apparent drift/vibration (estimate;", sec3)
+        self.assertNotIn("not reported", sec3)
+
+    def test_min_shift_response_option_suppresses_drift_line(self):
+        sdir = _build_session(self.root, "tex_thresh", "stationary", seed=21)
+        self.assertEqual(_quiet_main([str(sdir), "--min-shift-response", "1.01",
+                                      "--out", str(self.root / "thr")])[0], 0)
+        md = self._read(self.root / "thr" / "report.md")
+        self.assertIn("Apparent drift/vibration not reported", md)
+        self.assertIn("needs at least 1.01", md)
+
+    def test_garbled_wording_is_gone_and_minus_one_is_explained(self):
+        sdir = _build_session(self.root, "af_minus1", "stationary",
+                              autofocus_applied=False, autofocus_readback=-1.0)
+        self.assertEqual(_quiet_main([str(sdir)])[0], 0)
+        md = self._read(sdir / "report" / "report.md")
+        self.assertNotIn("requested not requested", md)
+        self.assertNotIn("was requested not", md)
+        self.assertIn("Autofocus was requested off but the camera did not confirm it "
+                      "(read back: -1.0).", md)
+        self.assertIn("does not expose this control", md)
+        self.assertIn("so this does not prove auto is on", md)
+        cam = _section(md, "## 2. Camera settings", "## 3. Stationary")
+        self.assertIn("| Autofocus | off (always requested) |", cam)
+        self.assertIn("| Auto exposure | off (always requested) |", cam)
+        self.assertIn("| Focus | 30 |", cam)
+        self.assertIn("| Gain | 10 |", cam)
+        self.assertIsNone(re.search(r"\b(pass|fail)", md, re.IGNORECASE))
+
     def test_main_returns_zero_on_success(self):
         sdir = _build_session(self.root, "stat_rc", "stationary")
         self.assertEqual(report.main([str(sdir)]), 0)
         shutil.rmtree(sdir / "report", ignore_errors=True)
+
+
+class ReportOptionTests(unittest.TestCase):
+    def test_defaults_and_options_parse(self):
+        parser = report.build_parser()
+        args = parser.parse_args(["sess"])
+        self.assertEqual(args.outlier_sigma, 5.0)
+        self.assertEqual(args.outlier_floor_gray, 2.0)
+        self.assertEqual(args.skip_first, 0)
+        self.assertEqual(args.min_shift_response, 0.1)
+        args = parser.parse_args(["sess", "--outlier-sigma", "3", "--outlier-floor-gray", "1.5",
+                                  "--skip-first", "2", "--min-shift-response", "0.2"])
+        self.assertEqual(args.outlier_sigma, 3.0)
+        self.assertEqual(args.outlier_floor_gray, 1.5)
+        self.assertEqual(args.skip_first, 2)
+        self.assertEqual(args.min_shift_response, 0.2)
+
+    def test_negative_or_non_numeric_values_are_rejected(self):
+        parser = report.build_parser()
+        for argv in (["sess", "--skip-first", "-1"], ["sess", "--outlier-sigma", "abc"],
+                     ["sess", "--min-shift-response", "-0.5"]):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(argv)
 
 
 class ToolDependencyTests(unittest.TestCase):

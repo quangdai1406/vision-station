@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import io
 import json
 import re
@@ -30,6 +31,22 @@ def _fourcc(*chars: str) -> int:
     return value
 
 
+SETTLE_KEYS = {"checked", "settled", "seconds", "frames_used", "last_means", "tol_gray", "frames", "max_s"}
+
+
+class FakeClock:
+    """Time that moves only when sleep() is called, so the settle loop costs no real time."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def now(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.t += seconds
+
+
 class FakeCapture:
     """One fake camera.
 
@@ -37,7 +54,9 @@ class FakeCapture:
     without change), raise_set (props whose set raises), fail_open, fail_grab_at,
     fail_retrieve_at, image_follows_exposure (brightness follows the exposure prop;
     otherwise the picture ignores exposure while read-back still echoes the value),
-    black (every frame is all zeros).
+    black (every frame is all zeros), start_dark ((frames, scale): the first retrieved frames
+    are scaled, then the picture is steady), flicker (every other frame is 20 % darker, so the
+    brightness never settles).
     """
 
     def __init__(self, cv2: "FakeCv2", index: int, api: object) -> None:
@@ -53,6 +72,8 @@ class FakeCapture:
         self.fail_retrieve_at = profile.get("fail_retrieve_at")
         self.image_follows_exposure = profile.get("image_follows_exposure", False)
         self.black = bool(profile.get("black", False))
+        self.start_dark = profile.get("start_dark")
+        self.flicker = bool(profile.get("flicker", False))
         c = cv2
         self.props = {
             c.CAP_PROP_AUTOFOCUS: 1.0,
@@ -116,6 +137,13 @@ class FakeCapture:
         if self.image_follows_exposure:
             shift = int(round(self.props[self._cv2.CAP_PROP_EXPOSURE] * 10))
             img = np.clip(img.astype(np.int64) + shift, 0, 255)
+        scale = 1.0
+        if self.start_dark is not None and n < self.start_dark[0]:
+            scale *= self.start_dark[1]  # dark first frames, then a steady picture
+        if self.flicker and n % 2 == 1:
+            scale *= 0.8  # every other frame 20 % darker: never settles
+        if scale != 1.0:
+            img = np.clip(np.round(img.astype(np.float64) * scale), 0, 255)
         if self.black:
             img = np.zeros_like(img)
         return True, img.astype(np.uint8)
@@ -175,6 +203,7 @@ class CaptureTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
         self.lines: list[str] = []
+        self.clock = FakeClock()
 
     def run_capture(self, cv2: FakeCv2 | None = None, **overrides):
         cv2 = cv2 or FakeCv2()
@@ -191,7 +220,11 @@ class CaptureTests(unittest.TestCase):
             backend="default",
             cv2_module=cv2,
             input_fn=lambda prompt="": "",
-            sleep=lambda s: None,
+            # Brightness settle is off here, so the exact event sequences in the older tests
+            # stay exact; the settle tests pass settle_max_s explicitly.
+            settle_max_s=0.0,
+            clock=self.clock.now,
+            sleep=self.clock.sleep,
             out=self.lines.append,
         )
         kwargs.update(overrides)
@@ -232,7 +265,7 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(
                 set(cam),
                 {"actual_width", "actual_height", "actual_fps", "readback", "applied_ok", "warnings",
-                 "buffersize_readback", "auto_exposure_attempts", "exposure_response"},
+                 "buffersize_readback", "auto_exposure_attempts", "exposure_response", "settle"},
             )
             self.assertEqual(
                 set(cam["readback"]),
@@ -245,6 +278,7 @@ class CaptureTests(unittest.TestCase):
             )
             self.assertIsInstance(cam["warnings"], list)
             self.assertIsInstance(cam["auto_exposure_attempts"], list)
+            self.assertEqual(set(cam["settle"]), SETTLE_KEYS)
         for frame in doc["frames"]:
             self.assertEqual(set(frame), {"index", "device", "stamp", "mean", "laplacian_var"})
 
@@ -444,6 +478,8 @@ class CaptureTests(unittest.TestCase):
             ],
             cv2_module=FakeCv2(),
             out=lines.append,
+            clock=self.clock.now,
+            sleep=self.clock.sleep,
         )
         self.assertEqual(code, 0)
         self.assertTrue((self.root / "sessions" / "cli1" / "session.json").is_file())
@@ -520,7 +556,7 @@ class CaptureTests(unittest.TestCase):
 
     def test_cli_flush_frames_zero_disables_flushing(self) -> None:
         cv2 = FakeCv2()
-        code = main(self.cli_args("cli-flush", "--count", "2", "--flush-frames", "0"),
+        code = main(self.cli_args("cli-flush", "--count", "2", "--flush-frames", "0", "--settle-max-s", "0"),
                     cv2_module=cv2, out=self.lines.append)
         self.assertEqual(code, 0)
         self.assertEqual(cv2.events, [("grab", 0), ("retrieve", 0)] * 2)
@@ -596,7 +632,7 @@ class CaptureTests(unittest.TestCase):
     def test_cli_no_response_check_flag_skips_the_check(self) -> None:
         cv2 = FakeCv2(profiles={0: {"image_follows_exposure": True}})
         code = main(self.cli_args("cli-resp", "--count", "1", "--exposure", "-4", "--no-response-check"),
-                    cv2_module=cv2, out=self.lines.append)
+                    cv2_module=cv2, out=self.lines.append, clock=self.clock.now, sleep=self.clock.sleep)
         self.assertEqual(code, 0)
         cam = self.load_session("cli-resp")["cameras"]["0"]
         self.assertIsNone(cam["applied_ok"]["exposure_responds"])
@@ -636,6 +672,161 @@ class CaptureTests(unittest.TestCase):
         self.assertIn("grab failed", summary["aborted"])
         self.assertEqual(cv2.created[0].props[FakeCv2.CAP_PROP_EXPOSURE], -4.0)
         self.assertTrue(cv2.created[0].released)
+
+    # --- brightness settle -----------------------------------------------------
+
+    def test_settle_waits_for_brightness_then_records_only_settled_frames(self) -> None:
+        self.run_capture(cv2=FakeCv2(), name="ref", count=3)
+        reference = [f["mean"] for f in self.load_session("ref")["frames"]]
+
+        cv2 = FakeCv2(profiles={0: {"start_dark": (4, 0.25)}})
+        self.run_capture(cv2=cv2, count=3, settle_max_s=30.0, flush_frames=0)
+        settle = self.load_session()["cameras"]["0"]["settle"]
+        self.assertTrue(settle["settled"])
+        # Dark for the first 4 frames: the 5-frame window is all bright from tick 8, 0.2 s per tick.
+        self.assertAlmostEqual(settle["seconds"], 1.6, places=6)
+        self.assertEqual(settle["frames_used"], 9)
+        means = [f["mean"] for f in self.load_session()["frames"]]
+        self.assertEqual(len(means), 3)
+        for got, want in zip(means, reference):
+            self.assertAlmostEqual(got, want, places=6)
+
+    def test_settle_frames_are_discarded_not_written_to_the_npz(self) -> None:
+        cv2 = FakeCv2(profiles={0: {"start_dark": (4, 0.25)}})
+        self.run_capture(cv2=cv2, count=2, settle_max_s=30.0, flush_frames=0)
+        self.assertEqual(cv2.created[0].retrieve_calls, 9 + 2)  # 9 settle frames, 2 recorded
+        with np.load(self.session_dir() / "frames_dev0.npz") as z:
+            self.assertEqual(z["gray"].shape, (2, 48, 64))
+            self.assertEqual(z["stamps"].shape, (2,))
+            self.assertAlmostEqual(float(z["stamps"][0]), 1.6, places=6)
+
+    def test_camera_that_never_settles_is_recorded_warned_and_the_run_continues(self) -> None:
+        cv2 = FakeCv2(profiles={0: {"flicker": True}})
+        summary, _ = self.run_capture(cv2=cv2, count=2, settle_max_s=2.0, flush_frames=0)
+        cam = self.load_session()["cameras"]["0"]
+        settle = cam["settle"]
+        self.assertTrue(settle["checked"])
+        self.assertFalse(settle["settled"])
+        self.assertGreaterEqual(settle["seconds"], 2.0 - 1e-6)
+        self.assertEqual(settle["max_s"], 2.0)
+        self.assertEqual(len(settle["last_means"]), 5)
+        self.assertTrue(any(
+            "brightness had not settled after 2 s (last frame means:" in w
+            and "increase --settle-max-s or fix the lighting" in w
+            for w in cam["warnings"]
+        ))
+        self.assertIsNone(summary["aborted"])
+        self.assertEqual(summary["frames_saved"], 2)
+
+    def test_settle_max_s_zero_disables_the_check(self) -> None:
+        cv2 = FakeCv2(profiles={0: {"start_dark": (4, 0.25)}})
+        self.run_capture(cv2=cv2, count=2, settle_max_s=0, flush_frames=0)
+        settle = self.load_session()["cameras"]["0"]["settle"]
+        self.assertFalse(settle["checked"])
+        self.assertEqual(cv2.events, [("grab", 0), ("retrieve", 0)] * 2)
+
+    def test_settle_record_has_the_documented_keys_and_types(self) -> None:
+        cv2 = FakeCv2(profiles={0: {"start_dark": (2, 0.5)}})
+        self.run_capture(cv2=cv2, count=1, settle_max_s=30.0, settle_frames=3,
+                         settle_tol_gray=2.0, flush_frames=0)
+        s = self.load_session()["cameras"]["0"]["settle"]
+        self.assertEqual(set(s), SETTLE_KEYS)
+        self.assertIs(s["checked"], True)
+        self.assertIs(s["settled"], True)
+        self.assertIsInstance(s["seconds"], float)
+        self.assertIsInstance(s["frames_used"], int)
+        self.assertEqual(len(s["last_means"]), 3)
+        self.assertTrue(all(isinstance(m, float) for m in s["last_means"]))
+        self.assertIsInstance(s["tol_gray"], float)
+        self.assertEqual(s["tol_gray"], 2.0)
+        self.assertIsInstance(s["frames"], int)
+        self.assertEqual(s["frames"], 3)
+        self.assertIsInstance(s["max_s"], float)
+        self.assertEqual(s["max_s"], 30.0)
+        self.run_capture(name="off", count=1, settle_max_s=0)
+        off = self.load_session("off")["cameras"]["0"]["settle"]
+        self.assertEqual(set(off), SETTLE_KEYS)
+        self.assertIs(off["checked"], False)
+
+    def test_placement_settles_before_the_first_prompt(self) -> None:
+        cv2 = FakeCv2(profiles={0: {"start_dark": (4, 0.25)}})
+        self.run_capture(cv2=cv2, mode="placement", count=1, no_prompt=False,
+                         input_fn=self.input_logger(cv2), settle_max_s=30.0, flush_frames=0)
+        # The 9 settle ticks (grab + retrieve each) come before the first prompt.
+        self.assertEqual(cv2.events.index(("input",)), 18)
+        self.assertEqual(cv2.events[18:], [("input",), ("grab", 0), ("retrieve", 0)])
+
+    def test_each_device_has_its_own_settle_record(self) -> None:
+        cv2 = FakeCv2(profiles={0: {"start_dark": (2, 0.25)}, 1: {"flicker": True}})
+        summary, _ = self.run_capture(cv2=cv2, devices=[0, 1], count=1, settle_max_s=2.0, flush_frames=0)
+        cams = self.load_session()["cameras"]
+        self.assertTrue(cams["0"]["settle"]["settled"])
+        self.assertFalse(cams["1"]["settle"]["settled"])
+        self.assertFalse(any("had not settled" in w for w in cams["0"]["warnings"]))
+        self.assertTrue(any("had not settled" in w for w in cams["1"]["warnings"]))
+        self.assertTrue(any(w.startswith("device 1:") and "had not settled" in w for w in summary["warnings"]))
+
+    def test_grab_failure_during_settle_still_records_the_check(self) -> None:
+        cv2 = FakeCv2(profiles={0: {"fail_grab_at": 3}})
+        summary, _ = self.run_capture(cv2=cv2, count=1, settle_max_s=30.0, flush_frames=0)
+        self.assertIn("grab failed", summary["aborted"])
+        settle = self.load_session()["cameras"]["0"]["settle"]
+        self.assertTrue(settle["checked"])
+        self.assertFalse(settle["settled"])
+        self.assertEqual(settle["frames_used"], 3)
+
+    def test_bad_settle_settings_are_rejected_before_anything_is_written(self) -> None:
+        for kwargs in ({"settle_frames": 1}, {"settle_max_s": -1.0}, {"settle_tol_gray": -0.5}):
+            with self.subTest(case=str(kwargs)):
+                with self.assertRaises(ValueError):
+                    self.run_capture(name="bad", **kwargs)
+                self.assertFalse(self.session_dir("bad").exists())
+
+    def test_first_frame_hint_appears_when_first_frame_is_10_percent_off(self) -> None:
+        cv2 = FakeCv2(profiles={0: {"start_dark": (1, 0.8)}})
+        code = main(self.cli_args("hint-on", "--count", "3", "--flush-frames", "0", "--settle-max-s", "0"),
+                    cv2_module=cv2, out=self.lines.append, clock=self.clock.now, sleep=self.clock.sleep)
+        self.assertEqual(code, 0)
+        hint_lines = [line for line in self.lines if "first frame brightness" in line]
+        self.assertEqual(len(hint_lines), 1)
+        self.assertIn("differs from the median", hint_lines[0])
+        self.assertIn("check the report's outlier section", hint_lines[0])
+
+    def test_no_hint_when_first_frame_is_within_10_percent_or_camera_is_constant(self) -> None:
+        for label, profile in (("constant", {}), ("five-percent", {"start_dark": (1, 0.95)})):
+            with self.subTest(case=label):
+                self.lines.clear()
+                cv2 = FakeCv2(profiles={0: profile})
+                code = main(self.cli_args(f"nohint-{label}", "--count", "3", "--flush-frames", "0",
+                                          "--settle-max-s", "0"),
+                            cv2_module=cv2, out=self.lines.append, clock=self.clock.now, sleep=self.clock.sleep)
+                self.assertEqual(code, 0)
+                self.assertFalse(any("first frame brightness" in line for line in self.lines))
+
+    def test_cli_default_settle_is_on_recorded_and_printed(self) -> None:
+        cv2 = FakeCv2(profiles={0: {"start_dark": (4, 0.25)}})
+        code = main(self.cli_args("cli-settle", "--count", "1"),
+                    cv2_module=cv2, out=self.lines.append, clock=self.clock.now, sleep=self.clock.sleep)
+        self.assertEqual(code, 0)
+        settle = self.load_session("cli-settle")["cameras"]["0"]["settle"]
+        self.assertTrue(settle["settled"])
+        self.assertEqual(settle["max_s"], 30.0)
+        self.assertTrue(any(line.startswith("Brightness settled after 1.6 s") for line in self.lines))
+
+    def test_cli_summary_says_not_settled_when_the_camera_never_settles(self) -> None:
+        cv2 = FakeCv2(profiles={0: {"flicker": True}})
+        code = main(self.cli_args("cli-nosettle", "--count", "1", "--settle-max-s", "1"),
+                    cv2_module=cv2, out=self.lines.append, clock=self.clock.now, sleep=self.clock.sleep)
+        self.assertEqual(code, 0)
+        self.assertTrue(any(line.startswith("Brightness NOT settled after 1 s (device 0)") for line in self.lines))
+
+    def test_settle_defaults_are_30_s_5_frames_and_1_gray(self) -> None:
+        args = capture_mod.build_parser().parse_args(["--mode", "stationary", "--devices", "0", "--name", "x"])
+        self.assertEqual((args.settle_max_s, args.settle_frames, args.settle_tol_gray), (30.0, 5, 1.0))
+        params = inspect.signature(capture_session).parameters
+        self.assertEqual(params["settle_max_s"].default, 30.0)
+        self.assertEqual(params["settle_frames"].default, 5)
+        self.assertEqual(params["settle_tol_gray"].default, 1.0)
 
     # --- session names and folder creation --------------------------------------
 

@@ -57,6 +57,23 @@ RESTORE_NOTE_FMT = (
 )
 # Engineering setting, not a threshold: how many camera indexes --list-devices probes (0..N).
 DEFAULT_MAX_INDEX = 5
+# Brightness settle check, after the timed warm-up and before the first recorded frame.
+# Engineering settings, NOT quality thresholds. The tolerance is a 'did it stop changing'
+# epsilon in gray levels, the same kind of epsilon as RESPONSE_EPS_GRAY.
+DEFAULT_SETTLE_MAX_S = 30.0
+DEFAULT_SETTLE_FRAMES = 5
+DEFAULT_SETTLE_TOL_GRAY = 1.0
+SETTLE_INTERVAL_S = 0.2
+# Engineering hint only: a first recorded frame this far (fraction of the median) off the median.
+SETTLE_HINT_FRACTION = 0.10
+SETTLE_WARNING_FMT = (
+    "brightness had not settled after {max_s:g} s (last frame means: {means}); the first frames "
+    "of this run may be unrepresentative: increase --settle-max-s or fix the lighting"
+)
+SETTLE_HINT_FMT = (
+    "device {dev}: first frame brightness {first:.1f} differs from the median {median:.1f}: the "
+    "camera may not have settled; check the report's outlier section."
+)
 SKIPPED_NOTE = (
     "exposure response check skipped (--no-response-check): the camera may be ignoring "
     f"manual exposure ({ECHO_NOTE})"
@@ -430,6 +447,93 @@ def _warm_up(caps: list, warmup_s: float, clock: Callable[[], float]) -> None:
             _grab(dev, cap)
 
 
+def _window_settled(means: list, frames: int, tol: float) -> bool:
+    """True when the last `frames` means differ from each other by at most `tol` gray levels."""
+    if len(means) < frames:
+        return False
+    window = means[-frames:]
+    return max(window) - min(window) <= tol
+
+
+def _settle_record(*, checked: bool, settled: bool, seconds: float, frames_used: int,
+                   last_means: list, tol: float, frames: int, max_s: float) -> dict:
+    return {
+        "checked": bool(checked),
+        "settled": bool(settled),
+        "seconds": float(seconds),
+        "frames_used": int(frames_used),
+        "last_means": [float(m) for m in last_means],
+        "tol_gray": float(tol),
+        "frames": int(frames),
+        "max_s": float(max_s),
+    }
+
+
+def _settle(np: Any, cv2: Any, caps: list, cameras: dict, *, max_s: float, frames: int,
+            tol: float, clock: Callable[[], float], sleep: Callable[[float], Any]) -> None:
+    """Wait until each camera's brightness stops changing, then record cameras[dev]["settle"].
+
+    Grabs and retrieves every camera about every SETTLE_INTERVAL_S seconds. A camera has
+    settled when the means of its last `frames` frames differ by at most `tol` gray levels.
+    Stops when every camera has settled or `max_s` seconds have passed. These frames are
+    discarded, not recorded. The record is written even when a grab fails.
+    """
+    means: dict[int, list] = {dev: [] for dev, _ in caps}
+    settled_at: dict[int, float] = {}
+    start = clock()
+    elapsed = 0.0
+    # Hard cap on passes so a wall-clock that jumps backwards (or a stuck test clock)
+    # can never keep this loop running: max_s / interval, plus a few spare passes.
+    max_passes = int(max_s / SETTLE_INTERVAL_S) + max(frames, 1) + 5
+    passes = 0
+    try:
+        while True:
+            passes += 1
+            for dev, cap in caps:
+                _grab(dev, cap)
+            for dev, cap in caps:
+                gray = _gray_of(np, cv2, _retrieve(dev, cap))
+                means[dev].append(float(gray.astype(np.float64).mean()))
+            elapsed = clock() - start
+            for dev, _ in caps:
+                if dev not in settled_at and _window_settled(means[dev], frames, tol):
+                    settled_at[dev] = elapsed
+            if len(settled_at) == len(caps) or elapsed >= max_s or passes >= max_passes:
+                break
+            sleep(SETTLE_INTERVAL_S)
+    finally:
+        for dev, _ in caps:
+            done = dev in settled_at
+            cameras[str(dev)]["settle"] = _settle_record(
+                checked=True,
+                settled=done,
+                seconds=settled_at.get(dev, elapsed),
+                frames_used=len(means[dev]),
+                last_means=means[dev][-frames:],
+                tol=tol,
+                frames=frames,
+                max_s=max_s,
+            )
+    for dev, _ in caps:
+        if dev not in settled_at:
+            last = ", ".join(f"{m:.1f}" for m in means[dev][-frames:])
+            cameras[str(dev)]["warnings"].append(SETTLE_WARNING_FMT.format(max_s=max_s, means=last))
+
+
+def _first_frame_hints(np: Any, devices: list, logs: dict) -> list[str]:
+    """Engineering hint only: a first recorded frame more than 10 % off the median of the frames."""
+    hints: list[str] = []
+    for dev in devices:
+        means = [mean for mean, _ in logs[dev].stats]
+        if not means:
+            continue
+        median = float(np.median(means))
+        first = float(means[0])
+        if abs(first - median) > SETTLE_HINT_FRACTION * median:
+            hints.append(SETTLE_HINT_FMT.format(dev=dev, first=first, median=median))
+    return hints
+
+
 def _wait_for_placement(index: int, count: int, no_prompt: bool, input_fn: Callable[[str], str], out: Callable[[str], Any]) -> None:
     out(f"Round {index + 1}/{count}: {PLACEMENT_PROMPT}")
     if not no_prompt:
@@ -578,6 +682,9 @@ def capture_session(
     sample_every: int = 10,
     flush_frames: int = DEFAULT_FLUSH_FRAMES,
     response_check: bool = True,
+    settle_max_s: float = DEFAULT_SETTLE_MAX_S,
+    settle_frames: int = DEFAULT_SETTLE_FRAMES,
+    settle_tol_gray: float = DEFAULT_SETTLE_TOL_GRAY,
     backend: Optional[str] = None,
     cv2_module: Any = None,
     input_fn: Callable[[str], str] = input,
@@ -614,6 +721,12 @@ def capture_session(
         raise ValueError("flush-frames must be 0 or more (0 disables flushing)")
     if width < 1 or height < 1:
         raise ValueError("width and height must be positive")
+    if settle_max_s < 0:
+        raise ValueError("settle-max-s must be 0 or more (0 disables the brightness settle check)")
+    if settle_frames < 2:
+        raise ValueError("settle-frames must be at least 2")
+    if settle_tol_gray < 0:
+        raise ValueError("settle-tol-gray must be 0 or more")
     if fourcc is not None and len(fourcc) != 4:
         raise ValueError("fourcc must be four characters, e.g. MJPG")
     if backend not in (None, "dshow", "default"):
@@ -668,6 +781,15 @@ def capture_session(
                 raise CaptureError(f"device {dev}: could not open camera at index {dev}")
             cameras[str(dev)] = _configure(cv2, np, dev, cap, settings)
         _warm_up(caps, warmup_s, clock)
+        if settle_max_s > 0:
+            _settle(np, cv2, caps, cameras, max_s=settle_max_s, frames=settle_frames,
+                    tol=settle_tol_gray, clock=clock, sleep=sleep)
+        else:
+            for dev in devices:
+                cameras[str(dev)]["settle"] = _settle_record(
+                    checked=False, settled=False, seconds=0.0, frames_used=0, last_means=[],
+                    tol=settle_tol_gray, frames=settle_frames, max_s=0.0,
+                )
         for index in range(count):
             if mode == "placement":
                 _wait_for_placement(index, count, no_prompt, input_fn, out)
@@ -702,6 +824,7 @@ def capture_session(
             aborted=aborted,
         )
 
+    hints = _first_frame_hints(np, devices, logs)
     warnings = [f"device {dev}: {w}" for dev in devices for w in cameras.get(str(dev), {}).get("warnings", [])]
     warnings.extend(release_problems)
     return {
@@ -710,6 +833,9 @@ def capture_session(
         "frames_per_device": {str(dev): len(logs[dev].stats) for dev in devices},
         "warnings": warnings,
         "aborted": aborted,
+        "settle": {str(dev): cameras[str(dev)]["settle"]
+                   for dev in devices if "settle" in cameras.get(str(dev), {})},
+        "hints": hints,
     }
 
 
@@ -819,6 +945,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "frames are not used (engineering setting, not a threshold; 0 disables)")
     p.add_argument("--no-response-check", action="store_true",
                    help="skip the check that the picture responds to --exposure changes")
+    p.add_argument("--settle-max-s", type=float, default=DEFAULT_SETTLE_MAX_S,
+                   help="seconds to wait, after warm-up and before the first recorded frame, for the "
+                        "brightness to stop changing (engineering setting, not a threshold; 0 disables)")
+    p.add_argument("--settle-frames", type=int, default=DEFAULT_SETTLE_FRAMES,
+                   help="consecutive frames whose means must agree for the brightness to count as "
+                        "settled (default 5, at least 2)")
+    p.add_argument("--settle-tol-gray", type=float, default=DEFAULT_SETTLE_TOL_GRAY,
+                   help="largest allowed max-min of those frame means, in gray levels (engineering "
+                        "epsilon, not a quality threshold)")
     p.add_argument("--backend", choices=("dshow", "default"), default=None,
                    help="OpenCV backend (default: dshow on Windows, otherwise default)")
     p.add_argument("--list-devices", action="store_true",
@@ -829,10 +964,23 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _settle_line(dev: str, rec: dict) -> str:
+    if not rec["checked"]:
+        return f"Brightness settle check: disabled (device {dev})"
+    if rec["settled"]:
+        return (f"Brightness settled after {rec['seconds']:.1f} s (device {dev}, "
+                f"{rec['frames_used']} frames used for the check)")
+    return f"Brightness NOT settled after {rec['max_s']:g} s (device {dev}); see the warnings"
+
+
 def _print_summary(summary: dict, out: Callable[[str], Any]) -> None:
     out(f"Session folder: {summary['folder']}")
     per_dev = ", ".join(f"device {d}: {n}" for d, n in summary["frames_per_device"].items())
     out(f"Frames saved: {summary['frames_saved']} ({per_dev})")
+    for dev, rec in summary.get("settle", {}).items():
+        out(_settle_line(dev, rec))
+    for hint in summary.get("hints", []):
+        out(f"Hint: {hint}")
     if summary["warnings"]:
         out("Warnings:")
         for w in summary["warnings"]:
@@ -850,6 +998,8 @@ def main(
     cv2_module: Any = None,
     input_fn: Callable[[str], str] = input,
     out: Callable[[str], Any] = print,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], Any] = time.sleep,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -887,10 +1037,15 @@ def main(
             sample_every=args.sample_every,
             flush_frames=args.flush_frames,
             response_check=not args.no_response_check,
+            settle_max_s=args.settle_max_s,
+            settle_frames=args.settle_frames,
+            settle_tol_gray=args.settle_tol_gray,
             backend=args.backend,
             cv2_module=cv2_module,
             input_fn=input_fn,
             out=out,
+            clock=clock,
+            sleep=sleep,
         )
     except (ToolDependencyError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

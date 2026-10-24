@@ -37,3 +37,13 @@ cameras.<dev>.applied_ok.exposure_responds: true | false | null (null = not requ
 
 ## Stationary noise floor (report.py)
 Per-frame residual against the median frame, NO alignment (alignment can fit sensor noise and hides real vibration). Placement sessions report both aligned and unaligned residuals.
+
+## Settle check (capture.py, added after the first real run)
+Runs after the timed warm-up and before the first recorded frame (placement: before the first prompt). Options: --settle-max-s (default 30, 0 disables), --settle-frames (default 5), --settle-tol-gray (default 1.0). These are engineering settings meaning "brightness stopped changing", not quality thresholds. Check frames are discarded, never recorded.
+cameras.<dev>.settle: {"checked": bool, "settled": bool, "seconds": float, "frames_used": int, "last_means": [float], "tol_gray": float, "frames": int, "max_s": float}  (absent if the run aborted before the check)
+An unsettled camera adds a warning to cameras.<dev>.warnings. The end-of-run summary also hints when the first recorded frame is >10 % away from the median brightness.
+
+## report.py additions
+Options: --outlier-sigma (default 5.0), --outlier-floor-gray (default 2.0): a stationary frame is FLAGGED when |mean - median| > max(sigma * 1.4826 * MAD, floor). Flagging only helps you spot frames; nothing is dropped unless you pass --skip-first N. When frames are flagged, the report shows all-frames vs excluding-flagged side by side. --min-shift-response (default 0.1): the apparent drift line is hidden below this phase-correlation peak response and the real value is printed.
+summary.csv extra columns: frames_used, skip_first, flagged_frames, flagged_frame_indices and six excl_flagged_* columns (empty when nothing is flagged). report.json gains "settings" and the median shift response.
+

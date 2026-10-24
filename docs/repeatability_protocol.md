@@ -105,6 +105,14 @@ How to choose the values:
    the same values for every run in this study.
 4. Write the values in your notes.
 
+Before it records anything, the tool now waits until the picture brightness stops changing
+(the settle check: up to 30 s by default, change it with `--settle-max-s`; `0` turns it off).
+The check only watches the whole-picture average brightness for up to 30 s before recording. It does not guarantee a stable camera, and it cannot see later brightness steps, flicker or slow drift. The end-of-run summary says "Brightness settled after X s" or "NOT settled". If it says NOT
+settled, or prints a hint that the first frame differs from the median, fix the lighting or
+raise `--settle-max-s` and run again. A first run showed frame 0 at brightness 12.5 while all
+other frames sat near 51.5: the camera probably had not settled, and that one frame distorted the
+whole report.
+
 After the run, the tool prints a **Warnings** list. If it says the camera ignored a
 control, for example:
 
@@ -221,6 +229,15 @@ in sentences. The report has no pass or fail and no acceptance limit.
 - For each session: the `samples` folder (colour pictures, for example
   `sessions\stationary-1\samples`) and `sessions\stationary-1\session.json`.
 - Do not send the `frames_dev*.npz` files unless Quality asks. They are large.
+
+### Spotting a bad frame in the report
+
+The report flags frames whose brightness is far from the typical frame (a rule to help you
+spot them, not a quality limit; tune with `--outlier-sigma` and `--outlier-floor-gray`). When
+frames are flagged it shows the numbers for all frames and for all frames except the flagged
+ones, side by side. Nothing is dropped unless you ask: `--skip-first 1` leaves out frame 0.
+The drift/vibration line is hidden when the image is too flat or too noisy to measure
+(`--min-shift-response`), and the report prints the reason.
 
 ## 7. Defect classes from the MES
 
