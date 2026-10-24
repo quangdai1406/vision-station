@@ -192,3 +192,11 @@ The operator procedure for the real-webcam test is
 - `tools/criteria.py`: turns the MES criteria for a part into `class_map.json` and a sample-collection checklist.
 - `tools/thresholds.py`: computes candidate `t_low` and `t_img` from a labelled scores CSV. The values are candidates, not approved thresholds.
 - `tools/analysis.py`: the numpy-only measurements that `report.py` uses.
+
+## One-camera proof of concept
+
+To see the flow work with one USB webcam on a Windows PC (top picture, flip,
+bottom picture, GOOD or BAD on screen), follow
+[docs/poc_quickstart.md](docs/poc_quickstart.md). It is a demo: two images per
+part, a demo golden-image model, demo thresholds with no quality meaning, and
+no MES posting.

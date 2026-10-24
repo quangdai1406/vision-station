@@ -220,6 +220,11 @@ class GoldenModel:
     pixels with z >= z_ref / 2 (at least 4 downscaled pixels). Its score is the
     region's peak z over z_ref, clipped to 0..1. No defect when the image
     score is 0 or no region is large enough.
+
+    Note: the image score is p99-based, so it can differ from the defect peak, and an
+    image can reach a high score with no box (no region of at least 4 downscaled
+    pixels). Defects smaller than about 1 % of the working pixels barely move p99.
+    All constants are demo heuristics, not quality thresholds.
     """
 
     def __init__(
