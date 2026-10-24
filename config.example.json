@@ -1,0 +1,63 @@
+{
+  "site": "[SITE CODE, e.g. AISI1]",
+  "line": "[LINE CODE, e.g. L1]",
+  "station_id": "[STATION ID as registered in the MES, e.g. vision-station-1]",
+  "part_number": "[PART NUMBER, e.g. 817D-LINER-L]",
+  "lot": "[LOT NUMBER for this run]",
+  "operator": "[OPERATOR NAME for the shift]",
+  "supervisor": "[SUPERVISOR NAME for the shift]",
+  "material_handler": "[MATERIAL HANDLER NAME for the shift]",
+
+  "thresholds": {
+    "t_low": "[T_LOW: from Quality, a number 0..1]",
+    "t_img": "[T_IMG: from Quality, a number 0..1, >= t_low]"
+  },
+
+  "data_dir": "./data",
+  "users_file": "./users.json",
+
+  "ui": {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "session_timeout_s": 900
+  },
+
+  "mes": {
+    "base_url": "[MES BASE URL, e.g. http://127.0.0.1:3000]",
+    "token_env": "[NAME OF THE ENV VAR HOLDING THE MES TOKEN, e.g. STATION_MES_TOKEN]",
+    "criteria_ids": ["[CRITERION ID 1 from GET /api/machine/criteria/PART]"],
+    "class_to_criterion": {
+      "[DEFECT CLASS from the model, e.g. scratch]": "[CRITERION ID it maps to]"
+    },
+    "default_criterion_id": null,
+    "sync_interval_s": 5,
+    "default_bad_disposition": "quarantine"
+  },
+
+  "cameras": {
+    "kind": "opencv",
+    "devices": [0, 1, 2, 3],
+    "width": 2560,
+    "height": 1440,
+    "manual": {
+      "focus": null,
+      "exposure": null,
+      "white_balance": null
+    }
+  },
+
+  "model": {
+    "kind": "onnx",
+    "path": "[PATH TO THE ONNX MODEL FILE, e.g. ./models/defects.onnx]",
+    "version": "[MODEL VERSION, e.g. 2026-10-23-a]"
+  },
+
+  "outputs": {
+    "kind": "console"
+  },
+
+  "flip_timeout_s": 60,
+  "frame_ok": {
+    "min_variance": "[MIN LAPLACIAN VARIANCE for a sharp frame, or delete frame_ok]"
+  }
+}
