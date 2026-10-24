@@ -10,12 +10,24 @@ them (tests). Standard library and numpy only at module level.
 
 Pretrained weights: with weights_path=None, torchvision downloads its default
 ImageNet weights once (needs internet). On a corporate PC without internet,
-pass weights_path to a local state_dict file instead.
+pass weights_path to a local state_dict file instead. The extractor name then
+carries a short sha256 of that file, so a model built with other weights is
+refused on load.
 
-Decoded images are assumed to be RGB (or grey) with values 0..255.
+Input images must be RGB (or grey) with values 0..255, RGB channel order. The
+array itself cannot show its channel order, so the contract is: decode camera
+bytes with station.anomaly.cv2_rgb_decoder (cv2 gives BGR, the decoder flips it).
+
+Resizing: input is downscaled with antialias=True. Plain bilinear downscaling
+from a 1080p frame to 320 px averages away small defects before the network
+sees them. Choose input_hw with the smallest defect in mind (more pixels, more
+GPU time), and check it on real defect images before trusting a threshold.
+keep_aspect=True (default) letterboxes the image into input_hw instead of
+squashing it, so the aspect ratio of the part is not distorted.
 """
 from __future__ import annotations
 
+import hashlib
 import time
 from typing import Any
 
@@ -78,13 +90,33 @@ def _resolve_device(torch: Any, device: str) -> str:
     return device
 
 
+def _weights_id(weights_path: Any) -> str:
+    """'imagenet-default', or 'sha256-' plus the first 12 hex digits of the weights file."""
+    if weights_path is None:
+        return "imagenet-default"
+    digest = hashlib.sha256()
+    try:
+        with open(weights_path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise StationError(f"could not read weights file {weights_path}: {exc}") from exc
+    return "sha256-" + digest.hexdigest()[:12]
+
+
 class TorchExtractor:
     """Layer2 + layer3 features of a torchvision ResNet, as (H', W', C) float32 numpy.
 
     Steps: ImageNet normalisation; grey repeated to 3 channels; resize to
-    input_hw; layer2 and layer3 maps; 3x3 average pooling on each; layer3
-    bilinearly upsampled to layer2 size; concatenated on channels.
+    input_hw with antialias=True (letterboxed with zero padding, i.e. the
+    ImageNet mean grey, when keep_aspect=True; squashed otherwise); layer2 and
+    layer3 maps; 3x3 average pooling on each; layer3 bilinearly upsampled to
+    layer2 size; concatenated on channels.
     stride = input_h / H' (8 for ResNet layer2 at a size divisible by 8).
+
+    name = '<arch>-l2l3-aa-<h>x<w>-<letterbox|squash>-<weights id>'. Any change
+    to preprocessing or weights changes the name, so an older saved model is
+    refused on load instead of silently scoring with different features.
 
     UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest).
     """
@@ -96,6 +128,7 @@ class TorchExtractor:
         device: str = "auto",
         input_hw: tuple[int, int] = (320, 320),
         weights_path: Any = None,
+        keep_aspect: bool = True,
         torch_module: Any = None,
         torchvision_module: Any = None,
     ) -> None:
@@ -108,11 +141,15 @@ class TorchExtractor:
             raise StationError(f"input_hw must be (height, width), got {input_hw!r}") from exc
         if min(h, w) < 32:
             raise StationError(f"input_hw must be at least 32 pixels each side, got {(h, w)}")
+        if not isinstance(keep_aspect, bool):
+            raise StationError(f"keep_aspect must be True or False, got {keep_aspect!r}")
         torch = _import_torch(torch_module)
         tv = _import_torchvision(torchvision_module)
         self.arch = arch
         self.input_hw = (h, w)
-        self.name = f"{arch}-l2l3-{h}x{w}"
+        self.keep_aspect = keep_aspect
+        mode = "letterbox" if keep_aspect else "squash"
+        self.name = f"{arch}-l2l3-aa-{h}x{w}-{mode}-{_weights_id(weights_path)}"
         self.stride = 8  # layer2 of a torchvision ResNet; refreshed from the real map in extract()
         self.device = _resolve_device(torch, device)
         self._torch = torch
@@ -131,7 +168,10 @@ class TorchExtractor:
         self._model = model.to(self._torch_device)
 
     def extract(self, image: Any) -> Any:
-        """UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest)."""
+        """UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest).
+
+        image: 2D grey or 3D RGB (channel order R, G, B), values 0..255.
+        """
         np = _np()
         torch = self._torch
         F = torch.nn.functional
@@ -144,12 +184,24 @@ class TorchExtractor:
             raise StationError(f"image must be 2D grey or 3D RGB, got shape {arr.shape}")
         if arr.size == 0:
             raise StationError("image is empty")
+        src_h, src_w = int(arr.shape[0]), int(arr.shape[1])
         x = arr * np.float32(1.0 / 255.0)
         x = (x - np.asarray(_IMAGENET_MEAN, dtype=np.float32)) / np.asarray(_IMAGENET_STD, dtype=np.float32)
         chw = np.ascontiguousarray(x.transpose(2, 0, 1)[None], dtype=np.float32)
+        th, tw = self.input_hw
         with torch.no_grad():
             t = torch.from_numpy(chw).to(self._torch_device)
-            t = F.interpolate(t, size=self.input_hw, mode="bilinear", align_corners=False)
+            if self.keep_aspect:
+                scale = min(th / src_h, tw / src_w)
+                nh = min(th, max(1, round(src_h * scale)))
+                nw = min(tw, max(1, round(src_w * scale)))
+                top = (th - nh) // 2
+                left = (tw - nw) // 2
+                t = F.interpolate(t, size=(nh, nw), mode="bilinear", align_corners=False, antialias=True)
+                # zero after normalisation = ImageNet mean grey
+                t = F.pad(t, (left, tw - nw - left, top, th - nh - top), value=0.0)
+            else:
+                t = F.interpolate(t, size=(th, tw), mode="bilinear", align_corners=False, antialias=True)
             m = self._model
             x0 = m.maxpool(m.relu(m.bn1(m.conv1(t))))
             x1 = m.layer1(x0)
@@ -160,7 +212,7 @@ class TorchExtractor:
             f3 = F.interpolate(f3, size=tuple(int(v) for v in f2.shape[-2:]), mode="bilinear", align_corners=False)
             feat = torch.cat([f2, f3], dim=1)
             out = feat[0].permute(1, 2, 0).contiguous().cpu().numpy().astype(np.float32)
-        self.stride = max(1, int(round(self.input_hw[0] / out.shape[0])))
+        self.stride = max(1, int(round(th / out.shape[0])))
         return out
 
 
@@ -168,6 +220,11 @@ class TorchBackend:
     """nn_distance with torch.cdist, in row chunks of at most ~256 MB of distances.
 
     Data is centred on the bank mean before the distances are taken, as in NumpyBackend.
+
+    The centred bank is uploaded to the device once per bank object and cached
+    (keyed by the identity of the bank array, which PatchCoreModel keeps per key),
+    so a model's bank is not copied to the GPU for every image. Call clear() to
+    free the cached tensors, e.g. after a model is retired.
 
     UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest).
     """
@@ -179,23 +236,45 @@ class TorchBackend:
         self._torch = torch
         self._torch_device = torch.device(self.device)
         self.max_chunk_bytes = max(4, int(max_chunk_bytes))
+        # id(bank) -> (bank object kept alive, bank shape, column means, device tensor)
+        self._bank_cache: dict[int, tuple[Any, tuple[int, ...], Any, Any]] = {}
+
+    def clear(self) -> None:
+        """Drop every cached bank tensor."""
+        self._bank_cache.clear()
+
+    def _device_bank(self, bank: Any) -> tuple[tuple[int, ...], Any, Any]:
+        """UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest)."""
+        cached = self._bank_cache.get(id(bank))
+        if cached is not None and cached[0] is bank:
+            return cached[1], cached[2], cached[3]
+        np = _np()
+        torch = self._torch
+        b = np.asarray(bank, dtype=np.float32)
+        if b.ndim != 2:
+            raise ValueError(f"bank must be (M, C), got shape {b.shape}")
+        if b.shape[0] == 0:
+            raise ValueError("bank is empty")
+        mu = b.mean(axis=0, dtype=np.float64).astype(np.float32)
+        bt = torch.from_numpy(np.ascontiguousarray(b - mu)).to(self._torch_device)
+        shape = (int(b.shape[0]), int(b.shape[1]))
+        self._bank_cache[id(bank)] = (bank, shape, mu, bt)
+        return shape, mu, bt
 
     def nn_distance(self, queries: Any, bank: Any) -> Any:
         """UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest)."""
         np = _np()
         torch = self._torch
         q = np.asarray(queries, dtype=np.float32)
-        b = np.asarray(bank, dtype=np.float32)
-        if q.ndim != 2 or b.ndim != 2 or q.shape[1] != b.shape[1]:
-            raise ValueError(f"queries {q.shape} and bank {b.shape} must be (N, C) and (M, C) with equal C")
-        if b.shape[0] == 0:
-            raise ValueError("bank is empty")
-        n, m = q.shape[0], b.shape[0]
+        if q.ndim != 2:
+            raise ValueError(f"queries must be (N, C), got shape {q.shape}")
+        bank_shape, mu, bt = self._device_bank(bank)
+        if q.shape[1] != bank_shape[1]:
+            raise ValueError(f"queries {q.shape} and bank {bank_shape} must be (N, C) and (M, C) with equal C")
+        n, m = q.shape[0], bank_shape[0]
         out = np.empty(n, dtype=np.float32)
         if n == 0:
             return out
-        mu = b.mean(axis=0, dtype=np.float64).astype(np.float32)
-        bt = torch.from_numpy(np.ascontiguousarray(b - mu)).to(self._torch_device)
         rows = min(n, max(1, (self.max_chunk_bytes // 4) // m))
         with torch.no_grad():
             for rs in range(0, n, rows):

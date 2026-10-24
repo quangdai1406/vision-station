@@ -5,7 +5,9 @@ path is UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest).
 """
 import contextlib
 import importlib.util
+import os
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -21,14 +23,17 @@ if HAS_NUMPY:
 class FakeTensor:
     """A numpy array with just enough torch-like methods for the extractor and backend."""
 
-    def __init__(self, data):
+    def __init__(self, data, rec=None):
         self.data = np.asarray(data)
+        self.rec = rec
 
     @property
     def shape(self):
         return tuple(self.data.shape)
 
     def to(self, device, *args, **kwargs):
+        if self.rec is not None:
+            self.rec.log("to", device, self.shape)  # counts device uploads
         return self
 
     def cpu(self):
@@ -124,13 +129,19 @@ def make_torch(cuda=False):
         total = sum(padded[:, :, i:i + h_out, j:j + w_out] for i in range(k) for j in range(k))
         return FakeTensor(total / float(k * k))
 
-    def interpolate(x, size=None, mode="nearest", align_corners=None):
-        rec.log("interpolate", tuple(size), mode)
+    def interpolate(x, size=None, mode="nearest", align_corners=None, antialias=False):
+        rec.log("interpolate", tuple(size), mode, bool(antialias))
         a = _a(x)
         h_out, w_out = (int(v) for v in size)
         rows = np.arange(h_out) * a.shape[2] // h_out
         cols = np.arange(w_out) * a.shape[3] // w_out
         return FakeTensor(a[:, :, rows][:, :, :, cols])
+
+    def pad(x, pad_amounts, mode="constant", value=0.0):
+        left, right, top, bottom = (int(v) for v in pad_amounts)
+        rec.log("pad", (left, right, top, bottom), float(value))
+        a = _a(x)
+        return FakeTensor(np.pad(a, ((0, 0), (0, 0), (top, bottom), (left, right)), constant_values=value))
 
     def cdist(a, b):
         rec.log("cdist", _a(a).shape, _a(b).shape)
@@ -139,7 +150,7 @@ def make_torch(cuda=False):
 
     def from_numpy(array):
         rec.log("from_numpy", np.asarray(array).shape)
-        return FakeTensor(np.asarray(array))
+        return FakeTensor(np.asarray(array), rec)
 
     def cat(tensors, dim=0):
         rec.log("cat", dim, len(tensors))
@@ -161,7 +172,7 @@ def make_torch(cuda=False):
         cat=cat,
         cdist=cdist,
         load=load,
-        nn=SimpleNamespace(functional=SimpleNamespace(avg_pool2d=avg_pool2d, interpolate=interpolate)),
+        nn=SimpleNamespace(functional=SimpleNamespace(avg_pool2d=avg_pool2d, interpolate=interpolate, pad=pad)),
     )
     return torch, rec
 
@@ -213,7 +224,7 @@ class TorchExtractorTests(unittest.TestCase):
         feats = extractor.extract(image)
         self.assertEqual(feats.shape, (8, 8, 16))  # 6 (layer2) + 10 (layer3)
         self.assertEqual(feats.dtype, np.float32)
-        self.assertEqual(extractor.name, "resnet18-l2l3-64x64")
+        self.assertEqual(extractor.name, "resnet18-l2l3-aa-64x64-letterbox-imagenet-default")
         self.assertEqual(extractor.stride, 8)
         names = rec.names()
         self.assertLess(names.index("conv1"), names.index("layer2"))
@@ -258,10 +269,62 @@ class TorchExtractorTests(unittest.TestCase):
         self.assertFalse(any(c[0] == "load" for c in rec.calls))
 
     def test_local_weights_path_is_loaded_without_download(self):
-        extractor, rec = self._extractor(weights_path="/models/r18.pth")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "r18.pth")
+            with open(path, "wb") as fh:
+                fh.write(b"fake-weights")
+            extractor, rec = self._extractor(weights_path=path)
         self.assertIn(("build", "resnet18", None), rec.calls)
-        self.assertIn(("load", "/models/r18.pth", True), rec.calls)
+        self.assertIn(("load", path, True), rec.calls)
         self.assertIn(("load_state_dict", {"fake_state": 1}), rec.calls)
+
+    def test_name_includes_weights_id_so_other_weights_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, "a.pth")
+            second = os.path.join(tmp, "b.pth")
+            with open(first, "wb") as fh:
+                fh.write(b"weights-one")
+            with open(second, "wb") as fh:
+                fh.write(b"weights-two")
+            a, _ = self._extractor(weights_path=first)
+            a_again, _ = self._extractor(weights_path=first)
+            b, _ = self._extractor(weights_path=second)
+        self.assertRegex(a.name, r"-sha256-[0-9a-f]{12}$")
+        self.assertEqual(a.name, a_again.name)
+        self.assertNotEqual(a.name, b.name)
+        self.assertNotIn("imagenet-default", a.name)
+        self.assertNotIn(tmp, a.name)  # the path itself is not in the name
+
+    def test_missing_weights_file_is_station_error(self):
+        with self.assertRaises(StationError) as ctx:
+            self._extractor(weights_path="/no/such/weights.pth")
+        self.assertIn("could not read weights file", str(ctx.exception))
+
+    def test_downscaling_is_antialiased(self):
+        extractor, rec = self._extractor(input_hw=(64, 64))
+        extractor.extract(np.zeros((128, 128, 3)))
+        interp = [c for c in rec.calls if c[0] == "interpolate"]
+        self.assertTrue(interp)
+        # the first interpolate is the input resize; later ones are feature-map upsampling
+        self.assertEqual(interp[0], ("interpolate", (64, 64), "bilinear", True))
+
+    def test_letterbox_keeps_aspect_and_pads_the_short_side(self):
+        extractor, rec = self._extractor(input_hw=(64, 64))  # keep_aspect defaults to True
+        feats = extractor.extract(np.zeros((64, 32)))  # tall-narrow: scale 1, width 32 -> pad 16 each side
+        self.assertEqual(feats.shape, (8, 8, 16))
+        self.assertIn(("interpolate", (64, 32), "bilinear", True), rec.calls)
+        self.assertIn(("pad", (16, 16, 0, 0), 0.0), rec.calls)
+
+    def test_squash_resizes_straight_to_input_size(self):
+        extractor, rec = self._extractor(input_hw=(64, 64), keep_aspect=False)
+        extractor.extract(np.zeros((64, 32)))
+        self.assertIn(("interpolate", (64, 64), "bilinear", True), rec.calls)
+        self.assertFalse(any(c[0] == "pad" for c in rec.calls))
+        self.assertTrue(extractor.name.endswith("-squash-imagenet-default"))
+
+    def test_keep_aspect_must_be_bool(self):
+        with self.assertRaises(StationError):
+            self._extractor(keep_aspect="yes")
 
     def test_unsupported_arch_and_small_input_rejected(self):
         torch, rec = make_torch()
@@ -276,7 +339,7 @@ class TorchExtractorTests(unittest.TestCase):
         tv = make_torchvision(rec)
         extractor = features_torch.TorchExtractor("wide_resnet50_2", input_hw=(64, 64),
                                                   torch_module=torch, torchvision_module=tv)
-        self.assertEqual(extractor.name, "wide_resnet50_2-l2l3-64x64")
+        self.assertEqual(extractor.name, "wide_resnet50_2-l2l3-aa-64x64-letterbox-imagenet-default")
         self.assertIn(("build", "wide_resnet50_2", "DEFAULT"), rec.calls)
 
 
@@ -307,6 +370,37 @@ class TorchBackendTests(unittest.TestCase):
         torch, _ = make_torch(cuda=False)
         self.assertEqual(features_torch.TorchBackend(torch_module=torch).device, "cpu")
 
+    def test_bank_is_uploaded_once_per_model_and_clear_resets(self):
+        torch, rec = make_torch()
+        backend = features_torch.TorchBackend(torch_module=torch)
+        bank = np.random.RandomState(1).randn(40, 5).astype(np.float32)
+        queries = np.random.RandomState(2).randn(90, 5).astype(np.float32)
+        want = anomaly.NumpyBackend().nn_distance(queries, bank)
+        bank_uploads = lambda: sum(1 for c in rec.calls if c[0] == "to" and c[2] == (40, 5))
+        for _ in range(3):
+            np.testing.assert_allclose(backend.nn_distance(queries, bank), want, rtol=1e-4, atol=1e-3)
+        self.assertEqual(bank_uploads(), 1)
+        backend.clear()
+        backend.nn_distance(queries, bank)
+        self.assertEqual(bank_uploads(), 2)
+
+    def test_a_different_bank_object_is_uploaded_separately(self):
+        torch, rec = make_torch()
+        backend = features_torch.TorchBackend(torch_module=torch)
+        queries = np.random.RandomState(3).randn(10, 5).astype(np.float32)
+        bank_a = np.random.RandomState(4).randn(40, 5).astype(np.float32)
+        bank_b = np.random.RandomState(5).randn(40, 5).astype(np.float32)
+        backend.nn_distance(queries, bank_a)
+        backend.nn_distance(queries, bank_b)
+        backend.nn_distance(queries, bank_a)
+        self.assertEqual(sum(1 for c in rec.calls if c[0] == "to" and c[2] == (40, 5)), 2)
+
+    def test_mismatched_dimension_is_value_error(self):
+        torch, _ = make_torch()
+        backend = features_torch.TorchBackend(torch_module=torch)
+        with self.assertRaises(ValueError):
+            backend.nn_distance(np.zeros((3, 4), dtype=np.float32), np.zeros((5, 3), dtype=np.float32))
+
 
 @unittest.skipUnless(HAS_NUMPY, "numpy not installed")
 class SelftestTests(unittest.TestCase):
@@ -319,7 +413,7 @@ class SelftestTests(unittest.TestCase):
             set(report),
             {"name", "device", "feature_shape", "seconds", "cuda_available", "torch_version"},
         )
-        self.assertEqual(report["name"], "resnet18-l2l3-64x64")
+        self.assertEqual(report["name"], "resnet18-l2l3-aa-64x64-letterbox-imagenet-default")
         self.assertEqual(report["device"], "cpu")
         self.assertEqual(report["feature_shape"], [8, 8, 16])
         self.assertFalse(report["cuda_available"])

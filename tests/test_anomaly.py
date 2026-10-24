@@ -1,8 +1,11 @@
 import importlib.util
+import json
 import os
+import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from station import anomaly
@@ -182,14 +185,17 @@ class PatchCoreTests(unittest.TestCase):
 
     def test_holdout_sets_norm_ref_and_source(self):
         builder = self._train()
-        builder.add_holdout(_frame(_good(seed=200)))
+        # two held-out images: this fixture's block statistics are so discrete that one
+        # float16 held-out image can match the float16 bank exactly (raw score 0)
+        builder.add_holdout(_frame(_good(seed=100)))
+        builder.add_holdout(_frame(_good(seed=101)))
         model = builder.build("pc-h")
         info = model.describe()["banks"]["C1/TOP"]
         self.assertEqual(info["norm_ref_source"], "holdout")
-        self.assertEqual(info["holdout_images"], 1)
+        self.assertEqual(info["holdout_images"], 2)
         self.assertGreater(info["norm_ref"], 0.0)
         raw_holdout = model._keys[("C1", "TOP")].calibration_raw
-        self.assertEqual(len(raw_holdout), 1)
+        self.assertEqual(len(raw_holdout), 2)
         self.assertAlmostEqual(info["norm_ref"], 2.0 * max(raw_holdout), places=9)
 
     def test_training_residual_path(self):
@@ -306,6 +312,276 @@ class PatchCoreTests(unittest.TestCase):
         with mock.patch.dict("sys.modules", {"station.modelstore": fake_store}):
             anomaly.register_patchcore_loader(BlockExtractor)
         self.assertEqual(calls, ["patchcore"])
+
+
+def _fit(level=120, seeds=range(4), holdout_seeds=(100, 101), version="v1", extractor=None, **kwargs):
+    builder = _builder(extractor, **kwargs)
+    for s in seeds:
+        builder.add(_frame(_good(level, seed=s)))
+    for s in holdout_seeds:
+        builder.add_holdout(_frame(_good(level, seed=s)))
+    return builder.build(version)
+
+
+def _update(model, seeds=(), level=120, holdout_seeds=(), version="v2", extractor=None, **kwargs):
+    builder = anomaly.PatchCoreBuilder.from_model(model, extractor or BlockExtractor(), _decode, **kwargs)
+    for s in seeds:
+        builder.add(_frame(_good(level, seed=s)))
+    for s in holdout_seeds:
+        builder.add_holdout(_frame(_good(level, seed=s)))
+    return builder.build(version)
+
+
+def _raw_against(model, key, feats):
+    bank32 = np.asarray(model.bank(key), dtype=np.float32)
+    return float(anomaly.NumpyBackend().nn_distance(np.asarray(feats, dtype=np.float32), bank32).max())
+
+
+def _block_feats(seed, level=120):
+    return BlockExtractor().extract(_good(level, seed=seed)).reshape(-1, 4).astype(np.float16)
+
+
+class _OtherDimExtractor(BlockExtractor):
+    """Same name and input size, but 3 features per cell instead of 4."""
+
+    def extract(self, image):
+        return super().extract(image)[..., :3]
+
+
+def _write_legacy_v1(path, model):
+    """Write a file in the patchcore-v1 layout (no holdout features, no parent, no input_hw)."""
+    arrays = {}
+    entries = []
+    for key in model.keys():
+        tag = f"{key[0]}__{key[1]}"
+        bank = np.asarray(model.bank(key), dtype=np.float16)
+        arrays[f"bank__{tag}"] = bank
+        entries.append({
+            "camera_id": key[0], "side": key[1], "bank_rows": int(bank.shape[0]),
+            "feature_dim": int(bank.shape[1]), "norm_ref": model.norm_ref(key),
+            "norm_ref_source": "holdout", "train_images": 4, "holdout_images": 2,
+            "calibration_raw": [],
+        })
+    meta = {"schema": "patchcore-v1", "version": model.version,
+            "extractor": {"name": BlockExtractor.name, "stride": 8}, "settings": {}, "keys": entries}
+    arrays["meta"] = np.array(json.dumps(meta, sort_keys=True))
+    anomaly._write_npz(np, path, arrays)
+
+
+class _FakeCv2:
+    IMREAD_COLOR = 1
+
+    def __init__(self, image):
+        self.image = image
+        self.buffers = []
+
+    def imdecode(self, buf, flag):
+        self.buffers.append((len(buf), flag))
+        return self.image
+
+
+@unittest.skipUnless(HAS_NUMPY, "numpy not installed")
+class IncrementalTests(unittest.TestCase):
+    def test_accessors(self):
+        model = _fit()
+        self.assertEqual(model.keys(), [("C1", "TOP")])
+        self.assertEqual(model.bank(("C1", "TOP")).dtype, np.float16)
+        self.assertEqual(model.norm_ref(("C1", "TOP")), model.describe()["banks"]["C1/TOP"]["norm_ref"])
+        self.assertEqual(model.extractor_name, BlockExtractor.name)
+        self.assertEqual(model.input_hw, SHAPE)
+        self.assertIsNone(model.parent_version)
+        with self.assertRaises(StationError):
+            model.bank(("C9", "TOP"))
+
+    def test_from_model_rejects_extractor_name_mismatch(self):
+        model = _fit()
+        other = BlockExtractor()
+        other.name = "other-extractor"
+        with self.assertRaises(StationError) as ctx:
+            anomaly.PatchCoreBuilder.from_model(model, other, _decode)
+        self.assertIn(BlockExtractor.name, str(ctx.exception))
+        self.assertIn("other-extractor", str(ctx.exception))
+
+    def test_from_model_rejects_input_hw_mismatch(self):
+        model = _fit()
+        other = BlockExtractor()
+        other.input_hw = (64, 64)
+        with self.assertRaises(StationError) as ctx:
+            anomaly.PatchCoreBuilder.from_model(model, other, _decode)
+        self.assertIn("input size", str(ctx.exception))
+
+    def test_from_model_rejects_feature_dimension_mismatch_on_add(self):
+        model = _fit()
+        builder = anomaly.PatchCoreBuilder.from_model(model, _OtherDimExtractor(), _decode)
+        with self.assertRaises(StationError) as ctx:
+            builder.add(_frame(_good(seed=9)))
+        self.assertIn("feature dimension 3", str(ctx.exception))
+        self.assertIn("4", str(ctx.exception))
+
+    def test_update_extends_bank_and_new_style_scores_drop(self):
+        model = _fit()
+        before = model.predict(_frame(_good(122, seed=60))).score
+        self.assertGreater(before, 0.5)
+        updated = _update(model, seeds=range(10, 13), level=122)
+        self.assertLess(updated.predict(_frame(_good(122, seed=60))).score, before)
+        self.assertLess(updated.predict(_frame(_good(122, seed=61))).score, 0.5)
+        self.assertLess(updated.predict(_frame(_good(120, seed=50))).score, 0.5)
+        self.assertGreater(updated.describe()["banks"]["C1/TOP"]["rows"], 0)
+
+    def test_defect_after_update_still_scores_high_with_original_box(self):
+        model = _fit()
+        updated = _update(model, seeds=range(10, 13), level=122)
+        arr, blob = _blob_image(seed=51)
+        bad = updated.predict(_frame(arr))
+        self.assertGreater(bad.score, 0.5)
+        self.assertEqual(len(bad.defects), 1)
+        box = bad.defects[0].box
+        self.assertLessEqual(box[0] + box[2], SHAPE[1])
+        self.assertLessEqual(box[1] + box[3], SHAPE[0])
+        self.assertGreater(_overlap_fraction(box, blob), 0.5)
+
+    def test_keys_only_in_old_model_are_kept_unchanged(self):
+        builder = _builder()
+        for i in range(3):
+            builder.add(_frame(_good(120, seed=i), side=Side.TOP))
+            builder.add(_frame(_good(60, seed=i), side=Side.BOTTOM))
+        builder.add_holdout(_frame(_good(120, seed=40), side=Side.TOP))
+        builder.add_holdout(_frame(_good(60, seed=40), side=Side.BOTTOM))
+        model = builder.build("both")
+        bottom_bank = np.array(model.bank(("C1", "BOTTOM")), copy=True)
+        bottom_norm = model.norm_ref(("C1", "BOTTOM"))
+        updated = _update(model, seeds=range(10, 12), level=120)
+        self.assertEqual(updated.keys(), [("C1", "BOTTOM"), ("C1", "TOP")])
+        np.testing.assert_array_equal(updated.bank(("C1", "BOTTOM")), bottom_bank)
+        self.assertEqual(updated.norm_ref(("C1", "BOTTOM")), bottom_norm)
+        self.assertEqual(updated.describe()["banks"]["C1/BOTTOM"]["images_seen"], 3)
+        self.assertEqual(updated.describe()["banks"]["C1/TOP"]["images_seen"], 5)
+
+    def test_key_new_in_update_needs_two_images(self):
+        model = _fit()
+        builder = anomaly.PatchCoreBuilder.from_model(model, BlockExtractor(), _decode)
+        builder.add(_frame(_good(seed=5), camera="C2"))
+        with self.assertRaises(ValueError) as ctx:
+            builder.build("v2")
+        self.assertIn("C2/TOP", str(ctx.exception))
+        builder = anomaly.PatchCoreBuilder.from_model(model, BlockExtractor(), _decode)
+        builder.add(_frame(_good(seed=5), camera="C2"))
+        builder.add(_frame(_good(seed=6), camera="C2"))
+        updated = builder.build("v2")
+        self.assertEqual(updated.keys(), [("C1", "TOP"), ("C2", "TOP")])
+        self.assertEqual(updated.describe()["banks"]["C2/TOP"]["images_seen"], 2)
+
+    def test_parent_version_and_images_seen_accumulate_over_two_updates(self):
+        v1 = _fit(seeds=range(3), version="v1")
+        self.assertEqual(v1.describe()["banks"]["C1/TOP"]["images_seen"], 3)
+        v2 = _update(v1, seeds=range(10, 12), version="v2")
+        self.assertEqual(v2.parent_version, "v1")
+        self.assertEqual(v2.describe()["parent_version"], "v1")
+        self.assertEqual(v2.describe()["banks"]["C1/TOP"]["images_seen"], 5)
+        self.assertEqual(v2.describe()["banks"]["C1/TOP"]["train_images"], 2)
+        v3 = _update(v2, seeds=[20], version="v3")
+        self.assertEqual(v3.parent_version, "v2")
+        self.assertEqual(v3.describe()["banks"]["C1/TOP"]["images_seen"], 6)
+        self.assertEqual(v3.describe()["banks"]["C1/TOP"]["train_images"], 1)
+        self.assertEqual(v3.describe()["banks"]["C1/TOP"]["holdout_images"], 2)
+
+    def test_holdout_cap_keeps_newest(self):
+        builder = _builder(max_holdout_images=2)
+        for i in range(3):
+            builder.add(_frame(_good(seed=i)))
+        for s in (200, 201, 202, 203):
+            builder.add_holdout(_frame(_good(seed=s)))
+        model = builder.build("cap")
+        retained = model._keys[("C1", "TOP")].holdout_features
+        self.assertEqual(len(retained), 2)
+        np.testing.assert_array_equal(retained[0][0], _block_feats(202))
+        np.testing.assert_array_equal(retained[1][0], _block_feats(203))
+        self.assertEqual(len(model._keys[("C1", "TOP")].calibration_raw), 2)
+
+        updated = _update(model, holdout_seeds=[210], seeds=[30], max_holdout_images=2)
+        retained = updated._keys[("C1", "TOP")].holdout_features
+        self.assertEqual(len(retained), 2)
+        np.testing.assert_array_equal(retained[0][0], _block_feats(203))
+        np.testing.assert_array_equal(retained[1][0], _block_feats(210))
+
+    def test_recalibration_uses_old_holdout_features_without_old_pictures(self):
+        model = _fit(holdout_seeds=(100, 101))
+        # the old training and held-out pictures are gone: only new pictures are passed in
+        updated = _update(model, seeds=range(10, 13), level=120)
+        info = updated.describe()["banks"]["C1/TOP"]
+        self.assertEqual(info["norm_ref_source"], "holdout")
+        self.assertEqual(info["holdout_images"], 2)
+        raws = [_raw_against(updated, ("C1", "TOP"), _block_feats(s)) for s in (100, 101)]
+        self.assertAlmostEqual(info["norm_ref"], 2.0 * max(raws), places=5)
+        self.assertEqual(len(updated._keys[("C1", "TOP")].calibration_raw), 2)
+
+    def test_update_without_any_holdout_falls_back_to_training_residual(self):
+        model = _fit(holdout_seeds=())
+        updated = _update(model, seeds=range(10, 13), level=120)
+        self.assertEqual(updated.describe()["banks"]["C1/TOP"]["norm_ref_source"], "training_residual")
+
+    def test_update_is_deterministic_and_saves_byte_identical(self):
+        model = _fit()
+        first = _update(model, seeds=range(10, 13), level=122)
+        second = _update(model, seeds=range(10, 13), level=122)
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b, c = (os.path.join(tmp, n) for n in ("a.npz", "b.npz", "c.npz"))
+            first.save(a)
+            second.save(b)
+            with open(a, "rb") as fa, open(b, "rb") as fb:
+                self.assertEqual(fa.read(), fb.read())
+            loaded = anomaly.PatchCoreModel.load(a, _decode, BlockExtractor())
+            loaded.save(c)
+            with open(a, "rb") as fa, open(c, "rb") as fc:
+                self.assertEqual(fa.read(), fc.read())
+            self.assertEqual(loaded.parent_version, "v1")
+            self.assertEqual(loaded.describe()["banks"]["C1/TOP"]["holdout_images"], 2)
+            # the loaded model can be updated again with only new pictures
+            again = _update(loaded, seeds=[40], level=122, version="v3")
+            self.assertEqual(again.describe()["banks"]["C1/TOP"]["images_seen"], 8)  # 4 + 3 + 1
+
+    def test_legacy_v1_file_scores_but_refuses_update(self):
+        model = _fit()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "old.npz")
+            _write_legacy_v1(path, model)
+            loaded = anomaly.PatchCoreModel.load(path, _decode, BlockExtractor())
+        self.assertTrue(loaded.legacy)
+        self.assertIsNone(loaded.parent_version)
+        self.assertIsNone(loaded.input_hw)
+        self.assertEqual(loaded.describe()["banks"]["C1/TOP"]["images_seen"], 4)
+        self.assertEqual(loaded.predict(_frame(_good(seed=3))).score, model.predict(_frame(_good(seed=3))).score)
+        with self.assertRaises(StationError) as ctx:
+            anomaly.PatchCoreBuilder.from_model(loaded, BlockExtractor(), _decode)
+        self.assertIn("Retrain", str(ctx.exception))
+
+
+@unittest.skipUnless(HAS_NUMPY, "numpy not installed")
+class Cv2RgbDecoderTests(unittest.TestCase):
+    def test_bgr_is_converted_to_rgb(self):
+        bgr = np.zeros((4, 5, 3), dtype=np.uint8)
+        bgr[..., 0] = 10  # blue
+        bgr[..., 1] = 20  # green
+        bgr[..., 2] = 30  # red
+        cv2 = _FakeCv2(bgr)
+        frame = Frame(camera_id="C1", side=Side.TOP, seq=0, timestamp_utc="2026-10-24T08:30:00Z",
+                      data=b"encoded-bytes")
+        out = anomaly.cv2_rgb_decoder(cv2)(frame)
+        self.assertEqual(out.shape, (4, 5, 3))
+        self.assertEqual(out.dtype, np.uint8)
+        self.assertEqual(tuple(out[0, 0]), (30, 20, 10))
+        self.assertEqual(cv2.buffers, [(len(b"encoded-bytes"), 1)])
+
+    def test_undecodable_payload_is_station_error(self):
+        frame = Frame(camera_id="C1", side=Side.TOP, seq=0, timestamp_utc="2026-10-24T08:30:00Z", data=b"bad")
+        with self.assertRaises(StationError):
+            anomaly.cv2_rgb_decoder(_FakeCv2(None))(frame)
+
+    def test_missing_cv2_is_station_error(self):
+        with mock.patch.dict(sys.modules, {"cv2": None}):
+            with self.assertRaises(StationError) as ctx:
+                anomaly.cv2_rgb_decoder()
+        self.assertIn("opencv", str(ctx.exception))
 
 
 if __name__ == "__main__":
