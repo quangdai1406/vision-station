@@ -11,7 +11,9 @@ import tempfile
 import threading
 import unittest
 import urllib.parse
+from unittest import mock
 
+from station import auth as station_auth
 from station.auth import SessionManager, UserStore, hash_password
 from station.contracts import InvalidTransition, Verdict
 from station.ui import make_server
@@ -45,6 +47,15 @@ class FakeSession:
         # False leaves prompt, press_ready and flip_wait_s out of snapshot().
         self.new_keys = True
         self.preview_bytes = JPEG_BYTES
+        # Part picker: when set, these keys are merged into snapshot() (parts_mode 'mes').
+        self.parts_snapshot = None
+        self.parts = [{"part_number": "AISI-100", "description": "Liner LH", "part_type": "FG",
+                       "lifecycle": "ACTIVE", "unit_cost": 12.5, "bom": ["x"],
+                       "planning": {"wo": 3}}]
+        self.select_result = {"part_number": "AISI-100", "model_version": "m-7",
+                              "can_inspect": True}
+        self.current = {"part_number": "AISI-100", "model_version": "m-7", "can_inspect": True,
+                        "reason": None, "parts_mode": "mes"}
 
     def _call(self, name, **kwargs):
         self.calls.append((name, kwargs))
@@ -87,6 +98,8 @@ class FakeSession:
             out["prompt"] = self.prompt
             out["press_ready"] = self.press_ready
             out["flip_wait_s"] = self.flip_wait_s
+        if self.parts_snapshot is not None:
+            out.update(self.parts_snapshot)
         return out
 
     def press(self):
@@ -111,6 +124,22 @@ class FakeSession:
     def preview(self, camera_id):
         self._call("preview", camera_id=camera_id)
         return self.preview_bytes
+
+    def search_parts(self, q, limit=20):
+        self._call("search_parts", q=q, limit=limit)
+        return list(self.parts)
+
+    def select_part(self, part_number, by):
+        self._call("select_part", part_number=part_number, by=by)
+        return dict(self.select_result)
+
+    def current_part(self):
+        self._call("current_part")
+        return dict(self.current)
+
+
+class PartsError(Exception):
+    """Stand-in for the MES client's error. The UI matches it by class name only."""
 
 
 class UiTestCase(unittest.TestCase):
@@ -632,6 +661,225 @@ class PartialStationTests(UiTestCase):
         self.assertNotIn("camera_ids", body)
         self.assertEqual(body["state"], "IDLE")
         self.assertEqual(self.call("GET", "/").status, 200)
+
+
+class PartsApiTests(UiTestCase):
+    def test_search_requires_login(self):
+        self.assertEqual(self.call("GET", "/api/parts/search?q=AISI").status, 401)
+        self.assertNotIn("search_parts", self.session.names())
+
+    def test_search_open_to_every_role_and_strips_q(self):
+        for user, pw in ((OP_USER, OP_PW), (SUP_USER, SUP_PW), (ADM_USER, ADM_PW)):
+            with self.subTest(user=user):
+                token = self.login(user, pw)
+                reply = self.call("GET", "/api/parts/search?q=%20AISI%20", token=token)
+                self.assertEqual(reply.status, 200)
+        self.assertEqual(self.session.calls[-1], ("search_parts", {"q": "AISI", "limit": 20}))
+
+    def test_search_q_must_be_1_to_100_characters(self):
+        token = self.login(OP_USER, OP_PW)
+        for query in ("", "q=", "q=%20%20%20", "q=" + "x" * 101):
+            with self.subTest(query=query[:12]):
+                reply = self.call("GET", "/api/parts/search?" + query, token=token)
+                self.assertEqual(reply.status, 400)
+        self.assertNotIn("search_parts", self.session.names())
+        self.assertEqual(self.call("GET", "/api/parts/search?q=" + "x" * 100, token=token).status,
+                         200)
+
+    def test_search_limit_defaults_and_clamps(self):
+        token = self.login(OP_USER, OP_PW)
+        cases = {"": 20, "&limit=abc": 20, "&limit=0": 1, "&limit=-5": 1,
+                 "&limit=7": 7, "&limit=999": 50}
+        for suffix, expected in cases.items():
+            with self.subTest(suffix=suffix):
+                self.session.calls = []
+                reply = self.call("GET", "/api/parts/search?q=AISI" + suffix, token=token)
+                self.assertEqual(reply.status, 200)
+                self.assertEqual(self.session.calls[-1],
+                                 ("search_parts", {"q": "AISI", "limit": expected}))
+
+    def test_search_returns_only_the_four_allowed_keys(self):
+        token = self.login(OP_USER, OP_PW)
+        reply = self.call("GET", "/api/parts/search?q=AISI", token=token)
+        self.assertNotIn(b"unit_cost", reply.body)
+        self.assertNotIn(b"planning", reply.body)
+        self.assertNotIn(b"bom", reply.body)
+        self.assertEqual(self.js(reply), {"results": [{
+            "part_number": "AISI-100", "description": "Liner LH",
+            "part_type": "FG", "lifecycle": "ACTIVE"}]})
+
+    def test_search_partserror_is_502_and_hides_detail(self):
+        token = self.login(OP_USER, OP_PW)
+        self.session.errors["search_parts"] = PartsError("connect to mes-db.internal failed")
+        reply = self.call("GET", "/api/parts/search?q=AISI", token=token)
+        self.assertEqual(reply.status, 502)
+        self.assertIn("error", self.js(reply))
+        self.assertNotIn(b"mes-db", reply.body)
+
+    def test_search_valueerror_is_400(self):
+        token = self.login(OP_USER, OP_PW)
+        self.session.errors["search_parts"] = ValueError("bad query")
+        self.assertEqual(self.call("GET", "/api/parts/search?q=AISI", token=token).status, 400)
+
+    def test_select_requires_login(self):
+        reply = self.call("POST", "/api/part/select", {"part_number": "AISI-100"})
+        self.assertEqual(reply.status, 401)
+        self.assertNotIn("select_part", self.session.names())
+
+    def test_select_open_to_operator_supervisor_admin_and_by_is_logged_in_user(self):
+        for user, pw in ((OP_USER, OP_PW), (SUP_USER, SUP_PW), (ADM_USER, ADM_PW)):
+            with self.subTest(user=user):
+                token = self.login(user, pw)
+                reply = self.call("POST", "/api/part/select",
+                                  {"part_number": "AISI-100", "by": "mallory"}, token=token)
+                self.assertEqual(reply.status, 200)
+                self.assertEqual(self.session.calls[-1],
+                                 ("select_part", {"part_number": "AISI-100", "by": user}))
+        self.assertEqual(self.js(reply)["model_version"], "m-7")
+
+    def test_select_role_without_action_gets_403(self):
+        token = self.login(OP_USER, OP_PW)
+        with mock.patch.dict(station_auth._POLICY, {"operator": frozenset({"press", "ack"})}):
+            reply = self.call("POST", "/api/part/select", {"part_number": "AISI-100"}, token=token)
+        self.assertEqual(reply.status, 403)
+        self.assertNotIn("select_part", self.session.names())
+
+    def test_select_bad_part_number_is_400(self):
+        token = self.login(OP_USER, OP_PW)
+        for body in ({"part_number": ""}, {"part_number": "   "}, {"part_number": "x" * 101},
+                     {"part_number": 5}, {}):
+            with self.subTest(body=body):
+                reply = self.call("POST", "/api/part/select", body, token=token)
+                self.assertEqual(reply.status, 400)
+        self.assertNotIn("select_part", self.session.names())
+
+    def test_select_accepts_exactly_100_characters(self):
+        token = self.login(OP_USER, OP_PW)
+        reply = self.call("POST", "/api/part/select", {"part_number": "x" * 100}, token=token)
+        self.assertEqual(reply.status, 200)
+
+    def test_select_invalid_transition_is_409(self):
+        token = self.login(OP_USER, OP_PW)
+        self.session.errors["select_part"] = InvalidTransition("part can only change while IDLE")
+        reply = self.call("POST", "/api/part/select", {"part_number": "AISI-100"}, token=token)
+        self.assertEqual(reply.status, 409)
+
+    def test_select_partserror_is_502_and_hides_detail(self):
+        token = self.login(OP_USER, OP_PW)
+        self.session.errors["select_part"] = PartsError("MES timeout at 10.0.0.5")
+        reply = self.call("POST", "/api/part/select", {"part_number": "AISI-100"}, token=token)
+        self.assertEqual(reply.status, 502)
+        self.assertNotIn(b"10.0.0.5", reply.body)
+
+    def test_select_valueerror_is_400(self):
+        token = self.login(OP_USER, OP_PW)
+        self.session.errors["select_part"] = ValueError("unknown part")
+        reply = self.call("POST", "/api/part/select", {"part_number": "AISI-100"}, token=token)
+        self.assertEqual(reply.status, 400)
+
+    def test_select_response_keeps_only_allowed_keys(self):
+        self.session.select_result = {"part_number": "AISI-100", "model_version": None,
+                                      "can_inspect": False, "reason": "no approved model",
+                                      "warnings": ["model review due"], "unit_cost": 9.9}
+        token = self.login(OP_USER, OP_PW)
+        body = self.js(self.call("POST", "/api/part/select", {"part_number": "AISI-100"},
+                                 token=token))
+        self.assertEqual(body, {"part_number": "AISI-100", "model_version": None,
+                                "can_inspect": False, "reason": "no approved model",
+                                "warnings": ["model review due"]})
+
+    def test_get_part_any_logged_in_role(self):
+        self.assertEqual(self.call("GET", "/api/part").status, 401)
+        for user, pw in ((OP_USER, OP_PW), (SUP_USER, SUP_PW), (ADM_USER, ADM_PW)):
+            with self.subTest(user=user):
+                token = self.login(user, pw)
+                reply = self.call("GET", "/api/part", token=token)
+                self.assertEqual(reply.status, 200)
+                body = self.js(reply)
+                self.assertEqual(body["part_number"], "AISI-100")
+                self.assertEqual(body["parts_mode"], "mes")
+                self.assertIs(body["can_inspect"], True)
+        self.assertIn("current_part", self.session.names())
+
+    def test_parts_snapshot_keys_pass_through_state(self):
+        self.session.parts_snapshot = {
+            "parts_mode": "mes", "camera": {"open": False, "last_error": "no frames"},
+            "part_number": "AISI-100", "part_selected": True, "model_version": "m-7",
+            "can_inspect": False, "block_reason": "no approved model"}
+        token = self.login(OP_USER, OP_PW)
+        body = self.js(self.call("GET", "/api/state", token=token))
+        for key, value in self.session.parts_snapshot.items():
+            self.assertEqual(body[key], value)
+
+    def test_old_snapshot_without_parts_keys_still_serves(self):
+        token = self.login(OP_USER, OP_PW)
+        reply = self.call("GET", "/api/state", token=token)
+        self.assertEqual(reply.status, 200)
+        body = self.js(reply)
+        for key in ("parts_mode", "camera", "part_selected", "block_reason"):
+            self.assertNotIn(key, body)
+
+
+class PartsPageTests(UiTestCase):
+    def page(self):
+        reply = self.call("GET", "/")
+        self.assertEqual(reply.status, 200)
+        return reply.body.decode("utf-8")
+
+    def test_part_panel_gated_on_parts_mode(self):
+        html = self.page()
+        self.assertIn('id="part-panel"', html)
+        self.assertIn("<h2>Part number</h2>", html)
+        self.assertIn('s.parts_mode === "mes"', html)
+        self.assertIn('el.partPanel.hidden = partsMode !== "mes"', html)
+        self.assertLess(html.index('id="part-panel"'), html.index('data-action="press"'))
+
+    def test_search_and_select_endpoints_wired(self):
+        html = self.page()
+        self.assertIn('id="part-q"', html)
+        self.assertIn('"/api/parts/search?q="', html)
+        self.assertIn('"/api/part/select"', html)
+        self.assertIn('el.partForm.addEventListener("submit"', html)
+
+    def test_press_labels_for_part_choice(self):
+        html = self.page()
+        self.assertIn('"Choose a part"', html)
+        self.assertIn('"No approved model"', html)
+        self.assertIn('"Press (Enter)"', html)
+
+    def test_camera_not_open_message(self):
+        html = self.page()
+        self.assertIn('id="cam-status"', html)
+        self.assertIn('"Camera not open: "', html)
+        self.assertIn("The live view retries every few seconds.", html)
+        self.assertLess(html.index('id="cam-status"'), html.index('id="live-grid"'))
+
+    def test_search_debounce_and_stale_response_guard(self):
+        html = self.page()
+        self.assertIn("PART_SEARCH_MIN_MS = 300", html)
+        self.assertIn("partSearchGen", html)
+        self.assertIn("if (g !== partSearchGen)", html)
+
+    def test_part_text_is_set_with_textcontent_only(self):
+        html = self.page()
+        self.assertIn("pn.textContent = row.part_number;", html)
+        self.assertIn("desc.textContent", html)
+        for bad in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):
+            self.assertNotIn(bad, html)
+
+    def test_part_script_passes_node_check_when_node_available(self):
+        if shutil.which("node") is None:
+            self.skipTest("node not available")
+        html = self.page()
+        m = re.search(r"<script>(.*?)</script>", html, re.S)
+        self.assertIsNotNone(m)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "page.js")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(m.group(1))
+            proc = subprocess.run(["node", "--check", path], capture_output=True, text=True,
+                                  timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
 if __name__ == "__main__":

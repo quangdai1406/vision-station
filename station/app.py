@@ -949,10 +949,7 @@ class StationApp:
         decode = cv2_decoder()
         if info.type == "patchcore":
             from station.anomaly import register_patchcore_loader  # noqa: PLC0415 - lazy, needs numpy
-            loader = register_patchcore_loader(self._make_extractor)
-            # register_patchcore_loader registers loader(path, decode, backend), but modelstore calls
-            # fn(info, decode): register the adapter that matches the modelstore contract.
-            register_loader("patchcore", lambda inf, dec: loader(inf.path, dec))
+            register_patchcore_loader(self._make_extractor)
         model = load_runtime_model(info, decode)
         model.version = info.version  # the approved version name is what the records show
         return model

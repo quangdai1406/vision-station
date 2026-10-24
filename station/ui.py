@@ -24,6 +24,13 @@ SESSION_COOKIE = "station_session"
 MAX_BODY_BYTES = 64 * 1024
 MAX_REASON_CHARS = 500
 PREVIEW_CAMERA_RE = re.compile(r"C[1-4]")
+PART_SEARCH_MAX_CHARS = 100
+PART_SEARCH_LIMIT_DEFAULT = 20
+PART_SEARCH_LIMIT_MAX = 50
+MAX_PART_NUMBER_CHARS = 100
+# Only these keys leave the server, so no cost or planning data reaches the browser.
+_PART_SEARCH_KEYS = ("part_number", "description", "part_type", "lifecycle")
+_PART_KEYS = ("part_number", "model_version", "can_inspect", "reason", "parts_mode", "warnings")
 
 _ACTION_PATHS = {
     "/api/press": "press",
@@ -87,6 +94,24 @@ def _parse_reason(data: dict) -> str:
     return reason
 
 
+def _pick(row: dict, keys: tuple) -> dict:
+    """Copy only the listed keys that the row has."""
+    return {key: row[key] for key in keys if key in row}
+
+
+def _call_parts(fn, *args, **kwargs):
+    """Call a parts method on the station. A PartsError (matched by class name, so this
+    module never imports the MES client) becomes 502 with a fixed message: the exception
+    text can name hosts or credentials, so it is not sent to the browser."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        if type(exc).__name__ == "PartsError":
+            print(f"parts service error: {type(exc).__name__}", file=sys.stderr)
+            raise _HttpError(502, "parts service unavailable") from None
+        raise
+
+
 class _Handler(BaseHTTPRequestHandler):
     # Filled in per server by make_server().
     station: Any = None
@@ -126,6 +151,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._state(urllib.parse.parse_qs(query))
         if path == "/api/preview":
             return self._preview(urllib.parse.parse_qs(query))
+        if path == "/api/parts/search":
+            return self._parts_search(urllib.parse.parse_qs(query))
+        if path == "/api/part":
+            return self._part_get()
         raise _HttpError(404, "not found")
 
     def _post(self) -> None:
@@ -134,6 +163,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._login()
         if path == "/api/logout":
             return self._logout()
+        if path == "/api/part/select":
+            return self._part_select()
         action = _ACTION_PATHS.get(path)
         if action is None:
             raise _HttpError(404, "not found")
@@ -190,6 +221,43 @@ class _Handler(BaseHTTPRequestHandler):
         if token:
             self.sessions.destroy(token)
         self._send_json(200, {"ok": True}, extra=[("Set-Cookie", _expired_cookie_header())])
+
+    def _parts_search(self, query: dict) -> None:
+        """Part-number search: any logged-in role. Returns only the allowed row keys."""
+        self._require()
+        q = query.get("q", [""])[-1].strip()
+        if not 1 <= len(q) <= PART_SEARCH_MAX_CHARS:
+            raise _HttpError(400, "q is required (1 to 100 characters)")
+        raw_limit = query.get("limit", [""])[-1].strip()
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            limit = PART_SEARCH_LIMIT_DEFAULT
+        limit = max(1, min(PART_SEARCH_LIMIT_MAX, limit))
+        rows = _call_parts(self.station.search_parts, q, limit=limit)
+        if not isinstance(rows, list):
+            raise RuntimeError("search_parts() must return a list")
+        results = [_pick(row, _PART_SEARCH_KEYS) for row in rows[:limit] if isinstance(row, dict)]
+        self._send_json(200, {"results": results})
+
+    def _part_get(self) -> None:
+        self._require()
+        current = _call_parts(self.station.current_part)
+        if not isinstance(current, dict):
+            raise RuntimeError("current_part() must return a dict")
+        self._send_json(200, _pick(current, _PART_KEYS))
+
+    def _part_select(self) -> None:
+        """Select a part. `by` is always the logged-in username, never the body."""
+        _, username, _role = self._require("select_part")
+        data = self._read_json()
+        raw = data.get("part_number")
+        if not isinstance(raw, str) or not raw.strip() or len(raw) > MAX_PART_NUMBER_CHARS:
+            raise _HttpError(400, "part_number is required (up to 100 characters)")
+        result = _call_parts(self.station.select_part, part_number=raw.strip(), by=username)
+        if not isinstance(result, dict):
+            raise RuntimeError("select_part() must return a dict")
+        self._send_json(200, _pick(result, _PART_KEYS))
 
     def _act(self, action: str) -> None:
         _, username, _role = self._require(action)
@@ -290,7 +358,11 @@ def make_server(session, users: UserStore, sessions: SessionManager,
     `session` must provide: snapshot(include_images=False) -> dict, press() -> bool,
     resolve_review(by, new_verdict, reason), override(by, new_verdict, reason),
     ack_alarm(), clear_fault(), tick(), preview(camera_id) -> bytes | None.
-    snapshot() may also carry prompt (str), press_ready (bool) and flip_wait_s (float).
+    snapshot() may also carry prompt (str), press_ready (bool) and flip_wait_s (float),
+    and in part mode parts_mode, camera ({open, last_error}), part_number, part_selected,
+    model_version, can_inspect and block_reason. Part picker (used when parts_mode is 'mes'):
+    search_parts(q, limit) -> list[dict], select_part(part_number, by) -> dict,
+    current_part() -> dict. A PartsError (matched by class name) maps to 502.
     InvalidTransition -> 409, ValueError -> 400.
     """
     handler = type("StationHandler", (_Handler,), {
@@ -374,6 +446,15 @@ input { font: inherit; width: 100%; padding: 10px; margin: 4px 0 12px; border-ra
 label { display: block; font-size: 14px; color: var(--muted); }
 .error { color: var(--bad); font-weight: 600; min-height: 1.4em; }
 .login { max-width: 360px; margin: 40px auto; }
+.part-line { font-weight: 600; margin: 0 0 8px; }
+.part-block { color: var(--bad); font-weight: 600; margin: 0 0 8px; }
+.part-note { font-size: 13px; margin: 8px 0 0; min-height: 1.2em; }
+.part-results { list-style: none; padding: 0; margin: 8px 0 0; }
+.part-results li + li { margin-top: 6px; }
+.part-choice { display: block; width: 100%; margin: 0; text-align: left; }
+.part-pn { font-weight: 700; margin-right: 8px; }
+.part-desc { display: block; font-size: 14px; color: var(--muted); font-weight: 400; }
+.cam-status { color: var(--bad); font-weight: 600; margin: 0 0 8px; }
 </style>
 </head>
 <body>
@@ -409,10 +490,24 @@ label { display: block; font-size: 14px; color: var(--muted); }
     </div>
     <section id="live" class="card" aria-label="Live view">
       <h3 class="live-title">Live view</h3>
+      <p id="cam-status" class="cam-status" role="status" hidden></p>
       <div id="live-grid" class="tiles"></div>
       <p class="muted hint">Live view (not saved)</p>
     </section>
     <div id="tiles" class="card"></div>
+    <section id="part-panel" class="card" aria-label="Part number" hidden>
+      <h2>Part number</h2>
+      <p id="part-line" class="part-line" role="status"></p>
+      <p id="part-block" class="part-block" hidden></p>
+      <form id="part-search-form">
+        <label for="part-q">Search AISI MES part numbers</label>
+        <input id="part-q" maxlength="100" autocomplete="off">
+        <button type="submit" id="part-search" class="secondary">Search</button>
+      </form>
+      <ul id="part-results" class="part-results"></ul>
+      <p id="part-note" class="part-note muted"></p>
+      <p id="part-warn" class="part-note muted"></p>
+    </section>
     <div class="card">
       <p id="prompt" class="prompt" hidden></p>
       <button data-action="press">Press (Enter)</button>
@@ -452,6 +547,7 @@ label { display: block; font-size: 14px; color: var(--muted); }
   var MSG_WAIT_CAPTURE = "Wait: the picture is being taken.";
   var MSG_FLIP_FIRST = "Press ignored: flip the part first, then press Enter.";
   var MSG_NOT_ACCEPTED = "Press was not accepted in the current state.";
+  var PART_SEARCH_MIN_MS = 300;
 
   function $(id) { return document.getElementById(id); }
 
@@ -461,6 +557,10 @@ label { display: block; font-size: 14px; color: var(--muted); }
     total: $("c-total"), good: $("c-good"), bad: $("c-bad"), tiles: $("tiles"),
     reason: $("reason"), poc: $("poc"), prompt: $("prompt"),
     pressStatus: $("press-status"), liveGrid: $("live-grid"),
+    partPanel: $("part-panel"), partLine: $("part-line"), partBlock: $("part-block"),
+    partForm: $("part-search-form"), partQ: $("part-q"), partSearch: $("part-search"),
+    partResults: $("part-results"), partNote: $("part-note"), partWarn: $("part-warn"),
+    camStatus: $("cam-status"),
     press: document.querySelector('[data-action="press"]')
   };
 
@@ -475,6 +575,15 @@ label { display: block; font-size: 14px; color: var(--muted); }
   var pressReady = true;
   var flipWait = 0;
   var pressAllowed = false;
+  // Part picker state. parts_mode 'fixed' (or no key, as in old snapshots) hides the panel.
+  var partsMode = "fixed";
+  var partSelected = false;
+  var canInspect = true;
+  var partBusy = false;
+  // Request counter: a search response is shown only if no newer search or selection began.
+  var partSearchGen = 0;
+  var partSearchLastAt = 0;
+  var partSearchTimer = null;
 
   function setError(msg) { el.error.textContent = msg || ""; }
   function setPressStatus(msg) { el.pressStatus.textContent = msg || ""; }
@@ -785,6 +894,8 @@ label { display: block; font-size: 14px; color: var(--muted); }
     flipWait = typeof s.flip_wait_s === "number" && s.flip_wait_s > 0 ? s.flip_wait_s : 0;
     el.prompt.textContent = typeof s.prompt === "string" ? s.prompt : "";
     el.prompt.hidden = el.prompt.textContent === "";
+    renderPart(s);
+    renderCamera(s);
     refreshPress();
 
     var verdict = (s.verdict === "GOOD" || s.verdict === "BAD" || s.verdict === "REVIEW") ? s.verdict : "NONE";
@@ -854,6 +965,10 @@ label { display: block; font-size: 14px; color: var(--muted); }
     stopPolling();
     liveStop();
     unlockPress();
+    cancelPartSearch();
+    partBusy = false;
+    partSearchGen += 1;
+    clearPartResults();
     lastPart = undefined;
     lastState = undefined;
     curState = undefined;
@@ -892,6 +1007,146 @@ label { display: block; font-size: 14px; color: var(--muted); }
     }).then(null, function (err) { handleError(g, err); });
   }
 
+  // ----- part picker (only when parts_mode is 'mes') ---------------------
+  // The part may change only between parts: the picker is locked while a press is
+  // in flight, while a select is running, or whenever the state is not IDLE.
+  function partsLocked() {
+    return partBusy || pressing || captureLocked || curState !== "IDLE";
+  }
+
+  function refreshPartPanel() {
+    var locked = partsLocked();
+    el.partQ.disabled = locked;
+    el.partSearch.disabled = locked;
+    Array.prototype.forEach.call(el.partResults.querySelectorAll("button"), function (b) {
+      b.disabled = locked;
+    });
+  }
+
+  function setPartNote(msg) { el.partNote.textContent = msg || ""; }
+
+  function clearPartResults() {
+    while (el.partResults.firstChild) { el.partResults.removeChild(el.partResults.firstChild); }
+    setPartNote("");
+  }
+
+  function cancelPartSearch() {
+    if (partSearchTimer !== null) { clearTimeout(partSearchTimer); }
+    partSearchTimer = null;
+  }
+
+  function warningsText(data) {
+    var list = data && Array.isArray(data.warnings) ? data.warnings : [];
+    return list.filter(function (w) { return typeof w === "string" && w !== ""; }).join(" ");
+  }
+
+  function renderPart(s) {
+    partsMode = s.parts_mode === "mes" ? "mes" : "fixed";
+    partSelected = s.part_selected === true;
+    canInspect = s.can_inspect !== false;
+    el.partPanel.hidden = partsMode !== "mes";
+    if (partsMode !== "mes") {
+      el.partLine.textContent = "";
+      el.partBlock.hidden = true;
+      return;
+    }
+    el.partLine.textContent = partSelected
+      ? "Part: " + String(s.part_number || "-") + ", model " + String(s.model_version || "-")
+      : "No part selected. Search for a part number, then pick it.";
+    var reason = typeof s.block_reason === "string" ? s.block_reason : "";
+    if (!reason && partSelected && !canInspect) { reason = "Cannot inspect this part."; }
+    el.partBlock.textContent = reason;
+    el.partBlock.hidden = reason === "";
+  }
+
+  // Camera status in the live view section. Absent camera key counts as open.
+  function renderCamera(s) {
+    var cam = s.camera && typeof s.camera === "object" ? s.camera : null;
+    var open = !(cam && cam.open === false);
+    el.camStatus.hidden = open;
+    if (open) {
+      el.camStatus.textContent = "";
+      return;
+    }
+    var why = cam && typeof cam.last_error === "string" && cam.last_error ? cam.last_error : "unknown error";
+    el.camStatus.textContent = "Camera not open: " + why + ". The live view retries every few seconds.";
+  }
+
+  function showPartResults(rows) {
+    clearPartResults();
+    var locked = partsLocked();
+    rows.forEach(function (row) {
+      if (!row || typeof row.part_number !== "string") { return; }
+      var li = document.createElement("li");
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "secondary part-choice";
+      btn.disabled = locked;
+      var pn = document.createElement("span");
+      pn.className = "part-pn";
+      pn.textContent = row.part_number;
+      var desc = document.createElement("span");
+      desc.className = "part-desc";
+      desc.textContent = typeof row.description === "string" ? row.description : "";
+      btn.appendChild(pn);
+      btn.appendChild(desc);
+      btn.addEventListener("click", function () { selectPart(row.part_number); });
+      li.appendChild(btn);
+      el.partResults.appendChild(li);
+    });
+    if (el.partResults.firstChild === null) { setPartNote("No matching part numbers."); }
+  }
+
+  // Debounce: a search request goes out at most once per PART_SEARCH_MIN_MS.
+  function requestPartSearch() {
+    cancelPartSearch();
+    var wait = Math.max(0, PART_SEARCH_MIN_MS - (Date.now() - partSearchLastAt));
+    partSearchTimer = setTimeout(runPartSearch, wait);
+  }
+
+  function runPartSearch() {
+    partSearchTimer = null;
+    var q = el.partQ.value.trim();
+    partSearchGen += 1;
+    var g = partSearchGen;
+    partSearchLastAt = Date.now();
+    clearPartResults();
+    if (!q) { return; }
+    request("GET", "/api/parts/search?q=" + encodeURIComponent(q) + "&limit=20").then(function (data) {
+      if (g !== partSearchGen) { return; }
+      showPartResults(data && Array.isArray(data.results) ? data.results : []);
+    }, function (err) {
+      if (g !== partSearchGen) { return; }
+      if (err.status === 401) { showLogin(); return; }
+      setError(err.message);
+    });
+  }
+
+  function selectPart(partNumber) {
+    if (partsLocked()) { return; }
+    setError("");
+    setPartNote("");
+    setPartWarn("");
+    partBusy = true;
+    partSearchGen += 1; // a pending search must not repopulate the list
+    cancelPartSearch();
+    refreshPartPanel();
+    request("POST", "/api/part/select", { part_number: partNumber }).then(function (data) {
+      partBusy = false;
+      clearPartResults();
+      setPartWarn(warningsText(data));
+      refreshPress();
+      schedule(0);
+    }, function (err) {
+      partBusy = false;
+      refreshPress();
+      if (err.status === 401) { showLogin(); return; }
+      setError(err.message);
+    });
+  }
+
+  function setPartWarn(msg) { el.partWarn.textContent = msg || ""; }
+
   // Press the part: from the Press button or the Enter key. One request at a time.
   var pressing = false;
   // Client-side lockout: after an accepted press the button stays disabled until a
@@ -907,6 +1162,7 @@ label { display: block; font-size: 14px; color: var(--muted); }
 
   // The Press label and enabled state: capture > not ready (flip wait) > allowed.
   function refreshPress() {
+    refreshPartPanel();
     var p = el.press;
     if (!p) { return; }
     if (captureLocked) {
@@ -916,6 +1172,16 @@ label { display: block; font-size: 14px; color: var(--muted); }
     }
     if (!pressReady) {
       p.textContent = flipWait > 0 ? "Wait " + Math.ceil(flipWait) + " s" : "Press (Enter)";
+      p.disabled = true;
+      return;
+    }
+    if (partsMode === "mes" && !partSelected) {
+      p.textContent = "Choose a part";
+      p.disabled = true;
+      return;
+    }
+    if (partsMode === "mes" && !canInspect) {
+      p.textContent = "No approved model";
       p.disabled = true;
       return;
     }
@@ -1014,6 +1280,12 @@ label { display: block; font-size: 14px; color: var(--muted); }
     }, function (err) {
       setError(err.message);
     });
+  });
+
+  el.partForm.addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    if (partsLocked()) { return; }
+    requestPartSearch();
   });
 
   el.logout.addEventListener("click", function () {

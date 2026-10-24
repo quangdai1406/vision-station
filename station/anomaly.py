@@ -813,7 +813,7 @@ def cv2_rgb_decoder(cv2_module: Any = None) -> Decode:
 
 
 def register_patchcore_loader(extractor_factory: Callable[[], Any]) -> Callable[..., PatchCoreModel]:
-    """Return a loader(path, decode, backend=None) for saved PatchCore models.
+    """Return a loader(info_or_path, decode, backend=None) for saved PatchCore models.
 
     Call this from the application. It imports station.modelstore only at call
     time, and registers the loader with modelstore.register_loader('patchcore', ...)
@@ -821,7 +821,9 @@ def register_patchcore_loader(extractor_factory: Callable[[], Any]) -> Callable[
     unregistered. The extractor is built by extractor_factory() at load time.
     """
 
-    def loader(path: Any, decode: Decode, backend: Any = None) -> PatchCoreModel:
+    def loader(source: Any, decode: Decode, backend: Any = None) -> PatchCoreModel:
+        # modelstore passes a ModelInfo; direct callers may pass the model path itself.
+        path = getattr(source, "path", source)
         return PatchCoreModel.load(path, decode, extractor_factory(), backend=backend)
 
     try:
