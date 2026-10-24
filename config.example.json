@@ -56,6 +56,7 @@
     "kind": "console"
   },
 
+  "parts": {"mode": "fixed", "models_dir": "./models"},
   "flip_timeout_s": 60,
   "min_flip_s": 2.0,
   "frame_ok": {

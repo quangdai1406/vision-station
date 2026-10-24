@@ -21,6 +21,7 @@ import re
 import sys
 import threading
 import time
+from dataclasses import replace
 from typing import Any, Callable, Mapping, Optional
 
 from station.auth import SessionManager, UserStore, load_users
@@ -28,7 +29,9 @@ from station.cameras import FakeCameraSet, OpenCvCameraSet, make_blur_check, utc
 from station.contracts import (
     CAMERA_IDS,
     Frame,
+    InvalidTransition,
     PartRecord,
+    State,
     StationError,
     Thresholds,
     camera_ids_for,
@@ -37,8 +40,10 @@ from station.contracts import (
 )
 from station.inference import MarkerModel
 from station.mes_client import MesClient, MesConfig, build_request
+from station.modelstore import ModelError, ModelStore, load_runtime_model, register_loader
 from station.outbox import Outbox
 from station.outputs import ConsoleOutputs, SerialRelayOutputs
+from station.parts import MesPartsClient, PartsError, build_part_config
 from station.session import StationSession
 from station.storage import Store
 from station.ui import make_server
@@ -57,15 +62,20 @@ _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
 _LAMPS = ("green", "red", "alarm", "amber", "fault")
 
 _REQUIRED_KEYS = (
-    "site", "line", "station_id", "part_number", "lot", "operator", "supervisor",
+    "site", "line", "station_id", "lot", "operator", "supervisor",
     "material_handler", "thresholds", "data_dir", "users_file", "mes", "cameras",
     "model", "outputs",
 )
-_OPTIONAL_KEYS = ("ui", "flip_timeout_s", "min_flip_s", "frame_ok")
+# part_number is required in 'fixed' mode only (checked in validate_config).
+_OPTIONAL_KEYS = ("part_number", "parts", "ui", "flip_timeout_s", "min_flip_s", "frame_ok")
+_ALL_KEYS = _REQUIRED_KEYS + _OPTIONAL_KEYS
 _STRING_KEYS = (
-    "site", "line", "station_id", "part_number", "lot", "operator", "supervisor",
+    "site", "line", "station_id", "lot", "operator", "supervisor",
     "material_handler",
 )
+_EXTRACTOR_ARCHS = ("resnet18", "wide_resnet50_2")
+_EXTRACTOR_DEVICES = ("auto", "cpu", "cuda")
+_NEEDS_TORCH = "This part needs the anomaly model, which needs torch on this PC."
 
 
 class ConfigError(ValueError):
@@ -237,10 +247,35 @@ def _validate_cameras(raw: Any) -> dict:
     return out
 
 
+def _validate_extractor(raw: Any) -> Optional[dict]:
+    """model.extractor: the feature extractor for a PatchCore part model. Optional."""
+    if raw is None:
+        return None
+    path = "model.extractor"
+    ex = _obj(raw, path)
+    _check_keys(ex, ("arch", "input_hw", "weights_path", "device"), path, required=("arch", "input_hw"))
+    arch = ex["arch"]
+    if arch not in _EXTRACTOR_ARCHS:
+        raise ConfigError("model.extractor.arch must be 'resnet18' or 'wide_resnet50_2'")
+    hw = ex["input_hw"]
+    if (not isinstance(hw, list) or len(hw) != 2
+            or any(isinstance(v, bool) or not isinstance(v, int) for v in hw)):
+        raise ConfigError("model.extractor.input_hw must be [height, width] as two whole numbers")
+    if min(hw) < 32:
+        raise ConfigError("model.extractor.input_hw must be at least 32 pixels each side")
+    weights = ex.get("weights_path")
+    if weights is not None and (not isinstance(weights, str) or not weights):
+        raise ConfigError("model.extractor.weights_path must be a file path, or left out")
+    device = ex.get("device", "auto")
+    if device not in _EXTRACTOR_DEVICES:
+        raise ConfigError("model.extractor.device must be 'auto', 'cpu' or 'cuda'")
+    return {"arch": arch, "input_hw": [hw[0], hw[1]], "weights_path": weights, "device": device}
+
+
 def _validate_model(raw: Any) -> dict:
     path = "model"
     model = _obj(raw, path)
-    _check_keys(model, ("kind", "path", "version"), path, required=("kind", "version"))
+    _check_keys(model, ("kind", "path", "version", "extractor"), path, required=("kind", "version"))
     kind = model["kind"]
     if kind not in ("marker", "onnx", "golden"):
         raise ConfigError("model.kind must be 'marker', 'onnx' or 'golden'")
@@ -249,7 +284,30 @@ def _validate_model(raw: Any) -> dict:
         raise ConfigError(f"model.path is required when model.kind is '{kind}'")
     if model_path is not None and not isinstance(model_path, str):
         raise ConfigError("model.path must be a string")
-    return {"kind": kind, "path": model_path, "version": _str(model, "version", path)}
+    return {
+        "kind": kind,
+        "path": model_path,
+        "version": _str(model, "version", path),
+        "extractor": _validate_extractor(model.get("extractor")),
+    }
+
+
+def _validate_parts(raw: Any) -> dict:
+    """parts: 'fixed' (one configured part, the default) or 'mes' (the operator picks a part)."""
+    parts = _obj({} if raw is None else raw, "parts")
+    _check_keys(parts, ("mode", "models_dir"), "parts")
+    mode = parts.get("mode", "fixed")
+    if mode not in ("fixed", "mes"):
+        raise ConfigError("parts.mode must be 'fixed' or 'mes'")
+    models_dir = parts.get("models_dir", "./models")
+    if not isinstance(models_dir, str) or not models_dir.strip():
+        raise ConfigError("parts.models_dir must be a non-empty string")
+    if mode == "mes" and not os.path.isdir(models_dir):
+        raise ConfigError(
+            f"parts.models_dir {models_dir} does not exist: create the folder that holds the "
+            "approved models, or fix the path"
+        )
+    return {"mode": mode, "models_dir": models_dir}
 
 
 def _validate_outputs(raw: Any) -> dict:
@@ -277,16 +335,30 @@ def validate_config(data: Any) -> dict:
     Paths are used as given. load_config() resolves them against the config file's folder first.
     """
     cfg = _obj(data, "config")
-    _check_keys(cfg, _REQUIRED_KEYS + _OPTIONAL_KEYS, "", required=_REQUIRED_KEYS)
+    _check_keys(cfg, _ALL_KEYS, "")
     placeholders = _find_placeholders(cfg)
     if placeholders:
         raise ConfigError(
             "these values are still placeholders, fill them in: " + ", ".join(placeholders)
         )
 
-    out: dict[str, Any] = {}
+    parts = _validate_parts(cfg.get("parts"))
+    missing = [k for k in _REQUIRED_KEYS if k not in cfg]
+    if parts["mode"] == "fixed" and "part_number" not in cfg:
+        missing.append("part_number")  # a fixed station names its part; a 'mes' station picks one
+    if missing:
+        raise ConfigError(f"config: missing required key(s) {missing}")
+
+    out: dict[str, Any] = {"parts": parts}
     for key in _STRING_KEYS:
         out[key] = _str(cfg, key, "")
+    if parts["mode"] == "fixed":
+        out["part_number"] = _str(cfg, "part_number", "")
+    else:
+        part_number = cfg.get("part_number", "")
+        if not isinstance(part_number, str):
+            raise ConfigError("part_number must be a string (it may be left empty in 'mes' mode)")
+        out["part_number"] = part_number.strip()
     for key in ("data_dir", "users_file"):
         out[key] = _str(cfg, key, "")
 
@@ -345,6 +417,14 @@ def load_config(path: str | os.PathLike) -> dict:
         model = data.get("model")
         if isinstance(model, dict):
             model["path"] = _resolve_path(model.get("path"), base)
+            extractor = model.get("extractor")
+            if isinstance(extractor, dict):
+                extractor["weights_path"] = _resolve_path(extractor.get("weights_path"), base)
+        if data.get("parts") is None:
+            data["parts"] = {}
+        parts = data["parts"]
+        if isinstance(parts, dict):
+            parts["models_dir"] = _resolve_path(parts.get("models_dir", "./models"), base)
     return validate_config(data)
 
 
@@ -405,15 +485,40 @@ class _PartIdFactory:
 # ----------------------------------------------------------- session wrapper
 
 class _LockedSession:
-    """Serialises every UI call into the session."""
+    """Serialises every UI call into the session.
 
-    def __init__(self, session: StationSession, lock: threading.RLock) -> None:
+    app (optional) supplies the parts mode, the camera state and the part calls.
+    """
+
+    def __init__(self, session: StationSession, lock: threading.RLock, app: Any = None) -> None:
         self._session = session
         self._lock = lock
+        self._app = app
 
     def snapshot(self, include_images: bool = False) -> dict:
         with self._lock:
-            return self._session.snapshot(include_images=include_images)
+            data = self._session.snapshot(include_images=include_images)
+            app = self._app
+            data["parts_mode"] = app.parts_mode if app is not None else "fixed"
+            data["camera"] = app.camera_status() if app is not None else {"open": True, "last_error": None}
+            return data
+
+    def search_parts(self, q: str, limit: int = 20) -> list:
+        # A network call: not under the session lock, so a slow MES does not freeze the station.
+        return self._need_app().search_parts(q, limit)
+
+    def select_part(self, part_number: str, by: str) -> dict:
+        with self._lock:
+            return self._need_app().select_part(part_number, by)
+
+    def current_part(self) -> dict:
+        with self._lock:
+            return self._need_app().current_part()
+
+    def _need_app(self) -> Any:
+        if self._app is None:
+            raise StationError("part selection is not wired to a station")
+        return self._app
 
     def press(self) -> bool:
         with self._lock:
@@ -485,6 +590,15 @@ def _load_golden_model(model: dict) -> Any:
     return golden
 
 
+def _torch_importable() -> bool:
+    """True when torch can be imported. Checked only; the extractor itself imports it when built."""
+    try:
+        import torch  # noqa: F401,PLC0415 - optional dependency
+    except ImportError:
+        return False
+    return True
+
+
 class StationApp:
     """A fully wired station. Build with build_station(); call start() to run it."""
 
@@ -502,6 +616,10 @@ class StationApp:
     ) -> None:
         cfg = validate_config(dict(config))
         self.config = cfg
+        self._parts_mode = cfg["parts"]["mode"]
+        self._models_dir = cfg["parts"]["models_dir"]
+        self._part_configs: dict[str, dict] = {}  # part number -> criteria config from the MES
+        self._parts_client: Optional[MesPartsClient] = None
         self._now_utc = now_utc or utc_now_iso
         self._clock = clock or time.monotonic
         self._stop_event = threading.Event()
@@ -513,11 +631,17 @@ class StationApp:
         self._sync_thread: Optional[threading.Thread] = None
         self.sync_interval_s = cfg["mes"]["sync_interval_s"]
 
+        if demo and self._parts_mode == "mes":
+            raise ConfigError("the demo station uses the demo model: set parts.mode to 'fixed' for --demo")
+
         # Devices and model first: a failure here leaves nothing open.
         cameras = cameras if cameras is not None else self._make_cameras(cfg)
         self._cameras = cameras
         self._camera_ids = tuple(cfg["cameras"]["camera_ids"])
-        model = model if model is not None else self._make_model(cfg)
+        if self._parts_mode == "mes":
+            model = None  # the session starts with no part and no model; an injected model is ignored
+        else:
+            model = model if model is not None else self._make_model(cfg)
         outputs = outputs if outputs is not None else self._make_outputs(cfg)
 
         # A partial station (fewer than the 4 cameras) is proof-of-concept only: it is the
@@ -587,6 +711,9 @@ class StationApp:
             default_bad_disposition=mes["default_bad_disposition"],
         )
         self._client = MesClient(self._mes_cfg) if self.mes_enabled else None
+        # Part search needs the token too, whatever demo or partial rules say about posting.
+        self._parts_client = (MesPartsClient(mes["base_url"], token)
+                              if self._parts_mode == "mes" and token else None)
         if demo:
             self.store.append_event("mes_disabled", {"reason": "demo mode: parts are not sent to MES"})
         else:
@@ -613,7 +740,7 @@ class StationApp:
         self.session = StationSession(
             cameras, model, outputs, self.store, self.session_thresholds,
             station_id=cfg["station_id"],
-            part_number=cfg["part_number"],
+            part_number="" if self._parts_mode == "mes" else cfg["part_number"],
             lot=cfg["lot"],
             operator=cfg["operator"],
             supervisor=cfg["supervisor"],
@@ -638,7 +765,7 @@ class StationApp:
             ) from exc
         self.users: UserStore = users
         self.sessions = SessionManager(timeout_s=cfg["ui"]["session_timeout_s"])
-        self._locked = _LockedSession(self.session, self._session_lock)
+        self._locked = _LockedSession(self.session, self._session_lock, self)
         self.server = make_server(self._locked, users, self.sessions,
                                   host=cfg["ui"]["host"], port=cfg["ui"]["port"])
 
@@ -662,7 +789,8 @@ class StationApp:
             part_dir = self.store._known_path(record.session_id)
             if part_dir is None:
                 raise StationError("saved part is not in the store index")
-            fields, files = build_request(record, self._mes_cfg, self.store.archive_ref(part_dir))
+            fields, files = build_request(record, self._mes_cfg_for(record.part_number),
+                                          self.store.archive_ref(part_dir))
             self._with_outbox(lambda ob: ob.enqueue(record.session_id, fields, files))
         except Exception as exc:
             self.store.append_event(
@@ -744,6 +872,117 @@ class StationApp:
         if not hasattr(cams, "is_open"):
             return {"open": True, "last_error": None}
         return {"open": bool(cams.is_open), "last_error": getattr(cams, "last_open_error", None)}
+
+    # ------------------------------------------------------------ parts
+
+    @property
+    def parts_mode(self) -> str:
+        return self._parts_mode
+
+    def search_parts(self, q: str, limit: int = 20) -> list[dict]:
+        """MES part search for the UI. A network call: callers must not hold the session lock."""
+        self._require_mes_parts()
+        return self._require_parts_client().search(q, limit)
+
+    def current_part(self) -> dict:
+        with self._session_lock:
+            s = self.session
+            return {
+                "part_number": s.part_number,
+                "model_version": s.model_version,
+                "can_inspect": s.can_inspect,
+                "reason": s.block_reason,
+                "parts_mode": self._parts_mode,
+            }
+
+    def select_part(self, part_number: str, by: str) -> dict:
+        """Make a part the one being inspected, with that part's approved model. Takes the session lock.
+
+        Raises ValueError (fixed station or bad input), InvalidTransition (not IDLE) and PartsError
+        (not in the MES, MES unreachable, no token). A part with no usable approved model is not an
+        error: the session is blocked with the reason and the result has can_inspect False.
+        """
+        self._require_mes_parts()
+        if not isinstance(part_number, str) or not part_number.strip():
+            raise ValueError("part number must be a non-empty string")
+        if not isinstance(by, str) or not by.strip():
+            raise ValueError("by is required")
+        pn = part_number.strip()
+        with self._session_lock:
+            if self.session.state is not State.IDLE:
+                raise InvalidTransition(f"a part cannot be selected while {self.session.state.value}")
+            client = self._require_parts_client()
+            if client.get_part(pn) is None:
+                raise PartsError(f"part {pn} not found in the MES")
+            part_cfg = build_part_config(client.criteria(pn))
+            self._part_configs[pn] = part_cfg
+            warnings = list(part_cfg["warnings"])
+            try:
+                info = ModelStore(self._models_dir).current(pn)
+            except ModelError as exc:
+                return self._block_part(pn, str(exc), warnings)
+            if info is None:
+                return self._block_part(pn, f"No approved model for part {pn}. Ask Quality to approve one.",
+                                        warnings)
+            try:
+                model = self._load_part_model(info)
+            except StationError as exc:
+                return self._block_part(pn, str(exc), warnings)
+            self.session.set_blocked(None)
+            self.session.set_part(pn, model, info.version)
+            self.store.append_event("part_selected",
+                                    {"part_number": pn, "model_version": info.version, "by": by.strip()})
+            return {"part_number": pn, "model_version": info.version, "can_inspect": True,
+                    "warnings": warnings}
+
+    def _block_part(self, part_number: str, reason: str, warnings: list[str]) -> dict:
+        self.session.clear_part()
+        self.session.set_blocked(reason)
+        return {"part_number": part_number, "can_inspect": False, "reason": reason, "warnings": warnings}
+
+    def _load_part_model(self, info: Any) -> Any:
+        """Build the runtime model for an approved version. StationError (incl. ModelError) if unusable."""
+        from station.golden import cv2_decoder  # noqa: PLC0415 - needs cv2 and numpy at run time
+
+        if info.type == "patchcore" and not _torch_importable():
+            raise StationError(_NEEDS_TORCH)
+        decode = cv2_decoder()
+        if info.type == "patchcore":
+            from station.anomaly import register_patchcore_loader  # noqa: PLC0415 - lazy, needs numpy
+            loader = register_patchcore_loader(self._make_extractor)
+            # register_patchcore_loader registers loader(path, decode, backend), but modelstore calls
+            # fn(info, decode): register the adapter that matches the modelstore contract.
+            register_loader("patchcore", lambda inf, dec: loader(inf.path, dec))
+        model = load_runtime_model(info, decode)
+        model.version = info.version  # the approved version name is what the records show
+        return model
+
+    def _make_extractor(self) -> Any:
+        spec = self.config["model"].get("extractor")
+        if spec is None:
+            raise StationError("this part needs the anomaly model, but model.extractor is not set in the config")
+        from station.features_torch import TorchExtractor  # noqa: PLC0415 - needs torch at run time
+        return TorchExtractor(spec["arch"], device=spec["device"], input_hw=tuple(spec["input_hw"]),
+                              weights_path=spec["weights_path"])
+
+    def _require_mes_parts(self) -> None:
+        if self._parts_mode != "mes":
+            raise ValueError("this station is configured for a fixed part")
+
+    def _require_parts_client(self) -> MesPartsClient:
+        if self._parts_client is None:
+            raise PartsError("MES token not set: part search is unavailable")
+        return self._parts_client
+
+    def _mes_cfg_for(self, part_number: str) -> MesConfig:
+        """MES config for one part: its own criteria in 'mes' mode, the configured ones otherwise."""
+        if self._parts_mode != "mes":
+            return self._mes_cfg
+        part = self._part_configs.get(part_number)
+        if part is None:
+            raise StationError(f"no MES criteria are loaded for part {part_number}")
+        return replace(self._mes_cfg, criteria_ids=list(part["criteria_ids"]),
+                       class_to_criterion=dict(part["class_to_criterion"]))
 
     def stop(self) -> None:
         if self._closed:
