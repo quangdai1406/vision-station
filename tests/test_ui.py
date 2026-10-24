@@ -490,7 +490,7 @@ class PageTests(UiTestCase):
 
     def test_csp_allows_only_blob_and_data_images(self):
         csp = dict(self.call("GET", "/").headers)["Content-Security-Policy"]
-        self.assertIn("img-src 'self' data: blob:", csp)
+        self.assertIn("img-src data: blob:", csp)
         self.assertIn("default-src 'none'", csp)
         self.assertIn("connect-src 'self'", csp)
         self.assertNotIn("img-src data:;", csp)

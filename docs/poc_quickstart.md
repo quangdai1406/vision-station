@@ -277,7 +277,9 @@ What the screen shows:
 
 ## 6. Use it
 
-Test sequence for one part. One Enter takes one side.
+Test sequence for one part. One Enter takes one side. One Enter takes one picture per camera:
+1 picture here (one camera), 4 pictures on the real 4-camera station. The second Enter takes the
+BOTTOM picture(s), and then the station decides GOOD or BAD.
 
 1. Put the part in the fixture, TOP side up. Use the live view to check the placement, the light
    and the focus.

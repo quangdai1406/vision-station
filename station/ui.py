@@ -35,7 +35,7 @@ _ACTION_PATHS = {
 
 _CSP = (
     "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-    "img-src 'self' data: blob:; connect-src 'self'; base-uri 'none'; form-action 'none'; "
+    "img-src data: blob:; connect-src 'self'; base-uri 'none'; form-action 'none'; "
     "frame-ancestors 'none'"
 )
 
