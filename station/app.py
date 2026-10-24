@@ -46,6 +46,7 @@ DEFAULT_UI_PORT = 8000
 DEFAULT_SESSION_TIMEOUT_S = 900.0
 DEFAULT_SYNC_INTERVAL_S = 5.0
 DEFAULT_FLIP_TIMEOUT_S = 60.0
+DEFAULT_MIN_FLIP_S = 2.0
 DEFAULT_CAMERA_WIDTH = 2560
 DEFAULT_CAMERA_HEIGHT = 1440
 DEFAULT_BAD_DISPOSITION = "quarantine"
@@ -59,7 +60,7 @@ _REQUIRED_KEYS = (
     "material_handler", "thresholds", "data_dir", "users_file", "mes", "cameras",
     "model", "outputs",
 )
-_OPTIONAL_KEYS = ("ui", "flip_timeout_s", "frame_ok")
+_OPTIONAL_KEYS = ("ui", "flip_timeout_s", "min_flip_s", "frame_ok")
 _STRING_KEYS = (
     "site", "line", "station_id", "part_number", "lot", "operator", "supervisor",
     "material_handler",
@@ -314,6 +315,7 @@ def validate_config(data: Any) -> dict:
     out["outputs"] = _validate_outputs(cfg["outputs"])
     out["flip_timeout_s"] = _number(cfg.get("flip_timeout_s", DEFAULT_FLIP_TIMEOUT_S),
                                     "flip_timeout_s", positive=True)
+    out["min_flip_s"] = _number(cfg.get("min_flip_s", DEFAULT_MIN_FLIP_S), "min_flip_s", lo=0.0)
 
     frame_ok = cfg.get("frame_ok")
     if frame_ok is not None:
@@ -435,6 +437,21 @@ class _LockedSession:
     def tick(self) -> bool:
         with self._lock:
             return self._session.tick()
+
+    def preview(self, camera_id: str) -> Optional[bytes]:
+        """Latest live frame for one camera, or None. Never blocks and never raises.
+
+        A press holds the lock while it captures, so a preview request that cannot
+        get the lock at once gets None instead of waiting for the press to finish.
+        """
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            return self._session.preview(camera_id)
+        except Exception:
+            return None
+        finally:
+            self._lock.release()
 
 
 # --------------------------------------------------------------- the app
@@ -599,6 +616,7 @@ class StationApp:
             supervisor=cfg["supervisor"],
             material_handler=cfg["material_handler"],
             flip_timeout_s=cfg["flip_timeout_s"],
+            min_flip_s=cfg["min_flip_s"],
             frame_ok=frame_ok,
             clock=self._clock,
             now_utc=self._now_utc,

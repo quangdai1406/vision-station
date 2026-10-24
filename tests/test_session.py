@@ -13,6 +13,7 @@ from station.contracts import (
     PartVerdict,
     Side,
     State,
+    StationError,
     Thresholds,
     Verdict,
 )
@@ -35,9 +36,12 @@ class FakeCameras:
         self.sides = []
         self.default_n = default_n
         self.script = []  # per call: None -> default_n frames, int -> that many frames, list -> those frames, exception -> raise
+        self.on_capture = None  # optional hook, called at the start of each capture (e.g. to advance a fake clock)
 
     def capture(self, side):
         self.sides.append(side)
+        if self.on_capture is not None:
+            self.on_capture(side)
         action = self.script.pop(0) if self.script else None
         if isinstance(action, BaseException):
             raise action
@@ -112,6 +116,9 @@ class FakeClock:
     def __init__(self, t=0.0):
         self.t = t
 
+    def advance(self, dt):
+        self.t += dt
+
     def __call__(self):
         return self.t
 
@@ -151,10 +158,29 @@ class RecordingFuse:
         return PartVerdict(verdict=self.verdict, results=tuple(results), reason="fake")
 
 
+KEEP_DEFAULT = object()  # Harness(min_flip_s=KEEP_DEFAULT) builds the session without the argument (default 2.0)
+
+
+class PreviewCameras(FakeCameras):
+    """FakeCameras that also has a preview() passthrough."""
+
+    def __init__(self, error=None, **kw):
+        super().__init__(**kw)
+        self.error = error  # exception to raise from preview(), if set
+        self.previews = []
+
+    def preview(self, camera_id):
+        self.previews.append(camera_id)
+        if self.error is not None:
+            raise self.error
+        return f"preview-{camera_id}".encode()
+
+
 class Harness:
     def __init__(self, fuse_verdict=Verdict.GOOD, frame_ok=None, max_retakes=2,
-                 on_complete=None, initial_counters=None, camera_ids=CAMERA_IDS, fuse=None):
-        self.cameras = FakeCameras(default_n=len(camera_ids))
+                 on_complete=None, initial_counters=None, camera_ids=CAMERA_IDS, fuse=None,
+                 min_flip_s=0.0, cameras=None):
+        self.cameras = cameras if cameras is not None else FakeCameras(default_n=len(camera_ids))
         self.model = FakeModel()
         self.outputs = FakeOutputs()
         self.store = FakeStore()
@@ -171,6 +197,7 @@ class Harness:
             on_complete=on_complete or self.completed.append,
             initial_counters=initial_counters,
             camera_ids=camera_ids,
+            **({} if min_flip_s is KEEP_DEFAULT else {"min_flip_s": min_flip_s}),
         )
 
     def press_at(self, t):
@@ -507,7 +534,8 @@ class SnapshotTests(_Base):
         self.assertEqual(
             set(snap),
             {"state", "counters", "part_id", "machine_verdict", "final_verdict",
-             "verdict", "results", "fault", "images", "partial_station", "camera_ids"},
+             "verdict", "results", "fault", "images", "partial_station", "camera_ids",
+             "prompt", "press_ready", "flip_wait_s"},
         )
         self.assertEqual(snap["state"], "IDLE")
         self.assertEqual(snap["counters"], {"total": 0, "good": 0, "bad": 0})
@@ -1187,6 +1215,190 @@ class FullStationDefaultTests(_Base):
         for payload in presses + verdicts:
             self.assertIs(payload["partial_station"], False)
             self.assertEqual(payload["camera_ids"], list(CAMERA_IDS))
+
+
+class FlipGapTests(_Base):
+    """A BOTTOM press waits min_flip_s after the TOP capture finished; debounce runs from the end of a press."""
+
+    def test_default_min_flip_rejects_0_5s_and_accepts_2_1s_after_top(self):
+        h = self.harness(fuse_verdict=Verdict.GOOD, min_flip_s=KEEP_DEFAULT)
+        s = h.session
+        self.assertTrue(h.press_at(0.0))
+        self.assertFalse(h.press_at(0.5))
+        self.assertEqual(s.state, State.WAIT_FLIP)
+        self.assertEqual(h.cameras.sides, [Side.TOP])
+        ignored = _events(h, "press_ignored")
+        self.assertEqual(ignored[-1]["reason"], "flip_too_soon")
+        self.assertAlmostEqual(ignored[-1]["seconds_remaining"], 1.5)
+        self.assertTrue(h.press_at(2.1))
+        self.assertEqual(s.state, State.IDLE)
+        self.assertEqual(s.counters["total"], 1)
+
+    def test_second_press_right_after_slow_top_capture_is_not_taken_as_bottom(self):
+        # Regression for the real bug: the TOP capture takes 5 s, so a press that
+        # arrives just after it finished used to pass a debounce measured from its start.
+        h = self.harness(fuse_verdict=Verdict.GOOD, min_flip_s=KEEP_DEFAULT)
+        h.cameras.on_capture = lambda side: h.clock.advance(5.0)
+        s = h.session
+        self.assertTrue(h.press_at(0.0))
+        self.assertEqual(h.clock.t, 5.0)
+        self.assertEqual(s.state, State.WAIT_FLIP)
+
+        self.assertFalse(h.press_at(5.0))  # 0 s after the TOP finished: inside the debounce
+        self.assertEqual(_events(h, "press_ignored")[-1]["reason"], "debounce")
+
+        self.assertFalse(h.press_at(5.5))  # 0.5 s after: past the debounce, inside the 2.0 s gap
+        ignored = _events(h, "press_ignored")[-1]
+        self.assertEqual(ignored["reason"], "flip_too_soon")
+        self.assertAlmostEqual(ignored["seconds_remaining"], 1.5)
+        self.assertEqual(s.state, State.WAIT_FLIP)
+        self.assertEqual(h.cameras.sides, [Side.TOP])
+        self.assertEqual(s.counters["total"], 0)
+
+        self.assertTrue(h.press_at(7.1))  # 2.1 s after the TOP finished
+        self.assertEqual(s.state, State.IDLE)
+        self.assertEqual(h.cameras.sides, [Side.TOP, Side.BOTTOM])
+        self.assertEqual(s.counters["total"], 1)
+
+    def test_min_flip_zero_accepts_a_quick_bottom(self):
+        h = self.harness(fuse_verdict=Verdict.GOOD, min_flip_s=0.0)
+        self.assertTrue(h.press_at(0.0))
+        self.assertTrue(h.press_at(0.5))
+        self.assertEqual(h.session.state, State.IDLE)
+        self.assertEqual(h.session.counters["total"], 1)
+
+    def test_debounce_runs_from_the_end_of_the_previous_press(self):
+        h = self.harness(fuse_verdict=Verdict.GOOD)
+        h.cameras.on_capture = lambda side: h.clock.advance(1.0)  # each capture takes 1 s
+        self.assertTrue(h.press_at(0.0))   # finishes at 1.0
+        self.assertFalse(h.press_at(1.1))  # 0.1 s after the finish; from the start it would pass
+        self.assertEqual(_events(h, "press_ignored")[-1]["reason"], "debounce")
+        self.assertEqual(h.cameras.sides, [Side.TOP])
+        self.assertTrue(h.press_at(1.5))   # 0.5 s after the finish
+        self.assertEqual(h.session.state, State.IDLE)
+
+    def test_negative_min_flip_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            self.harness(min_flip_s=-0.1)
+
+    def test_clear_fault_back_to_wait_flip_needs_no_second_flip_gap(self):
+        h = self.harness(fuse_verdict=Verdict.GOOD, min_flip_s=KEEP_DEFAULT)
+        h.cameras.script = [None, CameraError("C4 dropped")]
+        h.press_at(0.0)
+        self.assertTrue(h.press_at(3.0))  # BOTTOM capture fails
+        self.assertEqual(h.session.state, State.FAULT)
+        h.session.clear_fault()
+        self.assertEqual(h.session.state, State.WAIT_FLIP)
+        h.clock.t = 3.5  # past the debounce measured from the failed press
+        snap = h.session.snapshot()
+        self.assertIs(snap["press_ready"], True)
+        self.assertEqual(snap["flip_wait_s"], 0.0)
+        self.assertEqual(snap["prompt"], "Step 2: flip the part to the BOTTOM side, then press Enter.")
+        self.assertTrue(h.press_at(3.5))
+        self.assertEqual(h.session.state, State.IDLE)
+
+
+class PromptAndReadinessTests(_Base):
+    def test_prompt_idle(self):
+        snap = self.harness().session.snapshot()
+        self.assertEqual(snap["prompt"], "Step 1: place the part TOP side up, then press Enter.")
+        self.assertIs(snap["press_ready"], True)
+        self.assertEqual(snap["flip_wait_s"], 0.0)
+
+    def test_prompt_wait_flip_counts_down_then_is_ready(self):
+        h = self.harness(min_flip_s=KEEP_DEFAULT)
+        h.press_at(0.0)
+        h.clock.t = 0.5
+        snap = h.session.snapshot()
+        self.assertEqual(snap["state"], "WAIT_FLIP")
+        self.assertEqual(snap["prompt"], "Step 2: flip the part to the BOTTOM side. You can press Enter in 2 s.")
+        self.assertIs(snap["press_ready"], False)
+        self.assertEqual(snap["flip_wait_s"], 1.5)
+
+        h.clock.t = 2.0
+        snap = h.session.snapshot()
+        self.assertEqual(snap["prompt"], "Step 2: flip the part to the BOTTOM side, then press Enter.")
+        self.assertIs(snap["press_ready"], True)
+        self.assertEqual(snap["flip_wait_s"], 0.0)
+
+    def test_prompt_verdict(self):
+        h = self.harness(fuse_verdict=Verdict.BAD)
+        h.complete_part(0.0)
+        snap = h.session.snapshot()
+        self.assertEqual(snap["prompt"], "BAD: check the part, then acknowledge the alarm.")
+        self.assertIs(snap["press_ready"], False)
+        self.assertEqual(snap["flip_wait_s"], 0.0)
+
+    def test_prompt_supervisor_review(self):
+        h = self.harness(fuse_verdict=Verdict.REVIEW)
+        h.complete_part(0.0)
+        snap = h.session.snapshot()
+        self.assertEqual(snap["prompt"], "REVIEW: a supervisor must decide GOOD or BAD.")
+        self.assertIs(snap["press_ready"], False)
+
+    def test_prompt_fault_shows_the_fault_text(self):
+        h = self.harness(fuse_verdict=Verdict.GOOD)
+        h.cameras.script = [CameraError("C2 timeout")]
+        h.press_at(0.0)
+        snap = h.session.snapshot()
+        self.assertEqual(snap["state"], "FAULT")
+        self.assertEqual(snap["prompt"], "Fault: C2 timeout")
+        self.assertIs(snap["press_ready"], False)
+
+    def test_prompt_is_empty_in_transitional_states(self):
+        h = self.harness()
+        seen = []
+        h.cameras.on_capture = lambda side: seen.append(h.session.snapshot())
+        h.press_at(0.0)
+        self.assertEqual(seen[0]["state"], "CAPTURE_TOP")
+        self.assertEqual(seen[0]["prompt"], "")
+        self.assertIs(seen[0]["press_ready"], False)
+
+
+class PreviewTests(_Base):
+    def test_preview_passthrough_returns_bytes_from_cameras(self):
+        cams = PreviewCameras()
+        h = self.harness(cameras=cams)
+        self.assertEqual(h.session.preview("C2"), b"preview-C2")
+        self.assertEqual(cams.previews, ["C2"])
+
+    def test_preview_is_none_without_a_preview_method(self):
+        h = self.harness()  # FakeCameras has no preview()
+        self.assertIsNone(h.session.preview("C1"))
+
+    def test_preview_is_none_for_an_unknown_camera_id(self):
+        cams = PreviewCameras()
+        h = self.harness(cameras=cams)
+        self.assertIsNone(h.session.preview("C9"))
+        partial = self.harness(cameras=PreviewCameras(), camera_ids=("C1",))
+        self.assertIsNone(partial.session.preview("C2"))
+        self.assertEqual(partial.session.preview("C1"), b"preview-C1")
+        self.assertEqual(cams.previews, [])
+
+    def test_preview_is_none_when_the_camera_raises(self):
+        for err in (StationError("C1 offline"), RuntimeError("boom")):
+            with self.subTest(error=type(err).__name__):
+                h = self.harness(cameras=PreviewCameras(error=err))
+                self.assertIsNone(h.session.preview("C1"))
+
+    def test_preview_changes_no_state_counters_outputs_or_events(self):
+        cams = PreviewCameras()
+        h = self.harness(cameras=cams)
+        h.press_at(0.0)  # TOP captured, waiting for the flip
+        s = h.session
+
+        def fingerprint():
+            return (s.state, s.snapshot(), dict(s.counters), list(h.outputs.calls),
+                    list(h.store.events), list(cams.sides))
+
+        before = fingerprint()
+        s.preview("C1")
+        s.preview("C9")
+        cams.error = StationError("boom")
+        self.assertIsNone(s.preview("C2"))
+        cams.error = None
+        self.assertEqual(s.preview("C3"), b"preview-C3")
+        self.assertEqual(fingerprint(), before)
 
 
 if __name__ == "__main__":

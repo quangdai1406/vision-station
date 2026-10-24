@@ -7,6 +7,7 @@ markers, read by the real MarkerModel. Nothing here touches the network beyond
 """
 from __future__ import annotations
 
+import contextlib
 import email.parser
 import email.policy
 import http.client
@@ -15,6 +16,7 @@ import json
 import os
 import pathlib
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -146,9 +148,23 @@ class FakeClock:
         return self.now
 
 
-# ------------------------------------------------------------------ tests
+FLIP_GAP_S = 2.5  # past the default min_flip_s (2.0 s) that a BOTTOM press waits after TOP
 
-class StationE2E(unittest.TestCase):
+
+def press_part(ui: Ui, token: str, clock: FakeClock) -> None:
+    """One part: a TOP press, the flip gap, then a BOTTOM press. Both must be accepted."""
+    for gap in (1.0, FLIP_GAP_S):  # 1.0 s is past the 0.3 s debounce
+        clock.now += gap
+        status, body, _ = ui.req("POST", "/api/press", token=token)
+        if (status, body) != (200, {"accepted": True}):
+            raise AssertionError(f"press not accepted: {status} {body}")
+
+
+# ------------------------------------------------------------------ harness
+
+class _StationHarness(unittest.TestCase):
+    """Shared setup and helpers for the station tests. Holds no test methods."""
+
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="station-e2e-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
@@ -170,6 +186,7 @@ class StationE2E(unittest.TestCase):
         self.markers: dict[tuple[str, str], bytes] = {}
         self.clock = FakeClock()
         self.outputs = RecordingOutputs()
+        self.top_capture_delay_s = 0.0  # a test may set this: the next TOP capture takes that long
         self.t0 = time.time()
         self.app = self.start_app()
         self.ui = Ui(self.app)
@@ -205,6 +222,10 @@ class StationE2E(unittest.TestCase):
         }
 
     def _frame_bytes(self, camera_id: str, side: Side, n: int) -> bytes:
+        if side is Side.TOP and camera_id == "C1" and self.top_capture_delay_s:
+            # A slow TOP capture: the fake clock moves while the frames are taken (once per capture).
+            self.clock.now += self.top_capture_delay_s
+            self.top_capture_delay_s = 0.0
         marker = self.markers.get((camera_id, side.value), GOOD_MARKER)
         return marker + b" |" + camera_id.encode() + b"|" + side.value.encode() + b"|" + str(n).encode()
 
@@ -225,6 +246,24 @@ class StationE2E(unittest.TestCase):
         self.clock.now += 1.0  # past the 0.3 s debounce
         status, body, _ = (ui or self.ui).req("POST", "/api/press", token=token or self.op)
         self.assertEqual((status, body), (200, {"accepted": True}))
+
+    def press_part(self, token=None, ui=None) -> None:
+        """TOP press, flip gap, BOTTOM press (module press_part)."""
+        press_part(ui or self.ui, token or self.op, self.clock)
+
+    def try_press(self, advance_s: float) -> bool:
+        """Advance the fake clock, POST /api/press as the operator and return its accepted flag."""
+        self.clock.now += advance_s
+        status, body, _ = self.ui.req("POST", "/api/press", token=self.op)
+        self.assertEqual(status, 200, body)
+        return body["accepted"]
+
+    def events(self, kind: str) -> list[dict]:
+        with contextlib.closing(sqlite3.connect(str(self.app.store.db_path))) as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM events WHERE kind = ? ORDER BY id", (kind,)
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     def state(self, token=None) -> dict:
         status, body, _ = self.ui.req("GET", "/api/state", token=token or self.op)
@@ -252,10 +291,12 @@ class StationE2E(unittest.TestCase):
     def pngs(part_dir: pathlib.Path) -> list[str]:
         return sorted(p.name for p in part_dir.iterdir() if p.suffix == ".png")
 
+class StationE2E(_StationHarness):
+    """The full 4-camera station through the UI: good, bad, review, MES outage, 422, restart."""
+
     # 1. GOOD
     def test_good_part_is_saved_and_posted_once(self) -> None:
-        self.press()
-        self.press()
+        self.press_part()
 
         st = self.state()
         self.assertEqual(st["state"], "IDLE")
@@ -284,8 +325,7 @@ class StationE2E(unittest.TestCase):
     # 2. BAD
     def test_bad_part_waits_for_ack_then_posts_with_one_defect_photo(self) -> None:
         self.markers[("C2", "TOP")] = b"SCORE:0.92;CLASS:scratch;BOX:10,20,30,40"
-        self.press()
-        self.press()
+        self.press_part()
 
         st = self.state()
         self.assertEqual(st["state"], "VERDICT")
@@ -325,8 +365,7 @@ class StationE2E(unittest.TestCase):
     # 3. REVIEW
     def test_review_part_is_never_green_until_a_supervisor_resolves_it(self) -> None:
         self.markers[("C3", "BOTTOM")] = b"SCORE:0.6"  # between t_low 0.5 and t_img 0.8
-        self.press()
-        self.press()
+        self.press_part()
 
         st = self.state()
         self.assertEqual(st["state"], "SUPERVISOR_REVIEW")
@@ -369,8 +408,7 @@ class StationE2E(unittest.TestCase):
     # 4. MES down, then back
     def test_mes_down_keeps_the_item_then_sends_it_exactly_once(self) -> None:
         self.mes.mode = 500
-        self.press()
-        self.press()
+        self.press_part()
         session_id, _ = self.saved_part()
 
         self.assertEqual(self.app.sync_once(now=self.t0),
@@ -400,8 +438,7 @@ class StationE2E(unittest.TestCase):
     # 5. 422 is permanent
     def test_422_marks_the_item_failed_and_it_is_not_retried(self) -> None:
         self.mes.mode = 422
-        self.press()
-        self.press()
+        self.press_part()
         session_id, _ = self.saved_part()
 
         self.assertEqual(self.app.sync_once(now=self.t0),
@@ -420,8 +457,7 @@ class StationE2E(unittest.TestCase):
     # 6. restart keeps counters and the unsent item
     def test_restart_keeps_counters_and_the_unsent_outbox_item(self) -> None:
         self.mes.mode = 500
-        self.press()
-        self.press()
+        self.press_part()
         session_id, _ = self.saved_part()
         self.app.sync_once(now=self.t0)
         self.app.stop()
@@ -439,13 +475,63 @@ class StationE2E(unittest.TestCase):
         self.assertEqual({r["key"] for r in self.mes.requests}, {session_id})
 
         # The next part after the restart is counted and gets a new id.
-        self.press(token=op2, ui=ui2)
-        self.press(token=op2, ui=ui2)
+        self.press_part(token=op2, ui=ui2)
         self.assertEqual(ui2.req("GET", "/api/state", token=op2)[1]["counters"]["total"], 2)
         rows = app2.store.recent_parts(2)
         self.assertNotEqual(rows[0]["part_id"], rows[1]["part_id"])
         self.assertNotEqual(rows[0]["session_id"], rows[1]["session_id"])
         self.assertEqual(app2.store.verify_part(pathlib.Path(rows[0]["path"])), [])
+
+
+class DoubleCaptureE2E(_StationHarness):
+    """Regression: one Enter never takes both sides; the prompt says what to do next."""
+
+    def test_one_enter_never_takes_both_sides_when_the_top_capture_is_slow(self) -> None:
+        self.top_capture_delay_s = 5.0  # the TOP capture takes 5 s of fake time
+        self.clock.now += 1.0
+        status, body, _ = self.ui.req("POST", "/api/press", token=self.op)
+        self.assertEqual((status, body), (200, {"accepted": True}))
+        self.assertEqual(self.state()["state"], "WAIT_FLIP")
+
+        # A second press right after the slow TOP capture is refused: no BOTTOM, no part.
+        self.assertFalse(self.try_press(0.1))
+        st = self.state()
+        self.assertEqual(st["state"], "WAIT_FLIP")
+        self.assertIs(st["press_ready"], False)
+        self.assertGreater(st["flip_wait_s"], 0)
+        self.assertTrue(st["prompt"].startswith("Step 2"), st["prompt"])
+        self.assertEqual(st["counters"], {"total": 0, "good": 0, "bad": 0})
+        self.assertEqual(self.app.store.recent_parts(5), [])
+        self.assertFalse(self.outputs.green)
+
+        # Once the flip gap has passed, the BOTTOM press is accepted and the part completes.
+        self.assertTrue(self.try_press(FLIP_GAP_S))
+        st = self.state()
+        self.assertEqual(st["state"], "IDLE")
+        self.assertEqual(st["verdict"], "GOOD")
+        self.assertEqual(st["counters"], {"total": 1, "good": 1, "bad": 0})
+        self.assertEqual(len(self.app.store.recent_parts(5)), 1)
+
+    def test_double_tap_on_a_fast_capture_is_ignored_and_logged(self) -> None:
+        self.press()  # TOP, fast capture
+        self.assertFalse(self.try_press(0.1))  # double tap: inside the debounce
+        self.assertFalse(self.try_press(0.5))  # 0.6 s after TOP: still inside the flip gap
+        self.assertEqual([e["reason"] for e in self.events("press_ignored")],
+                         ["debounce", "flip_too_soon"])
+        self.assertEqual(self.state()["counters"], {"total": 0, "good": 0, "bad": 0})
+
+        self.assertTrue(self.try_press(FLIP_GAP_S))
+        self.assertEqual(self.state()["state"], "IDLE")
+        self.assertEqual(self.state()["verdict"], "GOOD")
+
+    def test_prompt_says_step_1_when_idle_and_step_2_when_waiting_for_the_flip(self) -> None:
+        self.assertTrue(self.state()["prompt"].startswith("Step 1"))
+        self.press()
+        st = self.state()
+        self.assertEqual(st["state"], "WAIT_FLIP")
+        self.assertTrue(st["prompt"].startswith("Step 2"), st["prompt"])
+        self.assertTrue(self.try_press(FLIP_GAP_S))
+        self.assertTrue(self.state()["prompt"].startswith("Step 1"))
 
 
 if __name__ == "__main__":

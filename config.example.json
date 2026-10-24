@@ -57,6 +57,7 @@
   },
 
   "flip_timeout_s": 60,
+  "min_flip_s": 2.0,
   "frame_ok": {
     "min_variance": "[MIN LAPLACIAN VARIANCE for a sharp frame, or delete frame_ok]"
   }

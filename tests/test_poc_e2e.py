@@ -35,7 +35,7 @@ from station.contracts import Frame, Side, StationError
 from station.golden import GoldenBuilder
 from station.inference import MarkerModel
 from station.outputs import RecordingOutputs
-from tests.test_e2e import FakeClock, FakeMes, Ui, parse_multipart
+from tests.test_e2e import FakeClock, FakeMes, Ui, parse_multipart, press_part
 
 TOKEN_ENV = "VISION_TEST_POC_E2E_TOKEN"
 TOKEN = "poc-e2e-test-token-not-a-real-secret"
@@ -166,10 +166,9 @@ class _Harness(unittest.TestCase):
         return self.start(cfg, cameras=cameras, model=build_golden_model())
 
     # helpers
-    def press(self) -> None:
-        self.clock.now += 1.0  # past the 0.3 s debounce
-        status, body, _ = self.ui.req("POST", "/api/press", token=self.op)
-        self.assertEqual((status, body), (200, {"accepted": True}))
+    def press_part(self) -> None:
+        """TOP press, flip gap, BOTTOM press (module press_part)."""
+        press_part(self.ui, self.op, self.clock)
 
     def state(self) -> dict:
         status, body, _ = self.ui.req("GET", "/api/state", token=self.op)
@@ -220,8 +219,7 @@ class OneCameraPocE2E(_Harness):
     # 1. GOOD
     def test_good_part_is_saved_and_shows_green(self) -> None:
         self.one_camera(allow_partial=False)
-        self.press()
-        self.press()
+        self.press_part()
 
         st = self.state()
         self.assertEqual(st["state"], "IDLE")
@@ -251,8 +249,7 @@ class OneCameraPocE2E(_Harness):
     def test_bad_part_stays_red_until_ack_and_keeps_the_defect_box(self) -> None:
         self.one_camera(allow_partial=False)
         self.blobs.add(("C1", "TOP"))
-        self.press()
-        self.press()
+        self.press_part()
 
         st = self.state()
         self.assertEqual(st["state"], "VERDICT")
@@ -292,8 +289,7 @@ class OneCameraPocE2E(_Harness):
     def test_partial_station_sends_nothing_to_mes_even_with_a_token(self) -> None:
         self.one_camera(allow_partial=False)
         self.blobs.add(("C1", "TOP"))
-        self.press()
-        self.press()
+        self.press_part()
         self.ack()
 
         self.assertFalse(self.app.mes_enabled)
@@ -311,8 +307,7 @@ class OneCameraPocE2E(_Harness):
         self.one_camera(allow_partial=True)
         self.assertTrue(self.app.mes_enabled)
         self.blobs.add(("C1", "TOP"))
-        self.press()
-        self.press()
+        self.press_part()
         self.ack()
 
         self.assertEqual(self.app.sync_once(), {"sent": 1, "failed_permanent": 0, "retry_later": 0})
@@ -377,8 +372,7 @@ class FourCameraDefaultE2E(_Harness):
         self.assertTrue(self.app.mes_enabled)
         self.assertEqual(self.events("mes_disabled"), [])
 
-        self.press()
-        self.press()
+        self.press_part()
         self.assertEqual(self.state()["verdict"], "GOOD")
         session_id, part_dir = self.saved_part()
         self.assertEqual(len(self.pngs(part_dir)), 8)
@@ -387,6 +381,67 @@ class FourCameraDefaultE2E(_Harness):
         self.assertEqual(self.app.sync_once(), {"sent": 1, "failed_permanent": 0, "retry_later": 0})
         self.assertEqual(len(self.mes.requests), 1)
         self.assertEqual(self.mes.requests[0]["key"], session_id)
+
+
+# ------------------------------------------------------------ live view
+
+@unittest.skipIf(np is None, "numpy not installed")
+class OneCameraLiveViewE2E(_Harness):
+    """GET /api/preview: a read-only live view that never changes the station."""
+
+    def preview_get(self, camera: str, token: str | None):
+        """Return (status, headers with lower-case names, body) for one live-view request."""
+        conn = http.client.HTTPConnection(self.ui.host, self.ui.port, timeout=10)
+        try:
+            headers = {"Cookie": f"station_session={token}"} if token else {}
+            conn.request("GET", "/api/preview?camera=" + camera, headers=headers)
+            resp = conn.getresponse()
+            return resp.status, {k.lower(): v for k, v in resp.getheaders()}, resp.read()
+        finally:
+            conn.close()
+
+    def event_count(self) -> int:
+        with contextlib.closing(sqlite3.connect(str(self.app.store.db_path))) as conn:
+            return conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+
+    def test_preview_returns_a_jpeg_frame_to_a_logged_in_operator(self) -> None:
+        self.one_camera(allow_partial=False)
+        status, headers, body = self.preview_get("C1", self.op)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["content-type"], "image/jpeg")
+        self.assertIn("no-store", headers["cache-control"])
+        self.assertTrue(body.startswith(b"FAKEJPEG:C1"), body[:40])
+
+    def test_preview_needs_a_login(self) -> None:
+        self.one_camera(allow_partial=False)
+        status, _, _ = self.preview_get("C1", None)
+        self.assertEqual(status, 401)
+
+    def test_preview_rejects_a_name_that_is_not_a_camera(self) -> None:
+        self.one_camera(allow_partial=False)
+        status, _, _ = self.preview_get("C9", self.op)
+        self.assertEqual(status, 400)
+
+    def test_preview_of_a_camera_this_station_does_not_have_is_204(self) -> None:
+        self.one_camera(allow_partial=False)  # C1 only
+        status, _, body = self.preview_get("C2", self.op)
+        self.assertEqual((status, body), (204, b""))
+
+    def test_previews_change_no_state_counters_or_events(self) -> None:
+        self.one_camera(allow_partial=False)
+        self.clock.now += 1.0
+        status, body, _ = self.ui.req("POST", "/api/press", token=self.op)  # TOP taken: WAIT_FLIP
+        self.assertEqual((status, body), (200, {"accepted": True}))
+        state_before = self.state()
+        events_before = self.event_count()
+
+        for cam, expected in (("C1", 200), ("C1", 200), ("C2", 204), ("C1", 200)):
+            status, _, _ = self.preview_get(cam, self.op)
+            self.assertEqual(status, expected, cam)
+
+        self.assertEqual(self.state(), state_before)
+        self.assertEqual(self.event_count(), events_before)
+        self.assertEqual(self.state()["state"], "WAIT_FLIP")
 
 
 if __name__ == "__main__":

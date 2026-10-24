@@ -8,6 +8,7 @@ make_blur_check() is a pure-Python sharpness gate over a decoded grey image.
 """
 from __future__ import annotations
 
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -21,6 +22,12 @@ FrameBytes = Callable[[str, Side, int], bytes]
 AUTO_EXPOSURE_MANUAL = 0.25
 AUTOFOCUS_OFF = 0
 AUTO_WB_OFF = 0
+
+# Live-preview defaults (engineering choices for a small, fast view, not
+# inspection limits): preview frames are at most this many pixels wide and
+# JPEG-encoded at this quality.
+PREVIEW_WIDTH = 640
+PREVIEW_JPEG_QUALITY = 70
 
 _MANUAL_KEYS = ("focus", "exposure", "white_balance")
 
@@ -59,6 +66,7 @@ class FakeCameraSet:
         self._clock = clock
         self._camera_ids: tuple[str, ...] = ids
         self.capture_counts: dict[Side, int] = {Side.TOP: 0, Side.BOTTOM: 0}
+        self._preview_calls = 0
 
     @property
     def camera_ids(self) -> tuple[str, ...]:
@@ -81,6 +89,18 @@ class FakeCameraSet:
             )
             for seq, cam in enumerate(self._camera_ids)
         ]
+
+    def preview(self, camera_id: str) -> Optional[bytes]:
+        """Fake live-preview bytes b'FAKEJPEG:<camera_id>:<n>' or None.
+
+        n counts preview calls (zero-based) for known ids. Unknown ids return
+        None and do not advance n. Capture state is never touched.
+        """
+        if camera_id not in self._camera_ids:
+            return None
+        n = self._preview_calls
+        self._preview_calls = n + 1
+        return f"FAKEJPEG:{camera_id}:{n}".encode("ascii")
 
 
 def _import_cv2() -> Any:
@@ -130,6 +150,9 @@ class OpenCvCameraSet:
         self._now_utc = now_utc
         self._manual = manual
         self._caps: Optional[list[Any]] = None
+        # Held by capture() for its whole duration. preview() only tries it
+        # (non-blocking), so a preview never interleaves with a capture.
+        self._lock = threading.Lock()
         self.last_skew_s: Optional[float] = None
 
     @property
@@ -173,6 +196,54 @@ class OpenCvCameraSet:
             raise CameraError(f"{cam}: failed to open or configure camera: {exc}") from exc
 
     def capture(self, side: Side) -> Sequence[Frame]:
+        with self._lock:
+            return self._capture_locked(side)
+
+    def preview(
+        self,
+        camera_id: str,
+        *,
+        width: int = PREVIEW_WIDTH,
+        quality: int = PREVIEW_JPEG_QUALITY,
+    ) -> Optional[bytes]:
+        """JPEG bytes of the latest frame of one camera, for the live view.
+
+        Engineering defaults: width=PREVIEW_WIDTH (640) and quality=70; a frame
+        wider than `width` is downscaled with INTER_AREA, aspect ratio kept,
+        and never upscaled. Returns None, and never raises, when camera_id is
+        unknown, the camera is not open (preview never opens devices), a
+        capture holds the lock (this call does not wait), or any grab,
+        retrieve or encode problem occurs. Only this camera is grabbed.
+        """
+        if camera_id not in self._camera_ids:
+            return None
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            caps = self._caps
+            if caps is None:
+                return None
+            cap = caps[self._camera_ids.index(camera_id)]
+            cv2 = self._cv2
+            if not cap.grab():
+                return None
+            ok, image = cap.retrieve()
+            if not ok or image is None:
+                return None
+            shape = getattr(image, "shape", None)
+            if shape is not None and width > 0 and int(shape[1]) > width:
+                new_h = max(1, round(int(shape[0]) * width / int(shape[1])))
+                image = cv2.resize(image, (width, new_h), interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            if not ok or buf is None:
+                return None
+            return bytes(buf.tobytes())
+        except Exception:
+            return None
+        finally:
+            self._lock.release()
+
+    def _capture_locked(self, side: Side) -> Sequence[Frame]:
         side = Side(side)
         if self._caps is None:
             self.open()

@@ -18,9 +18,9 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 |---|---:|---:|---:|---|
 | `station/__init__.py` | 1 | 0 | 0 |  |
 | `station/__main__.py` | 95 | 2 | 2 | Entry point. |
-| `station/app.py` | 735 | 6 | 4 | Wire the station together: config, build, run, and MES sync. |
+| `station/app.py` | 753 | 6 | 4 | Wire the station together: config, build, run, and MES sync. |
 | `station/auth.py` | 178 | 8 | 6 | Password hashing, user store, role policy and in-memory session tokens. |
-| `station/cameras.py` | 291 | 7 | 5 | Camera sources for the inspection station. |
+| `station/cameras.py` | 362 | 7 | 5 | Camera sources for the inspection station. |
 | `station/contracts.py` | 170 | 24 | 14 | Shared types and interfaces for the camera inspection station. |
 | `station/fusion.py` | 87 | 2 | 6 | Per-image classification and per-part fusion. |
 | `station/golden.py` | 416 | 6 | 5 | Compare-with-a-good-part model for the one-camera proof of concept. |
@@ -28,10 +28,10 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `station/mes_client.py` | 280 | 4 | 6 | MES client for the camera inspection station. |
 | `station/outbox.py` | 214 | 2 | 5 | Durable outbox for inspection events waiting to be posted to the MES. |
 | `station/outputs.py` | 122 | 6 | 5 | Output drivers for lights and the alarm (implements contracts.OutputDriver). |
-| `station/session.py` | 565 | 2 | 5 | One inspection session: from the first press of a part to a completed record. |
+| `station/session.py` | 647 | 2 | 5 | One inspection session: from the first press of a part to a completed record. |
 | `station/storage.py` | 463 | 3 | 5 | Storage for finished inspection parts and the append-only event log. |
 | `station/teach.py` | 179 | 2 | 2 | `python -m station teach`: learn the golden model from GOOD parts on the real cameras. |
-| `station/ui.py` | 791 | 2 | 5 | HTTP server for the inspection station: a JSON API plus one HTML page. |
+| `station/ui.py` | 1033 | 2 | 5 | HTTP server for the inspection station: a JSON API plus one HTML page. |
 | `station/users_cli.py` | 131 | 2 | 2 | `python -m station users add <username> <role>`: create or update a station login. |
 | `tools/__init__.py` | 6 | 5 | 4 | Repeatability and threshold-selection tools. See FORMAT.md. |
 | `tools/analysis.py` | 263 | 3 | 3 | Numpy-only image repeatability metrics. Shapes and return keys: see tools/FORMAT.md. |
@@ -108,7 +108,7 @@ None.
 
 ## External packages (code files importing each)
 
-`__future__` (18), `typing` (18), `json` (13), `pathlib` (9), `sys` (8), `argparse` (7), `os` (7), `time` (7), `dataclasses` (6), `datetime` (6), `numpy` (5), `cv2` (4), `re` (4), `threading` (4), `csv` (3), `math` (3), `urllib` (3), `base64` (2), `contextlib` (2), `enum` (2), `hashlib` (2), `http` (2), `io` (2), `sqlite3` (2), `tempfile` (2), `uuid` (2), `collections` (1), `getpass` (1), `hmac` (1), `mimetypes` (1), `onnxruntime` (1), `secrets` (1), `shutil` (1), `traceback` (1), `unicodedata` (1), `zipfile` (1)
+`__future__` (18), `typing` (18), `json` (13), `pathlib` (9), `sys` (8), `argparse` (7), `os` (7), `time` (7), `dataclasses` (6), `datetime` (6), `numpy` (5), `re` (5), `threading` (5), `cv2` (4), `math` (4), `csv` (3), `urllib` (3), `base64` (2), `contextlib` (2), `enum` (2), `hashlib` (2), `http` (2), `io` (2), `sqlite3` (2), `tempfile` (2), `uuid` (2), `collections` (1), `getpass` (1), `hmac` (1), `mimetypes` (1), `onnxruntime` (1), `secrets` (1), `shutil` (1), `traceback` (1), `unicodedata` (1), `zipfile` (1)
 
 ## What the graph cannot see
 

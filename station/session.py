@@ -46,11 +46,22 @@ Camera set: camera_ids defaults to all four cameras (the full station). A subset
 is a proof-of-concept partial station: it is flagged in snapshot() and in the
 'press' and 'verdict' events (partial_station, camera_ids), and is_partial is True.
 
+Presses (decided here):
+  - Debounce: a press within debounce_s of the END of the previous accepted press
+    is ignored. Measuring from the start would let a double tap through when the
+    TOP capture is slower than the debounce.
+  - Flip gap: a BOTTOM press is ignored until min_flip_s has passed since the TOP
+    capture and inference finished (press_ignored, reason 'flip_too_soon'). This is
+    an engineering setting, not a quality limit. 0 disables it. A return to WAIT_FLIP
+    after a BOTTOM fault does not wait again.
+  - preview(camera_id) is a read-only passthrough to the cameras for the live view.
+
 Snapshot: see StationSession.snapshot for the exact shape the UI reads.
 """
 from __future__ import annotations
 
 import base64
+import math
 import time
 import uuid
 from dataclasses import dataclass
@@ -141,6 +152,7 @@ class StationSession:
         material_handler: str,
         flip_timeout_s: float = 60.0,
         debounce_s: float = 0.3,
+        min_flip_s: float = 2.0,
         frame_ok: Optional[Callable[[Frame], bool]] = None,
         max_retakes: int = 2,
         clock: Callable[[], float] = time.monotonic,
@@ -166,7 +178,10 @@ class StationSession:
         self._supervisor = supervisor
         self._material_handler = material_handler
         self._flip_timeout_s = flip_timeout_s
+        if min_flip_s < 0:
+            raise ValueError(f"min_flip_s must be >= 0, got {min_flip_s}")
         self._debounce_s = debounce_s
+        self._min_flip_s = float(min_flip_s)
         self._frame_ok = frame_ok or _accept_all
         self._max_retakes = max_retakes
         self._clock = clock
@@ -182,7 +197,9 @@ class StationSession:
             for key in self.counters:
                 self.counters[key] = int(initial_counters.get(key, 0))
 
-        self._last_press: Optional[float] = None
+        self._last_press: Optional[float] = None  # start of the last accepted press (flip timeout)
+        self._last_done: Optional[float] = None  # end of the last accepted press (debounce)
+        self._top_done_at: Optional[float] = None  # when the TOP capture and inference finished
         self._fault: Optional[str] = None
         self._fault_return: Optional[State] = None
         self._clear_part()
@@ -191,7 +208,7 @@ class StationSession:
 
     def press(self) -> bool:
         now = self._clock()
-        if self._last_press is not None and now - self._last_press < self._debounce_s:
+        if not self._debounce_ok(now):
             self._log("press_ignored", {"reason": "debounce", "state": self.state.value},
                       session_id=self._active_session_id())
             return False
@@ -199,19 +216,29 @@ class StationSession:
             self._log("press_ignored", {"reason": "state", "state": self.state.value},
                       session_id=self._active_session_id())
             return False
+        wait = self._flip_wait(now)
+        if wait > 0:
+            self._log("press_ignored", {"reason": "flip_too_soon", "state": self.state.value,
+                                        "seconds_remaining": round(wait, 1)},
+                      session_id=self._active_session_id())
+            return False
 
         self._last_press = now
-        if self.state is State.IDLE:
-            self._outputs.clear()
-            self._begin_part()
-            self._log("press", {"side": Side.TOP.value, "part_id": self._part_id, **self._station_fields()},
-                      session_id=self._session_id)
-            if self._run_side(Side.TOP, fail_state=State.IDLE):
-                self.state = State.WAIT_FLIP
-        else:
-            self._log("press", {"side": Side.BOTTOM.value, "part_id": self._part_id, **self._station_fields()},
-                      session_id=self._session_id)
-            self._run_bottom()
+        try:
+            if self.state is State.IDLE:
+                self._outputs.clear()
+                self._begin_part()
+                self._log("press", {"side": Side.TOP.value, "part_id": self._part_id, **self._station_fields()},
+                          session_id=self._session_id)
+                if self._run_side(Side.TOP, fail_state=State.IDLE):
+                    self.state = State.WAIT_FLIP
+                    self._top_done_at = self._clock()
+            else:
+                self._log("press", {"side": Side.BOTTOM.value, "part_id": self._part_id, **self._station_fields()},
+                          session_id=self._session_id)
+                self._run_bottom()
+        finally:
+            self._last_done = self._clock()  # debounce runs from the end of this press, faults included
         return True
 
     def ack_alarm(self) -> None:
@@ -284,6 +311,7 @@ class StationSession:
             self._clear_part()  # the part was never completed; drop it
         elif back is State.WAIT_FLIP:
             self._last_press = self._clock()  # restart the flip timeout
+            self._top_done_at = -math.inf  # the part is already flipped: no minimum flip gap again
         self.state = back
 
     def snapshot(self, include_images: bool = False) -> dict[str, Any]:
@@ -297,7 +325,12 @@ class StationSession:
         (one metadata entry per captured frame, up to expected_images, with score
         and defects merged in from the matching result; 'b64' only when
         include_images), partial_station (bool) and camera_ids (list of str).
+        Also prompt (str: the instruction for the current state, '' when none),
+        press_ready (bool: a press would be accepted now) and flip_wait_s (float:
+        seconds before a BOTTOM press is accepted, rounded to 0.1, 0.0 otherwise).
         """
+        now = self._clock()
+        wait = self._flip_wait(now)
         results = self._all_results()
         by_key = {(r.camera_id, r.side): r for r in results}
         images: list[dict[str, Any]] = []
@@ -326,6 +359,9 @@ class StationSession:
             "images": images,
             "partial_station": self.is_partial,
             "camera_ids": list(self._camera_ids),
+            "prompt": self._prompt(wait),
+            "press_ready": self._press_ready(now),
+            "flip_wait_s": round(wait, 1),
         }
 
     @property
@@ -333,7 +369,53 @@ class StationSession:
         """True for a proof-of-concept station (fewer than the 4 cameras of the full station)."""
         return not is_full_station(self._camera_ids)
 
+    def preview(self, camera_id: str) -> Optional[bytes]:
+        """Live-view frame for one camera. Read-only: changes no state, counters, outputs or events.
+
+        Returns None if the cameras object has no preview(), the id is not one of
+        this session's cameras, or the call raises (the error is not logged).
+        """
+        if camera_id not in self._camera_ids:
+            return None
+        try:
+            fn = getattr(self._cameras, "preview", None)
+            if not callable(fn):
+                return None
+            return fn(camera_id)
+        except Exception:
+            return None
+
     # ----------------------------------------------------------------- helpers
+
+    def _debounce_ok(self, now: float) -> bool:
+        return self._last_done is None or now - self._last_done >= self._debounce_s
+
+    def _flip_wait(self, now: float) -> float:
+        """Seconds still to wait before a BOTTOM press is accepted (0.0 when none)."""
+        if self.state is not State.WAIT_FLIP or self._top_done_at is None:
+            return 0.0
+        return max(0.0, self._min_flip_s - (now - self._top_done_at))
+
+    def _press_ready(self, now: float) -> bool:
+        return (self.state in (State.IDLE, State.WAIT_FLIP)
+                and self._debounce_ok(now)
+                and self._flip_wait(now) <= 0)
+
+    def _prompt(self, wait: float) -> str:
+        st = self.state
+        if st is State.IDLE:
+            return "Step 1: place the part TOP side up, then press Enter."
+        if st is State.WAIT_FLIP:
+            if wait > 0:
+                return f"Step 2: flip the part to the BOTTOM side. You can press Enter in {math.ceil(wait)} s."
+            return "Step 2: flip the part to the BOTTOM side, then press Enter."
+        if st is State.VERDICT:
+            return "BAD: check the part, then acknowledge the alarm."
+        if st is State.SUPERVISOR_REVIEW:
+            return "REVIEW: a supervisor must decide GOOD or BAD."
+        if st is State.FAULT:
+            return f"Fault: {self._fault}" if self._fault else "Fault: clear it, then start again."
+        return ""
 
     def _station_fields(self) -> dict[str, Any]:
         return {"partial_station": self.is_partial, "camera_ids": list(self._camera_ids)}

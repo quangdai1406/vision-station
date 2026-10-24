@@ -50,5 +50,7 @@
 
   "outputs": {
     "kind": "console"
-  }
+  },
+
+  "min_flip_s": 2.0
 }

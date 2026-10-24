@@ -100,6 +100,8 @@ Full file for this proof of concept. The text values are examples. Replace them 
     "t_img": 0.6
   },
 
+  "min_flip_s": 2.0,
+
   "data_dir": "./data",
   "users_file": "./users.json",
 
@@ -158,6 +160,7 @@ What each part means:
 | `model.path` | Keep `./golden.npz`. | Teach (step 4) writes this file. |
 | `model.version` | Any text, for example `golden-poc-1`. | Written to each part record. |
 | `outputs.kind` | Keep `console`. | Lights and the alarm are printed in the PowerShell window. There are no lamps. |
+| `min_flip_s` | Keep `2.0`. | Seconds after the TOP picture before the BOTTOM press is accepted. It stops one tap from taking both sides. It is an engineering setting, not a quality limit. `0` turns it off. |
 
 **Thresholds (demo values only).** Choose two numbers between 0 and 1, with `t_low` smaller than
 or equal to `t_img`. The starter values are `t_low` 0.3 and `t_img` 0.6. These are demo values.
@@ -261,21 +264,36 @@ What the screen shows:
 - **Two rows, TOP and BOTTOM:** one tile per camera, so one tile per row here. Each tile shows the
   picture and a caption such as `C1  score 0.12`. Red boxes on the picture show the areas that differ
   from the taught good part, with the label `difference_from_golden` and a score.
+- **Prompt line (above the buttons):** the next step, for example
+  `Step 1: place the part TOP side up, then press Enter.`
+- **Live view (not saved):** one picture per camera, each with its label. It shows while the station
+  waits: before the TOP press and while you flip the part. It stops while a picture is being taken
+  and while a verdict is shown. Use it to place the part and to check light and focus before you
+  press Enter. Nothing from the live view is stored.
 - **Buttons:** `Press (Enter)`, `Acknowledge alarm`, `Clear fault`, the reason box, and the
   `Resolve REVIEW` and `Override BAD to GOOD` buttons. A button is greyed out when your role may
-  not use it.
+  not use it. The Press button shows `Capturing...` while a picture is taken, and `Wait N s` while
+  the station waits for the flip.
 
 ## 6. Use it
 
-Test sequence for one part:
+Test sequence for one part. One Enter takes one side.
 
-1. Put the part in the fixture, TOP side up.
+1. Put the part in the fixture, TOP side up. Use the live view to check the placement, the light
+   and the focus.
 2. Click the grey background of the page once, so the focus is not in a box. Then press **Enter**,
-   or click **Press (Enter)**. This takes the TOP picture. The verdict stays `-`.
-3. Flip the part and keep it still. The station waits for the flip. The default wait is 60 seconds
+   or click **Press (Enter)**. This takes the TOP picture. The button shows `Capturing...` for a
+   moment. The verdict stays `-`. The screen then says `Step 2: flip the part to the BOTTOM side,
+   then press Enter.`
+3. Flip the part and keep it still. The button shows `Wait N s` first. The station does not accept
+   a second press for a short time (`min_flip_s`, 2 seconds by default). This stops one tap from
+   taking both sides. When the button shows `Press (Enter)` again, the flip press is accepted. The
+   live view comes back while you flip. The default wait for the flip is 60 seconds
    (`flip_timeout_s`). After that the part is voided, and you start again.
 4. Press **Enter** again. This takes the BOTTOM picture. The station compares the two pictures and
-   shows the verdict.
+   shows the verdict. The tiles under the live view show the TOP and BOTTOM pictures.
+
+After any press, the page ignores presses for 1.5 seconds.
 
 What each verdict does:
 
@@ -388,7 +406,28 @@ the key. Fix that key in `config.json` and start again. Check the JSON commas an
 
 **The page does not react to Enter.** Click the grey background of the page once, so the focus is
 not in a box. Enter is ignored while the focus is in the reason box or on a button. Click
-**Press (Enter)** instead if you prefer.
+**Press (Enter)** instead if you prefer. The page also ignores presses for 1.5 seconds after each
+press.
+
+**The button says `Wait N s`.** This is normal. The station waits for the flip before it accepts
+the BOTTOM press (`min_flip_s`, 2 seconds by default). Flip the part. When the button shows
+`Press (Enter)` again, press Enter.
+
+**The live view is empty.** The camera is busy while a picture is taken, so an empty frame during a
+capture is normal. If the live view stays empty, check the camera index in `cameras.devices` (step
+1.5), close other programs that use the camera, and reload the page.
+
+**I still got both pictures (TOP and BOTTOM from one tap).** The station ignores a second press
+that comes too soon, and logs it as `press_ignored`. Check the events in
+`C:\vision-station\data\station.db`. Run this in PowerShell from `C:\vision-station`, then send us
+the lines it prints:
+
+```powershell
+py -c 'import sqlite3; c = sqlite3.connect("data/station.db"); [print(r) for r in c.execute("select ts_utc, kind, payload_json from events order by id") if r[1] in ("press", "press_ignored")]'
+```
+
+Each `press` line is an accepted press. Each `press_ignored` line is a press the station refused,
+with its reason.
 
 **`Press was not accepted in the current state.`** Look at the State line. The station may be
 waiting for the flip, or for an acknowledge. Do the step it asks for.

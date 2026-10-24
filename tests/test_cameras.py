@@ -1,5 +1,7 @@
 import re
 import sys
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -53,6 +55,17 @@ class FakeBuf:
         return self._data
 
 
+class FakeImage:
+    """Stands in for a numpy frame: it has a shape and a printable name."""
+
+    def __init__(self, name, width, height):
+        self.name = name
+        self.shape = (height, width, 3)
+
+    def __str__(self):
+        return self.name
+
+
 class FakeCv2:
     CAP_PROP_FRAME_WIDTH = 3
     CAP_PROP_FRAME_HEIGHT = 4
@@ -62,23 +75,35 @@ class FakeCv2:
     CAP_PROP_FOCUS = 28
     CAP_PROP_EXPOSURE = 15
     CAP_PROP_WB_TEMPERATURE = 45
+    IMWRITE_JPEG_QUALITY = 1
+    INTER_AREA = 3
 
     def __init__(self):
         self.log = []
         self.captures = []
         self.encode_ok = True
         self.fail_encode_for = None  # image string that fails encoding
+        self.encode_params = []  # (ext, params) per imencode call
+        self.resizes = []  # (image name, dsize, interpolation) per resize call
 
     def VideoCapture(self, index):
         cap = FakeCapture(self, index, self.log)
         self.captures.append(cap)
         return cap
 
-    def imencode(self, ext, image):
+    def imencode(self, ext, image, params=None):
         self.log.append(("imencode", image))
-        if not self.encode_ok or image == self.fail_encode_for:
+        self.encode_params.append((ext, params))
+        if not self.encode_ok or str(image) == self.fail_encode_for:
             return (False, None)
-        return (True, FakeBuf(b"PNG:" + image.encode("ascii")))
+        label = ext.lstrip(".").upper()
+        return (True, FakeBuf(f"{label}:{image}".encode("ascii")))
+
+    def resize(self, image, dsize, interpolation=None):
+        self.log.append(("resize", str(image)))
+        self.resizes.append((str(image), dsize, interpolation))
+        width, height = dsize
+        return FakeImage(f"{image}>resized", width, height)
 
 
 def _fixed_clock():
@@ -310,6 +335,160 @@ def _closed(cv2, index):
     cap = FakeCapture(cv2, index, cv2.log)
     cap.opened = False
     return cap
+
+
+class FakeCameraSetPreviewTests(unittest.TestCase):
+    def test_preview_bytes_count_calls_and_unknown_id_is_none(self):
+        cams = FakeCameraSet()
+        self.assertEqual(cams.preview("C2"), b"FAKEJPEG:C2:0")
+        self.assertEqual(cams.preview("C1"), b"FAKEJPEG:C1:1")
+        self.assertIsNone(cams.preview("C9"))
+        self.assertIsNone(FakeCameraSet(camera_ids=("C1",)).preview("C2"))
+
+    def test_preview_does_not_change_capture_state(self):
+        cams = FakeCameraSet()
+        cams.preview("C1")
+        cams.preview("C1")
+        self.assertEqual(cams.capture_counts, {Side.TOP: 0, Side.BOTTOM: 0})
+        frames = cams.capture(Side.TOP)
+        self.assertEqual(frames[0].data, b"FAKE:C1:TOP:0")
+
+
+class OpenCvPreviewTests(unittest.TestCase):
+    def _opened(self, indexes=(0, 1, 2, 3)):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet(list(indexes), cv2_module=cv2, now_utc=_fixed_clock())
+        cams.open()
+        return cv2, cams
+
+    def test_preview_returns_jpeg_bytes_for_known_id(self):
+        cv2, cams = self._opened()
+        self.assertEqual(cams.preview("C1"), b"JPG:img0")
+        self.assertEqual(cams.preview("C4"), b"JPG:img3")
+        self.assertEqual(cv2.encode_params[0], (".jpg", [FakeCv2.IMWRITE_JPEG_QUALITY, 70]))
+
+    def test_preview_quality_argument_is_passed_to_encoder(self):
+        cv2, cams = self._opened()
+        cams.preview("C1", quality=40)
+        self.assertEqual(cv2.encode_params[-1], (".jpg", [FakeCv2.IMWRITE_JPEG_QUALITY, 40]))
+
+    def test_preview_unknown_id_is_none(self):
+        cv2, cams = self._opened()
+        self.assertIsNone(cams.preview("C9"))
+        self.assertIsNone(cams.preview(""))
+
+    def test_preview_before_open_is_none_and_opens_nothing(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet([0, 1], cv2_module=cv2)
+        self.assertIsNone(cams.preview("C1"))
+        self.assertEqual(cv2.captures, [])
+
+    def test_preview_after_release_is_none(self):
+        cv2, cams = self._opened()
+        self.assertIsNotNone(cams.preview("C1"))
+        cams.release()
+        self.assertIsNone(cams.preview("C1"))
+
+    def test_preview_returns_none_immediately_while_capture_holds_lock(self):
+        cv2, cams = self._opened()
+        entered = threading.Event()
+        proceed = threading.Event()
+        cap = cv2.captures[0]
+        real_grab = cap.grab
+
+        def blocking_grab():
+            entered.set()
+            proceed.wait(5)
+            return real_grab()
+
+        cap.grab = blocking_grab
+        result = {}
+
+        def run_capture():
+            result["frames"] = cams.capture(Side.TOP)
+
+        worker = threading.Thread(target=run_capture)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            started = time.monotonic()
+            self.assertIsNone(cams.preview("C1"))
+            self.assertIsNone(cams.preview("C2"))
+            self.assertLess(time.monotonic() - started, 1.0)
+        finally:
+            proceed.set()
+            worker.join(5)
+        self.assertEqual(len(result["frames"]), 4)
+        self.assertEqual(cams.preview("C1"), b"JPG:img0")
+
+    def test_encode_failure_is_none_and_other_cameras_still_work(self):
+        cv2, cams = self._opened()
+        cv2.fail_encode_for = "img2"
+        self.assertIsNone(cams.preview("C3"))
+        self.assertEqual(cams.preview("C1"), b"JPG:img0")
+        cv2.encode_ok = False
+        self.assertIsNone(cams.preview("C1"))
+
+    def test_grab_or_retrieve_problems_are_none_not_raised(self):
+        cv2, cams = self._opened()
+        cv2.captures[0].grab_ok = False
+        self.assertIsNone(cams.preview("C1"))
+        cv2.captures[0].grab_ok = True
+        cv2.captures[0].retrieve_ok = False
+        self.assertIsNone(cams.preview("C1"))
+        cv2.captures[0].retrieve_ok = True
+
+        def boom():
+            raise RuntimeError("device gone")
+
+        cv2.captures[1].grab = boom
+        self.assertIsNone(cams.preview("C2"))
+        self.assertEqual(cams.preview("C1"), b"JPG:img0")
+
+    def test_preview_grabs_only_the_requested_device(self):
+        cv2, cams = self._opened()
+        cv2.log.clear()
+        self.assertEqual(cams.preview("C3"), b"JPG:img2")
+        grabs = [e[1] for e in cv2.log if e[0] == "grab"]
+        self.assertEqual(grabs, [2])
+
+    def test_wide_frame_is_downscaled_to_default_width_keeping_aspect(self):
+        cv2, cams = self._opened((0,))
+        cv2.captures[0].image = FakeImage("big", 1280, 720)
+        self.assertEqual(cams.preview("C1"), b"JPG:big>resized")
+        self.assertEqual(cv2.resizes, [("big", (640, 360), FakeCv2.INTER_AREA)])
+
+    def test_width_argument_is_honoured(self):
+        cv2, cams = self._opened((0,))
+        cv2.captures[0].image = FakeImage("big", 1280, 720)
+        cams.preview("C1", width=320)
+        self.assertEqual(cv2.resizes[-1][1], (320, 180))
+
+    def test_aspect_ratio_kept_for_odd_sizes(self):
+        cv2, cams = self._opened((0,))
+        cv2.captures[0].image = FakeImage("tall", 1000, 1000)
+        cams.preview("C1")
+        self.assertEqual(cv2.resizes[-1][1], (640, 640))
+        cv2.captures[0].image = FakeImage("odd", 1000, 333)
+        cams.preview("C1")
+        self.assertEqual(cv2.resizes[-1][1], (640, 213))
+
+    def test_narrow_frame_is_not_upscaled(self):
+        cv2, cams = self._opened((0,))
+        cv2.captures[0].image = FakeImage("small", 400, 300)
+        self.assertEqual(cams.preview("C1"), b"JPG:small")
+        self.assertEqual(cv2.resizes, [])
+
+    def test_capture_still_works_after_previews(self):
+        cv2, cams = self._opened()
+        cams.preview("C1")
+        cams.preview("C2")
+        frames = cams.capture(Side.BOTTOM)
+        self.assertEqual([f.camera_id for f in frames], list(CAMERA_IDS))
+        self.assertEqual(frames[0].data, b"PNG:img0")
+        self.assertEqual(frames[3].data, b"PNG:img3")
+        self.assertIsNotNone(cams.last_skew_s)
+        self.assertIsNotNone(cams.preview("C1"))
 
 
 class BlurCheckTests(unittest.TestCase):

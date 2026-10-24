@@ -10,6 +10,7 @@ import dataclasses
 import enum
 import http.cookies
 import json
+import re
 import sys
 import traceback
 import urllib.parse
@@ -22,6 +23,7 @@ from station.contracts import InvalidTransition, Verdict
 SESSION_COOKIE = "station_session"
 MAX_BODY_BYTES = 64 * 1024
 MAX_REASON_CHARS = 500
+PREVIEW_CAMERA_RE = re.compile(r"C[1-4]")
 
 _ACTION_PATHS = {
     "/api/press": "press",
@@ -33,7 +35,7 @@ _ACTION_PATHS = {
 
 _CSP = (
     "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-    "img-src data:; connect-src 'self'; base-uri 'none'; form-action 'none'; "
+    "img-src 'self' data: blob:; connect-src 'self'; base-uri 'none'; form-action 'none'; "
     "frame-ancestors 'none'"
 )
 
@@ -122,6 +124,8 @@ class _Handler(BaseHTTPRequestHandler):
                               extra=[("Content-Security-Policy", _CSP)])
         if path == "/api/state":
             return self._state(urllib.parse.parse_qs(query))
+        if path == "/api/preview":
+            return self._preview(urllib.parse.parse_qs(query))
         raise _HttpError(404, "not found")
 
     def _post(self) -> None:
@@ -151,6 +155,20 @@ class _Handler(BaseHTTPRequestHandler):
             "actions": [a for a in ACTIONS if role_allows(role, a)],
         }
         self._send_json(200, body)
+
+    def _preview(self, query: dict) -> None:
+        """Live view frame: read-only. Never calls tick() or any action."""
+        self._require()  # any logged-in role may view (no action check)
+        camera = query.get("camera", [""])[-1]
+        if not PREVIEW_CAMERA_RE.fullmatch(camera):
+            raise _HttpError(400, "camera must be C1, C2, C3 or C4")
+        try:
+            jpeg = self.station.preview(camera)
+        except Exception:
+            jpeg = None  # a preview error must never break the page
+        if not isinstance(jpeg, (bytes, bytearray)) or not jpeg:
+            return self._send_empty(204)
+        return self._send(200, bytes(jpeg), "image/jpeg")
 
     def _login(self) -> None:
         data = self._read_json()
@@ -246,6 +264,12 @@ class _Handler(BaseHTTPRequestHandler):
         body = json.dumps(_to_jsonable(obj)).encode("utf-8")
         self._send(status, body, "application/json; charset=utf-8", extra)
 
+    def _send_empty(self, status: int) -> None:
+        self.send_response(status)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+
     def _send(self, status: int, body: bytes, ctype: str, extra=()) -> None:
         self.send_response(status)
         self.send_header("Content-Type", ctype)
@@ -265,7 +289,9 @@ def make_server(session, users: UserStore, sessions: SessionManager,
 
     `session` must provide: snapshot(include_images=False) -> dict, press() -> bool,
     resolve_review(by, new_verdict, reason), override(by, new_verdict, reason),
-    ack_alarm(), clear_fault(), tick(). InvalidTransition -> 409, ValueError -> 400.
+    ack_alarm(), clear_fault(), tick(), preview(camera_id) -> bytes | None.
+    snapshot() may also carry prompt (str), press_ready (bool) and flip_wait_s (float).
+    InvalidTransition -> 409, ValueError -> 400.
     """
     handler = type("StationHandler", (_Handler,), {
         "station": session,
@@ -328,6 +354,12 @@ main { padding: 16px; max-width: 980px; margin: 0 auto; }
 .poc { background: var(--poc); color: #1b1d21; font-weight: 700; border-radius: 10px;
   padding: 12px 16px; margin-bottom: 16px; }
 .hint { margin: 8px 0 0; }
+.prompt { font-size: 28px; font-weight: 700; line-height: 1.25; margin: 0 0 12px; }
+.status { min-height: 1.4em; font-weight: 600; margin: 8px 0 0; }
+.live-tile { margin: 0; min-width: 0; }
+.live-tile img { width: 100%; height: auto; min-height: 120px; display: block; background: #000;
+  border-radius: 6px; }
+.live-tile figcaption { font-size: 13px; color: var(--muted); margin-top: 4px; }
 .side-row + .side-row { margin-top: 16px; }
 .side-row h3 { font-size: 14px; color: var(--muted); letter-spacing: 1px; margin: 0 0 8px; }
 .tile { margin: 0; min-width: 0; }
@@ -375,12 +407,19 @@ label { display: block; font-size: 14px; color: var(--muted); }
       <div><span>Good</span><b id="c-good">0</b></div>
       <div><span>Bad</span><b id="c-bad">0</b></div>
     </div>
+    <section id="live" class="card" aria-label="Live view">
+      <h3 class="live-title">Live view</h3>
+      <div id="live-grid" class="tiles"></div>
+      <p class="muted hint">Live view (not saved)</p>
+    </section>
     <div id="tiles" class="card"></div>
     <div class="card">
+      <p id="prompt" class="prompt" hidden></p>
       <button data-action="press">Press (Enter)</button>
       <button data-action="ack">Acknowledge alarm</button>
       <button data-action="clear_fault">Clear fault</button>
       <p id="press-hint" class="muted hint">Enter key or click: start TOP scan, flip the part, press again for the BOTTOM scan.</p>
+      <p id="press-status" class="status" role="status"></p>
     </div>
     <div class="card">
       <label for="reason">Reason (required for resolve and override)</label>
@@ -396,6 +435,11 @@ label { display: block; font-size: 14px; color: var(--muted); }
 (function () {
   "use strict";
   var POLL_MS = 1000;
+  // Engineering settings: client-side press lockout and live-view frame rate.
+  var PRESS_LOCKOUT_MS = 1500;
+  var PRESS_MAX_WAIT_MS = 4000;
+  var PREVIEW_MS = 250;
+  var PREVIEW_RETRY_MS = 1000;
   var DEFAULT_CAMERAS = ["C1", "C2", "C3", "C4"];
   var SIDES = ["TOP", "BOTTOM"];
   var PLACEHOLDER_W = 320;
@@ -404,6 +448,10 @@ label { display: block; font-size: 14px; color: var(--muted); }
     press: "/api/press", ack: "/api/ack", clear_fault: "/api/clear-fault",
     resolve: "/api/resolve", override: "/api/override"
   };
+  var MSG_CAPTURING = "Capturing... keep the part still.";
+  var MSG_WAIT_CAPTURE = "Wait: the picture is being taken.";
+  var MSG_FLIP_FIRST = "Press ignored: flip the part first, then press Enter.";
+  var MSG_NOT_ACCEPTED = "Press was not accepted in the current state.";
 
   function $(id) { return document.getElementById(id); }
 
@@ -411,7 +459,8 @@ label { display: block; font-size: 14px; color: var(--muted); }
     login: $("login-box"), app: $("app"), form: $("login-form"), who: $("who"),
     logout: $("logout"), error: $("error"), state: $("state"), verdict: $("verdict"),
     total: $("c-total"), good: $("c-good"), bad: $("c-bad"), tiles: $("tiles"),
-    reason: $("reason"), poc: $("poc"),
+    reason: $("reason"), poc: $("poc"), prompt: $("prompt"),
+    pressStatus: $("press-status"), liveGrid: $("live-grid"),
     press: document.querySelector('[data-action="press"]')
   };
 
@@ -420,8 +469,15 @@ label { display: block; font-size: 14px; color: var(--muted); }
   // part_id and state of the snapshot that the shown images belong to.
   var lastPart;
   var lastState;
+  // Last state seen by a poll, and what the server said about pressing.
+  var curState;
+  var curFault = false;
+  var pressReady = true;
+  var flipWait = 0;
+  var pressAllowed = false;
 
   function setError(msg) { el.error.textContent = msg || ""; }
+  function setPressStatus(msg) { el.pressStatus.textContent = msg || ""; }
 
   function request(method, path, body) {
     var opts = { method: method, credentials: "same-origin", headers: {} };
@@ -596,6 +652,117 @@ label { display: block; font-size: 14px; color: var(--muted); }
     });
   }
 
+  // ----- live view (not saved) -----------------------------------------
+  // One <img> per camera. Each camera fetches its next frame only after the previous
+  // request completes, so requests never overlap. Runs only while the page is
+  // visible, the user is logged in, and the station is IDLE or WAIT_FLIP with no fault.
+  var liveTiles = [];
+  var liveKey = null;
+  var liveRunning = false;
+  var liveGen = 0;
+
+  function LiveTile(cam) {
+    this.cam = cam;
+    this.timer = null;
+    this.url = null;
+    this.figure = document.createElement("figure");
+    this.figure.className = "live-tile";
+    this.img = document.createElement("img");
+    this.img.alt = "Live view " + cam;
+    var caption = document.createElement("figcaption");
+    caption.textContent = cam;
+    this.figure.appendChild(this.img);
+    this.figure.appendChild(caption);
+  }
+
+  // Shows a new frame and releases the object URL it replaces.
+  LiveTile.prototype.show = function (blob) {
+    var url = URL.createObjectURL(blob);
+    var old = this.url;
+    this.url = url;
+    this.img.src = url;
+    if (old) { URL.revokeObjectURL(old); }
+  };
+
+  LiveTile.prototype.release = function () {
+    if (this.url) { URL.revokeObjectURL(this.url); this.url = null; }
+  };
+
+  // Rebuilds the live grid only when the camera list changes.
+  function ensureLive(cams) {
+    var key = cams.join("|");
+    if (key === liveKey) { return; }
+    liveKey = key;
+    liveStop();
+    liveTiles.forEach(function (t) { t.release(); });
+    liveTiles = [];
+    while (el.liveGrid.firstChild) { el.liveGrid.removeChild(el.liveGrid.firstChild); }
+    var n = Math.max(1, cams.length);
+    el.liveGrid.style.setProperty("--cols", String(n));
+    el.liveGrid.style.setProperty("--cols-m", String(Math.min(2, n)));
+    cams.forEach(function (cam) {
+      var t = new LiveTile(cam);
+      liveTiles.push(t);
+      el.liveGrid.appendChild(t.figure);
+    });
+  }
+
+  function liveWanted() {
+    if (el.app.hidden || document.visibilityState !== "visible") { return false; }
+    if (curFault) { return false; }
+    return curState === "IDLE" || curState === "WAIT_FLIP";
+  }
+
+  // Paused views keep their last picture.
+  function syncLive() {
+    if (liveWanted()) { liveStart(); } else { liveStop(); }
+  }
+
+  function liveStart() {
+    if (liveRunning) { return; }
+    liveRunning = true;
+    liveGen += 1;
+    var g = liveGen;
+    liveTiles.forEach(function (t) { liveSchedule(t, g, 0); });
+  }
+
+  function liveStop() {
+    if (!liveRunning) { return; }
+    liveRunning = false;
+    liveGen += 1;
+    liveTiles.forEach(function (t) {
+      if (t.timer !== null) { clearTimeout(t.timer); }
+      t.timer = null;
+    });
+  }
+
+  function liveSchedule(t, g, ms) {
+    t.timer = setTimeout(function () {
+      t.timer = null;
+      liveFetch(t, g);
+    }, ms);
+  }
+
+  function liveFetch(t, g) {
+    if (g !== liveGen) { return; }
+    fetch("/api/preview?camera=" + encodeURIComponent(t.cam), {
+      method: "GET", credentials: "same-origin", cache: "no-store"
+    }).then(function (res) {
+      if (res.status === 401) { return { loggedOut: true }; }
+      if (res.status === 204) { return null; }
+      if (!res.ok) { throw new Error("preview"); }
+      return res.blob();
+    }).then(function (result) {
+      if (g !== liveGen) { return; }
+      if (result && result.loggedOut === true) { showLogin(); return; }
+      if (result) { t.show(result); }
+      liveSchedule(t, g, PREVIEW_MS);
+    }).then(null, function () {
+      // Errors show nothing and retry quietly.
+      if (g === liveGen) { liveSchedule(t, g, PREVIEW_RETRY_MS); }
+    });
+  }
+
   function render(s, fresh) {
     el.login.hidden = true;
     el.app.hidden = false;
@@ -608,6 +775,17 @@ label { display: block; font-size: 14px; color: var(--muted); }
     Array.prototype.forEach.call(document.querySelectorAll("[data-action]"), function (b) {
       b.disabled = !allowed[b.getAttribute("data-action")];
     });
+
+    // A state that differs from the one seen at press time ends the capture lockout.
+    pressAllowed = !!allowed.press;
+    if (captureLocked && s.state !== lockFromState) { unlockPress(); }
+    curState = s.state;
+    curFault = !!s.fault;
+    pressReady = s.press_ready !== false;
+    flipWait = typeof s.flip_wait_s === "number" && s.flip_wait_s > 0 ? s.flip_wait_s : 0;
+    el.prompt.textContent = typeof s.prompt === "string" ? s.prompt : "";
+    el.prompt.hidden = el.prompt.textContent === "";
+    refreshPress();
 
     var verdict = (s.verdict === "GOOD" || s.verdict === "BAD" || s.verdict === "REVIEW") ? s.verdict : "NONE";
     el.verdict.className = "verdict v-" + verdict;
@@ -625,6 +803,7 @@ label { display: block; font-size: 14px; color: var(--muted); }
 
     var cams = cameraList(s);
     ensureTiles(cams);
+    ensureLive(cams);
 
     // Proof-of-concept banner: only for a partial station (not the 8-image rule).
     var partial = s.partial_station === true;
@@ -639,6 +818,7 @@ label { display: block; font-size: 14px; color: var(--muted); }
     tiles.forEach(function (t) {
       t.update(findImage(images, t), fresh);
     });
+    syncLive();
   }
 
   function findImage(images, t) {
@@ -672,8 +852,12 @@ label { display: block; font-size: 14px; color: var(--muted); }
   function showLogin() {
     gen += 1;
     stopPolling();
+    liveStop();
+    unlockPress();
     lastPart = undefined;
     lastState = undefined;
+    curState = undefined;
+    pressAllowed = false;
     el.app.hidden = true;
     el.login.hidden = false;
     el.logout.hidden = true;
@@ -683,6 +867,7 @@ label { display: block; font-size: 14px; color: var(--muted); }
   function handleError(g, err) {
     if (g !== gen) { return; }
     if (err.status === 401) { showLogin(); return; }
+    unlockPress();
     setError(err.message);
     schedule(POLL_MS);
   }
@@ -709,19 +894,70 @@ label { display: block; font-size: 14px; color: var(--muted); }
 
   // Press the part: from the Press button or the Enter key. One request at a time.
   var pressing = false;
+  // Client-side lockout: after an accepted press the button stays disabled until a
+  // poll shows a different state, a poll errors, or PRESS_MAX_WAIT_MS has passed.
+  var captureLocked = false;
+  var lockFromState;
+  var lockTimer = null;
+  var lastPressAt = 0;
+
+  function inPressLockout() {
+    return pressing || captureLocked || (Date.now() - lastPressAt < PRESS_LOCKOUT_MS);
+  }
+
+  // The Press label and enabled state: capture > not ready (flip wait) > allowed.
+  function refreshPress() {
+    var p = el.press;
+    if (!p) { return; }
+    if (captureLocked) {
+      p.textContent = "Capturing...";
+      p.disabled = true;
+      return;
+    }
+    if (!pressReady) {
+      p.textContent = flipWait > 0 ? "Wait " + Math.ceil(flipWait) + " s" : "Press (Enter)";
+      p.disabled = true;
+      return;
+    }
+    p.textContent = "Press (Enter)";
+    p.disabled = !pressAllowed;
+  }
+
+  function lockPress() {
+    captureLocked = true;
+    lockFromState = curState;
+    if (lockTimer !== null) { clearTimeout(lockTimer); }
+    lockTimer = setTimeout(unlockPress, PRESS_MAX_WAIT_MS);
+    refreshPress();
+  }
+
+  function unlockPress() {
+    if (lockTimer !== null) { clearTimeout(lockTimer); }
+    lockTimer = null;
+    if (captureLocked) {
+      captureLocked = false;
+      setPressStatus("");
+    }
+    refreshPress();
+  }
 
   function pressPart() {
-    if (pressing) { return; }
+    if (inPressLockout()) { setPressStatus(MSG_WAIT_CAPTURE); return; }
     pressing = true;
+    lastPressAt = Date.now();
     setError("");
+    lockPress();
+    setPressStatus(MSG_CAPTURING);
     request("POST", PATHS.press, {}).then(function (data) {
       pressing = false;
       if (data && data.accepted === false) {
-        setError("Press was not accepted in the current state.");
+        unlockPress();
+        setError(curState === "WAIT_FLIP" ? MSG_FLIP_FIRST : MSG_NOT_ACCEPTED);
       }
       schedule(0);
     }, function (err) {
       pressing = false;
+      unlockPress();
       if (err.status === 401) { showLogin(); return; }
       setError(err.message);
     });
@@ -753,12 +989,17 @@ label { display: block; font-size: 14px; color: var(--muted); }
   // or Enter on a focused button, must not press twice). Other keys do nothing.
   document.addEventListener("keydown", function (ev) {
     if (ev.key !== "Enter" || ev.repeat) { return; }
-    if (el.app.hidden || !el.press || el.press.disabled || pressing) { return; }
+    if (el.app.hidden || !el.press) { return; }
     var focus = document.activeElement;
     var tag = focus && focus.tagName ? focus.tagName : "";
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON") { return; }
+    if (inPressLockout()) { setPressStatus(MSG_WAIT_CAPTURE); return; }
+    if (el.press.disabled) { return; }
     pressPart();
   });
+
+  // Live view follows page visibility.
+  document.addEventListener("visibilitychange", syncLive);
 
   el.form.addEventListener("submit", function (ev) {
     ev.preventDefault();
@@ -782,6 +1023,7 @@ label { display: block; font-size: 14px; color: var(--muted); }
   });
 
   ensureTiles(DEFAULT_CAMERAS);
+  ensureLive(DEFAULT_CAMERAS);
   poll();
 })();
 </script>

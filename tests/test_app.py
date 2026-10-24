@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.request
 from unittest import mock
@@ -19,6 +20,7 @@ from station import users_cli
 from station.app import (
     ConfigError,
     StationApp,
+    _LockedSession,
     _PartIdFactory,
     build_station,
     load_config,
@@ -39,6 +41,8 @@ except ImportError:
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 TOKEN_ENV = "VISION_TEST_APP_TOKEN"
+# A gap between the TOP and BOTTOM press that is longer than the 2.0 s default min_flip_s.
+PAST_MIN_FLIP = 2.5
 
 
 def base_config(tmp: str) -> dict:
@@ -123,6 +127,18 @@ class ConfigTests(TmpCase):
             with self.assertRaises(ConfigError, msg=str(bad)):
                 validate_config(data)
 
+    def test_min_flip_s_defaults_to_2_and_is_validated(self) -> None:
+        data = base_config(self.tmp)  # no min_flip_s key: an existing config keeps working
+        self.assertEqual(validate_config(data)["min_flip_s"], 2.0)
+        data["min_flip_s"] = 0
+        self.assertEqual(validate_config(data)["min_flip_s"], 0.0)
+        data["min_flip_s"] = 0.75
+        self.assertEqual(validate_config(data)["min_flip_s"], 0.75)
+        for bad in (-0.5, "2", True, None):
+            data["min_flip_s"] = bad
+            with self.assertRaisesRegex(ConfigError, "min_flip_s"):
+                validate_config(data)
+
     def test_unknown_top_level_key_is_rejected(self) -> None:
         data = base_config(self.tmp)
         data["thresold"] = {}
@@ -191,6 +207,7 @@ class ConfigTests(TmpCase):
         text = (REPO / "config.example.json").read_text(encoding="utf-8")
         self.assertNotIn("token\":", text.lower())  # no token value anywhere in the example
         self.assertTrue(example["mes"]["token_env"].startswith("["))
+        self.assertEqual(example["min_flip_s"], 2.0)  # an engineering default, not a placeholder
 
 
 class PartIdTests(TmpCase):
@@ -241,7 +258,7 @@ class BuildTests(TmpCase):
         self.assertEqual(app.sync_once(), {"sent": 0, "failed_permanent": 0, "retry_later": 0})
 
         self.assertTrue(app.session.press())
-        clock.now += 1.0
+        clock.now += PAST_MIN_FLIP
         self.assertTrue(app.session.press())
         self.assertEqual(app.session.counters["total"], 1)
         self.assertEqual(app.outbox.pending_count(), 1)  # queued for later, not sent
@@ -283,7 +300,7 @@ class BuildTests(TmpCase):
                             model=MarkerModel("test-1"), outputs=RecordingOutputs(), clock=clock)
         self.addCleanup(app.stop)
         app.session.press()
-        clock.now += 1.0
+        clock.now += PAST_MIN_FLIP
         app.session.press()
         self.assertEqual(app.session.snapshot()["state"], State.VERDICT.value)
         app.session.ack_alarm()  # must not raise even though the MES mapping fails
@@ -301,7 +318,7 @@ class BuildTests(TmpCase):
         app1 = build_station(cfg, cameras=FakeCameraSet(), model=MarkerModel("test-1"),
                              outputs=RecordingOutputs(), clock=clock)
         app1.session.press()
-        clock.now += 1.0
+        clock.now += PAST_MIN_FLIP
         app1.session.press()
         app1.stop()
 
@@ -314,9 +331,9 @@ class BuildTests(TmpCase):
         self.assertEqual(app2.session.snapshot()["state"], State.IDLE.value)
 
         # The next part gets a new id and session, and nothing is lost.
-        clock.now += 1.0
+        clock.now += PAST_MIN_FLIP
         app2.session.press()
-        clock.now += 1.0
+        clock.now += PAST_MIN_FLIP
         app2.session.press()
         self.assertEqual(app2.session.counters["total"], 2)
         self.assertEqual(app2.outbox.pending_count(), 2)
@@ -344,7 +361,7 @@ class BuildTests(TmpCase):
                             outputs=RecordingOutputs(), clock=clock)
         self.addCleanup(app.stop)
         app.session.press()
-        clock.now += 1.0
+        clock.now += PAST_MIN_FLIP
         app.session.press()
         self.assertEqual(app.outbox.pending_count(), 1)
         app.start()
@@ -364,6 +381,7 @@ class BuildTests(TmpCase):
         from station.__main__ import build_demo_station
 
         cfg = base_config(self.tmp)
+        cfg["min_flip_s"] = 0.0  # real clock here: a 2 s flip gap would make the test wait 2 s
         os.environ[TOKEN_ENV] = "not-a-real-token-for-tests"
         app = build_demo_station(cfg)
         self.addCleanup(app.stop)
@@ -489,7 +507,7 @@ class PartialStationTests(TmpCase):
         self.assertEqual(app.session.snapshot()["camera_ids"], ["C1"])
 
         self.assertTrue(app.session.press())  # TOP
-        clock.now += 1.0
+        clock.now += PAST_MIN_FLIP
         self.assertTrue(app.session.press())  # BOTTOM: fuse and save
         self.assertEqual(app.session.counters["total"], 1)
 
@@ -516,7 +534,7 @@ class PartialStationTests(TmpCase):
         self.assertNotIn("mes_disabled", BuildTests._event_kinds(app.store))
 
         app.session.press()
-        clock.now += 1.0
+        clock.now += PAST_MIN_FLIP
         app.session.press()
         self.assertEqual(app.session.counters["total"], 1)
         self.assertEqual(app.outbox.pending_count(), 1)
@@ -615,6 +633,92 @@ class PocConfigTests(TmpCase):
         self.assertEqual(cfg["model"]["kind"], "golden")
         self.assertTrue(cfg["model"]["path"].endswith("golden.npz"))
         self.assertEqual(cfg["ui"]["port"], 8000)
+        self.assertEqual(cfg["min_flip_s"], 2.0)
+
+
+class MinFlipTests(TmpCase):
+    def setUp(self) -> None:
+        super().setUp()
+        with open(os.path.join(self.tmp, "users.json"), "w", encoding="utf-8") as fh:
+            json.dump({"op1": {"password_hash": hash_password("operator-pass-1"), "role": "operator"}}, fh)
+
+    def _app(self, min_flip_s=None) -> tuple[StationApp, FakeClock]:
+        cfg = base_config(self.tmp)
+        if min_flip_s is not None:
+            cfg["min_flip_s"] = min_flip_s
+        clock = FakeClock()
+        app = build_station(cfg, cameras=FakeCameraSet(), model=MarkerModel("test-1"),
+                            outputs=RecordingOutputs(), clock=clock)
+        self.addCleanup(app.stop)
+        return app, clock
+
+    def test_quick_second_press_is_ignored_with_the_default(self) -> None:
+        app, clock = self._app()
+        self.assertTrue(app.session.press())  # TOP
+        clock.now += 0.5  # past the 0.3 s debounce, but inside the 2.0 s default
+        self.assertFalse(app.session.press())
+        self.assertEqual(app.session.snapshot()["state"], State.WAIT_FLIP.value)
+        self.assertEqual(app.session.counters["total"], 0)
+
+    def test_quick_second_press_is_accepted_when_min_flip_s_is_0(self) -> None:
+        app, clock = self._app(min_flip_s=0)
+        self.assertTrue(app.session.press())
+        clock.now += 0.5
+        self.assertTrue(app.session.press())
+        self.assertEqual(app.session.counters["total"], 1)
+
+
+class PreviewWrapperTests(unittest.TestCase):
+    class FakeSession:
+        def __init__(self, result=b"jpeg-bytes", error=None) -> None:
+            self.result = result
+            self.error = error
+            self.calls: list[str] = []
+
+        def preview(self, camera_id: str):
+            self.calls.append(camera_id)
+            if self.error is not None:
+                raise self.error
+            return self.result
+
+    def test_preview_returns_the_session_bytes_and_releases_the_lock(self) -> None:
+        lock = threading.RLock()
+        session = self.FakeSession()
+        wrapped = _LockedSession(session, lock)
+        self.assertEqual(wrapped.preview("C1"), b"jpeg-bytes")
+        self.assertEqual(session.calls, ["C1"])
+        self.assertTrue(lock.acquire(blocking=False))  # not left held
+        lock.release()
+
+    def test_preview_returns_none_at_once_while_a_press_holds_the_lock(self) -> None:
+        lock = threading.RLock()
+        session = self.FakeSession()
+        wrapped = _LockedSession(session, lock)
+        holding = threading.Event()
+        release = threading.Event()
+
+        def hold() -> None:
+            with lock:
+                holding.set()
+                release.wait(10)
+
+        worker = threading.Thread(target=hold, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(holding.wait(10))
+            self.assertIsNone(wrapped.preview("C1"))
+            self.assertEqual(session.calls, [])  # the session was never touched
+        finally:
+            release.set()
+            worker.join(10)
+        self.assertEqual(wrapped.preview("C1"), b"jpeg-bytes")
+
+    def test_preview_returns_none_when_the_session_raises(self) -> None:
+        lock = threading.RLock()
+        wrapped = _LockedSession(self.FakeSession(error=StationError("camera gone")), lock)
+        self.assertIsNone(wrapped.preview("C2"))
+        self.assertTrue(lock.acquire(blocking=False))  # released despite the error
+        lock.release()
 
 
 class UsersCliTests(TmpCase):
