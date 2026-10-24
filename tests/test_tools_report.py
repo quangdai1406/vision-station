@@ -1,0 +1,321 @@
+"""Tests for tools/report.py. Synthetic session folders in a temp dir; numpy tests are skipped without numpy."""
+import contextlib
+import io
+import json
+import re
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:  # pragma: no cover - depends on the environment
+    np = None
+    HAS_NUMPY = False
+
+from tools import ToolDependencyError
+from tools import analysis
+from tools import report
+
+NEED_NUMPY = unittest.skipUnless(HAS_NUMPY, "numpy is not installed")
+
+
+def _build_session(root, name, mode, *, shifts=None, frames=6, h=48, w=64,
+                   autofocus_applied=True, seed=1, base=None, sigma=2.0):
+    """Write a session folder that follows tools/FORMAT.md. Placement uses integer (dx, dy) shifts.
+
+    base: optional fixed image for a stationary session (pure noise, no drift); the
+    frame size then comes from base.
+    """
+    rng = np.random.default_rng(seed)
+    if base is None:
+        base = rng.integers(30, 226, size=(h, w)).astype(np.float64)
+        stationary_seq = [base + 0.5 * t for t in range(frames)]
+    else:
+        base = np.asarray(base, dtype=np.float64)
+        h, w = base.shape
+        stationary_seq = [base] * frames
+    if mode == "placement":
+        seq = [np.roll(base, (dy, dx), axis=(0, 1)) for dx, dy in shifts]
+    else:
+        seq = stationary_seq
+    gray = np.stack([np.clip(f + rng.normal(0.0, sigma, size=(h, w)), 0, 255)
+                     for f in seq]).astype(np.uint8)
+    count = gray.shape[0]
+    stamps = 1000.0 + np.arange(count) * 0.1
+    sdir = Path(root) / name
+    (sdir / "samples").mkdir(parents=True)
+    np.savez(sdir / "frames_dev0.npz", gray=gray, stamps=stamps)
+    warnings = [] if autofocus_applied else [
+        "autofocus: requested off but the camera reports auto (readback 1)"]
+    meta = {
+        "schema": 1,
+        "created_utc": "2026-10-24T08:00:00Z",
+        "mode": mode,
+        "session_name": name,
+        "devices": [0],
+        "notes": {"part": "P-1 good unchanged", "lighting": "bench LED",
+                  "operator": "test", "free": ""},
+        "requested": {"width": w, "height": h, "fps": 10, "fourcc": "MJPG",
+                      "manual": {"focus": 30, "exposure": 100,
+                                 "white_balance": 4500, "gain": 10}},
+        "cameras": {"0": {
+            "actual_width": w, "actual_height": h, "actual_fps": 10.0,
+            "readback": {"autofocus": 0 if autofocus_applied else 1, "focus": 30,
+                         "auto_exposure": 0, "exposure": 100, "auto_wb": 0,
+                         "white_balance": 4500, "gain": 10},
+            "applied_ok": {"autofocus": autofocus_applied, "auto_exposure": True,
+                           "auto_wb": True, "focus": True, "exposure": True,
+                           "white_balance": True, "gain": True},
+            "warnings": warnings,
+        }},
+        "frames": [{"index": i, "device": 0, "stamp": float(stamps[i]),
+                    "mean": float(gray[i].mean()), "laplacian_var": 1.0}
+                   for i in range(count)],
+    }
+    (sdir / "session.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return sdir
+
+
+def _quiet_main(argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = report.main(argv)
+    return rc, out.getvalue(), err.getvalue()
+
+
+def _section(md, start, end):
+    return md.split(start, 1)[1].split(end, 1)[0]
+
+
+@NEED_NUMPY
+class ReportTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _read(self, path):
+        return Path(path).read_text(encoding="utf-8")
+
+    def test_writes_three_files_to_default_folder(self):
+        sdir = _build_session(self.root, "stat_ok", "stationary")
+        rc, _, _ = _quiet_main([str(sdir)])
+        self.assertEqual(rc, 0)
+        out = sdir / "report"
+        for name in ("report.json", "report.md", "summary.csv"):
+            self.assertTrue((out / name).is_file(), name)
+        data = json.loads(self._read(out / "report.json"))
+        self.assertEqual(len(data["rows"]), 1)
+
+    def test_out_option_is_used(self):
+        sdir = _build_session(self.root, "stat_out", "stationary")
+        custom = self.root / "custom_out"
+        rc, _, _ = _quiet_main([str(sdir), "--out", str(custom)])
+        self.assertEqual(rc, 0)
+        self.assertTrue((custom / "report.md").is_file())
+        self.assertTrue((custom / "summary.csv").is_file())
+
+    def test_warning_block_for_ignored_control(self):
+        sdir = _build_session(self.root, "stat_ign", "stationary", autofocus_applied=False)
+        self.assertEqual(_quiet_main([str(sdir)])[0], 0)
+        md = self._read(sdir / "report" / "report.md")
+        self.assertIn("WARNING", md)
+        cam_section = _section(md, "## 2. Camera settings", "## 3. Stationary")
+        self.assertIn("WARNING", cam_section)
+        auto_row = [ln for ln in cam_section.splitlines() if ln.startswith("| Autofocus |")]
+        self.assertTrue(auto_row)
+        self.assertIn("NO (ignored)", auto_row[0])
+        self.assertIn("reports auto", cam_section)  # session warning copied verbatim
+
+    def test_no_warning_block_when_all_applied(self):
+        sdir = _build_session(self.root, "stat_fine", "stationary")
+        self.assertEqual(_quiet_main([str(sdir)])[0], 0)
+        md = self._read(sdir / "report" / "report.md")
+        self.assertNotIn("WARNING", md)
+        self.assertIn("No camera control was reported as ignored.", md)
+
+    def test_noise_floor_section_has_observed_numbers(self):
+        sdir = _build_session(self.root, "stat_nf", "stationary")
+        self.assertEqual(_quiet_main([str(sdir)])[0], 0)
+        out = sdir / "report"
+        md = self._read(out / "report.md")
+        data = json.loads(self._read(out / "report.json"))
+        row = data["noise_floor"]["rows"][0]
+        resid = data["sessions"][0]["per_device"]["0"]["residual_unaligned"]
+        self.assertAlmostEqual(row["mean"], resid["mean"])
+        section = _section(md, "## 5. Noise floor", "## 6.")
+        self.assertIn("observed noise floor, not a threshold", section.lower())
+        self.assertIn(f"{row['mean']:.4f}", section)
+        self.assertIn(f"{row['p95']:.4f}", section)
+        self.assertIn(f"{row['max']:.4f}", section)
+
+    def _assert_noise_floor_is_unaligned(self, sdir):
+        self.assertEqual(_quiet_main([str(sdir)])[0], 0)
+        out = sdir / "report"
+        data = json.loads(self._read(out / "report.json"))
+        row = data["noise_floor"]["rows"][0]
+        gray, _ = analysis.load_session_gray(sdir, 0)
+        expected = analysis.residual_scores(gray, align=False)["mean"]
+        self.assertAlmostEqual(row["mean"], expected, places=9)
+        self.assertEqual(data["noise_floor"]["basis"], report.NOISE_FLOOR_BASIS)
+        try:
+            aligned = analysis.residual_scores(gray, align=True)["mean"]
+        except ValueError:
+            aligned = None  # the aligned figure may be unavailable; it is not used
+        if aligned is not None:
+            self.assertNotAlmostEqual(row["mean"], aligned, places=6)
+        md = self._read(out / "report.md")
+        section = _section(md, "## 5. Noise floor", "## 6.")
+        self.assertIn("no alignment", md)
+        self.assertNotIn("whole-pixel alignment", md)
+        self.assertIn("Alignment is NOT applied", section)
+        self.assertIn("observed noise floor, not a threshold", section.lower())
+
+    def test_noise_floor_unaligned_on_flat_pure_noise(self):
+        flat = np.full((48, 64), 128.0)
+        sdir = _build_session(self.root, "nf_flat", "stationary", base=flat,
+                              frames=12, sigma=3.0, seed=11)
+        self._assert_noise_floor_is_unaligned(sdir)
+
+    def test_noise_floor_unaligned_on_weak_texture(self):
+        yy, xx = np.mgrid[0:48, 0:64].astype(np.float64)
+        weak = 120.0 + 0.05 * xx + 0.05 * yy
+        sdir = _build_session(self.root, "nf_weak", "stationary", base=weak,
+                              frames=12, sigma=3.0, seed=12)
+        self._assert_noise_floor_is_unaligned(sdir)
+
+    def test_stationary_flat_session_never_aligns(self):
+        # Previously the aligned residual could raise ValueError here; it must not be used.
+        real = analysis.residual_scores
+
+        def guarded(gray, *args, **kwargs):
+            if kwargs.get("align", True):
+                raise ValueError("estimated shifts leave no overlapping area to compare")
+            return real(gray, *args, **kwargs)
+
+        sdir = _build_session(self.root, "stat_spur", "stationary",
+                              base=np.full((48, 64), 128.0), frames=8, sigma=3.0, seed=2)
+        with mock.patch.object(analysis, "residual_scores", side_effect=guarded):
+            rc, _, err = _quiet_main([str(sdir)])
+        self.assertEqual(rc, 0, err)
+        data = json.loads(self._read(sdir / "report" / "report.json"))
+        self.assertIsNone(data["sessions"][0]["per_device"]["0"].get("residual_aligned"))
+
+    def test_drift_line_present_and_omitted_on_estimate_failure(self):
+        sdir = _build_session(self.root, "stat_drift", "stationary")
+        self.assertEqual(_quiet_main([str(sdir)])[0], 0)
+        md = self._read(sdir / "report" / "report.md")
+        self.assertIn("apparent drift/vibration", md)
+        self.assertIn("itself noisy", md)
+        with mock.patch.object(analysis, "estimate_shifts", side_effect=ValueError("no shifts")):
+            rc, _, _ = _quiet_main([str(sdir), "--out", str(self.root / "drift_fail")])
+        self.assertEqual(rc, 0)
+        md = self._read(self.root / "drift_fail" / "report.md")
+        self.assertNotIn("apparent drift/vibration", md)
+        self.assertIn("## 5. Noise floor", md)
+
+    def test_analysis_value_error_gives_clean_nonzero_exit(self):
+        sdir = _build_session(self.root, "stat_bad", "stationary")
+        with mock.patch.object(analysis, "sharpness_stats",
+                               side_effect=ValueError("boom from analysis")):
+            rc, out, err = _quiet_main([str(sdir)])
+        self.assertEqual(rc, 2)
+        self.assertIn("boom from analysis", err)
+        self.assertNotIn("Traceback", err)
+        self.assertFalse((sdir / "report" / "report.md").exists())
+
+    def test_cannot_tell_section_always_present(self):
+        stat = _build_session(self.root, "stat_c", "stationary")
+        place = _build_session(self.root, "place_c", "placement",
+                               shifts=[(0, 0), (2, 0), (0, 3), (-2, 1)])
+        self.assertEqual(_quiet_main([str(stat)])[0], 0)
+        self.assertEqual(_quiet_main([str(place), "--out", str(self.root / "p")])[0], 0)
+        for md_path in (stat / "report" / "report.md", self.root / "p" / "report.md"):
+            md = self._read(md_path)
+            self.assertIn("## 6. What this test CANNOT tell you", md)
+            self.assertIn("tools/thresholds.py", md)
+            self.assertIn("[Quality to define]", md)
+            self.assertIn("4-camera USB bandwidth", md)
+
+    def test_no_pass_or_fail_words(self):
+        a = _build_session(self.root, "stat_a", "stationary", seed=3)
+        b = _build_session(self.root, "stat_b", "stationary", seed=4, autofocus_applied=False)
+        out = self.root / "both"
+        self.assertEqual(_quiet_main([str(a), str(b), "--out", str(out)])[0], 0)
+        md = self._read(out / "report.md")
+        self.assertIsNone(re.search(r"\b(pass|fail)", md, re.IGNORECASE))
+
+    def test_placement_shift_spread_matches_known_shifts(self):
+        shifts = [(0, 0), (3, 1), (-2, 0), (4, -2), (-3, 2), (1, 1)]
+        sdir = _build_session(self.root, "place_s", "placement", shifts=shifts)
+        self.assertEqual(_quiet_main([str(sdir)])[0], 0)
+        data = json.loads(self._read(sdir / "report" / "report.json"))
+        sh = data["sessions"][0]["per_device"]["0"]["shifts"]
+        dx = np.array([s[0] for s in shifts], dtype=float)
+        dy = np.array([s[1] for s in shifts], dtype=float)
+        self.assertAlmostEqual(sh["max_abs_dx"], np.max(np.abs(dx)), delta=1.0)
+        self.assertAlmostEqual(sh["max_abs_dy"], np.max(np.abs(dy)), delta=1.0)
+        self.assertAlmostEqual(sh["std_dx"], np.std(dx), delta=1.0)
+        self.assertAlmostEqual(sh["std_dy"], np.std(dy), delta=1.0)
+        md = self._read(sdir / "report" / "report.md")
+        self.assertIn("## 4. Placement results", md)
+        self.assertIn("Residual with alignment", md)
+        self.assertIn("Residual without alignment", md)
+
+    def test_multi_session_comparison(self):
+        a = _build_session(self.root, "cmp_a", "stationary", seed=5)
+        b = _build_session(self.root, "cmp_b", "stationary", seed=6, frames=9)
+        out = self.root / "cmp"
+        self.assertEqual(_quiet_main([str(a), str(b), "--out", str(out)])[0], 0)
+        data = json.loads(self._read(out / "report.json"))
+        self.assertEqual(len(data["rows"]), 2)
+        self.assertIsNotNone(data["comparison"])
+        self.assertTrue(data["comparison"]["metrics"])
+        md = self._read(out / "report.md")
+        self.assertIn("## Comparison across sessions and devices", md)
+        self.assertIn("cmp_a", md)
+        self.assertIn("cmp_b", md)
+        with open(out / "summary.csv", newline="", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        self.assertEqual(len(lines), 3)  # header + two rows
+
+    def test_missing_npz_gives_clear_error(self):
+        sdir = _build_session(self.root, "stat_miss", "stationary")
+        (sdir / "frames_dev0.npz").unlink()
+        with self.assertRaises(report.ReportInputError) as cm:
+            report.summarize_session(sdir)
+        self.assertIn("frames_dev0.npz", str(cm.exception))
+        rc, _, err = _quiet_main([str(sdir)])
+        self.assertEqual(rc, 2)
+        self.assertIn("frames_dev0.npz", err)
+        self.assertFalse((sdir / "report").exists())
+
+    def test_missing_session_json_gives_clear_error(self):
+        sdir = _build_session(self.root, "stat_nojson", "stationary")
+        (sdir / "session.json").unlink()
+        with self.assertRaises(report.ReportInputError) as cm:
+            report.summarize_session(sdir)
+        self.assertIn("session.json", str(cm.exception))
+
+    def test_main_returns_zero_on_success(self):
+        sdir = _build_session(self.root, "stat_rc", "stationary")
+        self.assertEqual(report.main([str(sdir)]), 0)
+        shutil.rmtree(sdir / "report", ignore_errors=True)
+
+
+class ToolDependencyTests(unittest.TestCase):
+    def test_missing_numpy_raises_tool_dependency_error(self):
+        with mock.patch.dict(sys.modules, {"numpy": None}):
+            with self.assertRaises(ToolDependencyError):
+                report.summarize_session(Path(tempfile.gettempdir()) / "no_such_session")
+
+
+if __name__ == "__main__":
+    unittest.main()

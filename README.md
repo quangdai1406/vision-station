@@ -180,3 +180,15 @@ token, enqueue failures, restart, the users command and the CLI.
   is slow at 2560x1440. Use it only after measuring on the line.
 - A saved part whose MES enqueue failed (for example an unmapped defect class) is not re-queued automatically; look for mes_enqueue_failed events and fix the mapping, then re-enqueue by hand.
 - The Outbox's long-lived connection must be closed from the thread that created it (StationApp.stop() on the main thread); the app opens a fresh Outbox per call elsewhere.
+
+## Repeatability and threshold tools
+
+The operator procedure for the real-webcam test is
+[docs/repeatability_protocol.md](docs/repeatability_protocol.md). These tools need numpy
+(and opencv-python for capture). They are not part of the station core.
+
+- `tools/capture.py`: captures a stationary or placement session from USB webcams.
+- `tools/report.py`: writes a plain-language report (`report.md`, `report.json`, `summary.csv`) from session folders.
+- `tools/criteria.py`: turns the MES criteria for a part into `class_map.json` and a sample-collection checklist.
+- `tools/thresholds.py`: computes candidate `t_low` and `t_img` from a labelled scores CSV. The values are candidates, not approved thresholds.
+- `tools/analysis.py`: the numpy-only measurements that `report.py` uses.
