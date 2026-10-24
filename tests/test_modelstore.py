@@ -381,6 +381,108 @@ class SharedStoreTests(_StoreCase):
             self.store.approvals(PART)
 
 
+class ActivationStackTests(_StoreCase):
+    def _three_approved(self):
+        self._candidate("v1")
+        self._candidate("v2", b"second", now=NOW2)
+        self._candidate("v3", b"third", now=NOW3)
+        for version, when in (("v1", NOW1), ("v2", NOW2), ("v3", NOW3)):
+            self.store.approve(PART, version, "Dai", "step", when)
+
+    def test_repeated_rollbacks_walk_down_then_stop(self):
+        self._three_approved()
+        self.assertEqual(self.store.rollback(PART, "Lan", "v3 bad", NOW3).version, "v2")
+        self.assertEqual(self.store.rollback(PART, "Lan", "v2 bad", NOW3).version, "v1")
+        with self.assertRaises(ms.ModelError):
+            self.store.rollback(PART, "Lan", "v1 bad", NOW3)
+        self.assertEqual(self.store.current(PART).version, "v1")
+
+    def test_rolled_back_from_version_never_returns(self):
+        self._three_approved()
+        self.store.rollback(PART, "Lan", "v3 bad", NOW3)
+        self.store.rollback(PART, "Lan", "v2 bad", NOW3)
+        self.assertEqual(self.store.history(PART), ["v1"])
+        with self.assertRaises(ms.ModelError):
+            self.store.rollback(PART, "Lan", "again", NOW3)
+        self.assertEqual(self.store.current(PART).version, "v1")
+
+    def test_manual_approve_after_rollback_becomes_current_again(self):
+        self._three_approved()
+        self.store.rollback(PART, "Lan", "v3 bad", NOW3)
+        self.store.approve(PART, "v3", "Dai", "fixed, re-approved", NOW3)
+        self.assertEqual(self.store.current(PART).version, "v3")
+        self.assertEqual(self.store.history(PART), ["v1", "v2", "v3"])
+        self.assertEqual(self.store.rollback(PART, "Lan", "v3 bad again", NOW3).version, "v2")
+
+    def test_rollback_skips_tampered_and_raises_when_none_verifies(self):
+        self._three_approved()
+        (self._version_dir("v2") / "model.bin").write_bytes(b"damaged")
+        (self._version_dir("v1") / "model.bin").write_bytes(b"damaged")
+        with self.assertRaises(ms.ModelError):
+            self.store.rollback(PART, "Lan", "v3 bad", NOW3)
+        self.assertEqual(self.store.current(PART).version, "v3")
+
+    def test_log_line_is_written_before_current_json_changes(self):
+        self._three_approved()
+        real_replace = os.replace
+        seen = []
+
+        def spy_replace(src, dst, *args, **kwargs):
+            if Path(dst).name == ms.CURRENT_NAME:
+                seen.append([(e["action"], e["version"]) for e in self.store.approvals(PART)])
+            return real_replace(src, dst, *args, **kwargs)
+
+        self.store.rollback(PART, "Lan", "v3 bad", NOW3)
+        with mock.patch.object(ms.os, "replace", side_effect=spy_replace):
+            self.store.approve(PART, "v3", "Dai", "again", NOW3)
+        self.assertEqual(seen[-1][-1], ("approve", "v3"))
+
+    def test_failed_switch_logs_failed_line_and_keeps_old_model(self):
+        self._candidate("v1")
+        self._candidate("v2", b"second", now=NOW2)
+        self.store.approve(PART, "v1", "Dai", "first", NOW1)
+        real_replace = os.replace
+
+        def failing_replace(src, dst, *args, **kwargs):
+            if Path(dst).name == ms.CURRENT_NAME:
+                raise OSError("simulated disk failure")
+            return real_replace(src, dst, *args, **kwargs)
+
+        with mock.patch.object(ms.os, "replace", side_effect=failing_replace):
+            with self.assertRaises(ms.ModelError):
+                self.store.approve(PART, "v2", "Lan", "second", NOW2)
+
+        log = [(e["action"], e["version"]) for e in self.store.approvals(PART)]
+        self.assertEqual(log, [("approve", "v1"), ("approve", "v2"), ("failed", "v2")])
+        self.assertEqual(self.store.current(PART).version, "v1")
+        self.assertEqual(self.store.history(PART), ["v1"])
+        statuses = {m["version"]: m["status"] for m in self.store.list_versions(PART)}
+        self.assertEqual(statuses, {"v1": "approved", "v2": "candidate"})
+
+        # The failed line does not block a later, successful approval.
+        self.store.approve(PART, "v2", "Lan", "retry", NOW2)
+        self.assertEqual(self.store.current(PART).version, "v2")
+        self.assertEqual(self.store.history(PART), ["v1", "v2"])
+
+    def test_history_tracks_approve_and_rollback(self):
+        self.assertEqual(self.store.history(PART), [])
+        self._three_approved()
+        self.assertEqual(self.store.history(PART), ["v1", "v2", "v3"])
+        self.store.rollback(PART, "Lan", "v3 bad", NOW3)
+        self.assertEqual(self.store.history(PART), ["v1", "v2"])
+        self.store.rollback(PART, "Lan", "v2 bad", NOW3)
+        self.assertEqual(self.store.history(PART), ["v1"])
+
+    def test_two_instances_see_the_same_stack(self):
+        other = ms.ModelStore(self.root)
+        self._three_approved()
+        self.store.rollback(PART, "Lan", "v3 bad", NOW3)
+        self.assertEqual(other.history(PART), ["v1", "v2"])
+        other.rollback(PART, "Lan", "v2 bad", NOW3)
+        self.assertEqual(self.store.history(PART), ["v1"])
+        self.assertEqual(self.store.current(PART).version, "v1")
+
+
 class LoaderTests(_StoreCase):
     def test_registered_loader_is_used(self):
         self._candidate("v1", type="fake")

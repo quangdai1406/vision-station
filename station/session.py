@@ -56,6 +56,16 @@ Presses (decided here):
     after a BOTTOM fault does not wait again.
   - preview(camera_id) is a read-only passthrough to the cameras for the live view.
 
+Part selection (decided here):
+  - The part number and model may be chosen at run time with set_part() (IDLE
+    only). They apply to the NEXT part. A session may start with no part ('' and
+    model None): it cannot inspect until a part is chosen.
+  - set_blocked(reason) stops inspection with a shown reason (e.g. the part has
+    no approved model). set_blocked(None) clears it. set_part clears it.
+  - clear_part() returns to 'no part' and also clears any block reason.
+  - A press while IDLE and not can_inspect is ignored (press_ignored,
+    reason 'no_part_or_model') with no capture.
+
 Snapshot: see StationSession.snapshot for the exact shape the UI reads.
 """
 from __future__ import annotations
@@ -123,6 +133,10 @@ def _enum_value(x: Any) -> Optional[str]:
     return None if x is None else x.value
 
 
+def _version_of(model) -> str:
+    return "" if model is None else str(getattr(model, "version", "") or "")
+
+
 def _validate_camera_ids(camera_ids: Sequence[str]) -> tuple[str, ...]:
     ids = tuple(camera_ids)
     unknown = [c for c in ids if c not in CAMERA_IDS]
@@ -168,11 +182,12 @@ class StationSession:
         self._expected_images = images_for(self._camera_ids)
         self._cameras = cameras
         self._model = model
+        self._model_version = _version_of(model)
         self._outputs = outputs
         self._store = store
         self._thresholds = thresholds
         self._station_id = station_id
-        self._part_number = part_number
+        self._part_number = part_number or ""
         self._lot = lot
         self._operator = operator
         self._supervisor = supervisor
@@ -202,11 +217,17 @@ class StationSession:
         self._top_done_at: Optional[float] = None  # when the TOP capture and inference finished
         self._fault: Optional[str] = None
         self._fault_return: Optional[State] = None
+        self._block_reason: str = ""
         self._clear_part()
 
     # ------------------------------------------------------------------ public
 
     def press(self) -> bool:
+        if self.state is State.IDLE and not self.can_inspect:
+            self._log("press_ignored", {"reason": "no_part_or_model", "state": self.state.value,
+                                        "block_reason": self._block_reason},
+                      session_id=self._active_session_id())
+            return False
         now = self._clock()
         if not self._debounce_ok(now):
             self._log("press_ignored", {"reason": "debounce", "state": self.state.value},
@@ -314,6 +335,59 @@ class StationSession:
             self._top_done_at = -math.inf  # the part is already flipped: no minimum flip gap again
         self.state = back
 
+    def set_part(self, part_number: str, model, model_version: str) -> None:
+        """Choose the part and its approved model for the NEXT part. IDLE only.
+
+        Clears any block reason. Raises ValueError for an empty part number or a
+        missing model.
+        """
+        if self.state is not State.IDLE:
+            raise InvalidTransition(f"set_part is not allowed in {self.state.value}")
+        number = str(part_number or "").strip()
+        if not number:
+            raise ValueError("part_number is required")
+        if model is None:
+            raise ValueError("model is required")
+        version = str(model_version or "")
+        self._part_number = number
+        self._model = model
+        self._model_version = version
+        self._block_reason = ""
+        self._log("part_selected", {"part_number": number, "model_version": version}, session_id=None)
+
+    def clear_part(self) -> None:
+        """Forget the chosen part and model (and any block reason). IDLE only."""
+        if self.state is not State.IDLE:
+            raise InvalidTransition(f"clear_part is not allowed in {self.state.value}")
+        self._part_number = ""
+        self._model = None
+        self._model_version = ""
+        self._block_reason = ""
+        self._log("part_cleared", {}, session_id=None)
+
+    def set_blocked(self, reason: Optional[str]) -> None:
+        """Block inspection with a reason shown to the operator; None or blank clears it. IDLE only."""
+        if self.state is not State.IDLE:
+            raise InvalidTransition(f"set_blocked is not allowed in {self.state.value}")
+        self._block_reason = "" if reason is None else str(reason).strip()
+
+    @property
+    def part_number(self) -> str:
+        return self._part_number
+
+    @property
+    def model_version(self) -> str:
+        return self._model_version
+
+    @property
+    def can_inspect(self) -> bool:
+        """True when a part number and model are chosen and nothing blocks inspection."""
+        return bool(self._part_number) and self._model is not None and not self._block_reason
+
+    @property
+    def block_reason(self) -> str:
+        return self._block_reason
+
     def snapshot(self, include_images: bool = False) -> dict[str, Any]:
         """State for the UI.
 
@@ -328,6 +402,8 @@ class StationSession:
         Also prompt (str: the instruction for the current state, '' when none),
         press_ready (bool: a press would be accepted now) and flip_wait_s (float:
         seconds before a BOTTOM press is accepted, rounded to 0.1, 0.0 otherwise).
+        Also part_number (str), part_selected (bool), model_version (str),
+        can_inspect (bool) and block_reason (str).
         """
         now = self._clock()
         wait = self._flip_wait(now)
@@ -362,6 +438,11 @@ class StationSession:
             "prompt": self._prompt(wait),
             "press_ready": self._press_ready(now),
             "flip_wait_s": round(wait, 1),
+            "part_number": self._part_number,
+            "part_selected": bool(self._part_number),
+            "model_version": self._model_version,
+            "can_inspect": self.can_inspect,
+            "block_reason": self._block_reason,
         }
 
     @property
@@ -397,6 +478,8 @@ class StationSession:
         return max(0.0, self._min_flip_s - (now - self._top_done_at))
 
     def _press_ready(self, now: float) -> bool:
+        if self.state is State.IDLE and not self.can_inspect:
+            return False
         return (self.state in (State.IDLE, State.WAIT_FLIP)
                 and self._debounce_ok(now)
                 and self._flip_wait(now) <= 0)
@@ -404,6 +487,12 @@ class StationSession:
     def _prompt(self, wait: float) -> str:
         st = self.state
         if st is State.IDLE:
+            if not self.can_inspect:
+                if not self._part_number:
+                    return "Choose a part number to start."
+                if self._block_reason:
+                    return self._block_reason
+                return "No approved model for this part."
             return "Step 1: place the part TOP side up, then press Enter."
         if st is State.WAIT_FLIP:
             if wait > 0:
@@ -581,7 +670,7 @@ class StationSession:
             supervisor=self._supervisor,
             material_handler=self._material_handler,
             started_utc=self._started_utc,
-            model_version=self._model.version,
+            model_version=self._model_version,
             thresholds=self._thresholds,
             frames=self._all_frames(),
             results=self._all_results(),

@@ -332,7 +332,8 @@ class ModelStore:
         return self._activate(part_number, version, by_text, reason_text, now_utc, "approve")
 
     def rollback(self, part_number: str, by: str, reason: str, now_utc: str) -> ModelInfo:
-        """Re-approve the most recent earlier approved version that still verifies.
+        """Re-approve the nearest version below the current one on the activation stack that
+        still verifies. Versions rolled back from are off the stack, so they never come back.
 
         Raises ModelError when nothing is approved now or no earlier version can be used.
         """
@@ -343,12 +344,11 @@ class ModelStore:
         if current_data is None:
             raise ModelError(f"no approved model for part {part_number}: nothing to roll back from")
         current_version = current_data["version"]
-        candidates: list[str] = []
-        for entry in reversed(self.approvals(part_number)):
-            version = entry.get("version")
-            if entry.get("action") in ("approve", "rollback") and isinstance(version, str):
-                if version != current_version and version not in candidates:
-                    candidates.append(version)
+        stack = self._stack(part_number)
+        # Nearest first.
+        candidates: list[str] = (
+            list(reversed(stack[: stack.index(current_version)])) if current_version in stack else []
+        )
         for version in candidates:
             if not self.verify(part_number, version):
                 return self._activate(part_number, version, by_text, reason_text, now_utc, "rollback")
@@ -399,7 +399,39 @@ class ModelStore:
             out.append(entry)
         return out
 
+    def history(self, part_number: str) -> list[str]:
+        """The activation stack for a part, oldest first and the current version last.
+
+        Built by replaying the approval log; 'failed' lines cancel the attempt they name.
+        """
+        return self._stack(part_number)
+
     # -- internals ----------------------------------------------------------
+
+    def _stack(self, part_number: str) -> list[str]:
+        stack = _replay(self.approvals(part_number))
+        current = self._read_current_raw(part_number)
+        # The log is written before current.json, so after a crash it can lead by one
+        # unfinished line. current.json is the truth for what is active.
+        if current is not None and current["version"] in stack:
+            stack = stack[: stack.index(current["version"]) + 1]
+        return stack
+
+    def _log_failed_switch(self, part_number: str, version: str, action: str, now: str,
+                           exc: BaseException) -> None:
+        entry = {
+            "action": "failed",
+            "part_number": part_number,
+            "version": version,
+            "intended": action,
+            "error": str(exc)[:300],
+            "utc": now,
+        }
+        try:
+            _append_line(self._part_dir(part_number) / APPROVALS_NAME,
+                         json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n")
+        except ModelError:
+            pass  # best effort: the stack is still anchored to current.json
 
     def _read_current_raw(self, part_number: str) -> Optional[dict]:
         path = self._part_dir(part_number) / CURRENT_NAME
@@ -435,21 +467,10 @@ class ModelStore:
             )
         previous = self._read_current_raw(part_number)
         previous_version = previous["version"] if previous else None
-        if previous_version is not None and previous_version != version:
-            self._set_status(part_number, previous_version, "retired")
         manifest = _load_manifest(vdir)
         if manifest is None:  # verify() passed, so this is a race with an outside edit
             raise ModelError(f"manifest for version {version} changed while approving")
-        manifest["status"] = "approved"
-        _write_text_atomic(vdir / MANIFEST_NAME, _json_text(manifest))
-        current = {
-            "part_number": part_number,
-            "version": version,
-            "approved_by": by,
-            "approved_utc": now,
-            "reason": reason,
-        }
-        _write_text_atomic(self._part_dir(part_number) / CURRENT_NAME, _json_text(current))
+        old_status = manifest.get("status")
         entry = {
             "action": action,
             "part_number": part_number,
@@ -459,9 +480,79 @@ class ModelStore:
             "utc": now,
             "previous_version": previous_version,
         }
+        # 1. The intended action goes to the log first, so the log never lags current.json.
         _append_line(self._part_dir(part_number) / APPROVALS_NAME,
                      json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n")
+        # 2. Then switch current.json. If the switch fails, a 'failed' line cancels the intent.
+        manifest_changed = False
+        try:
+            manifest["status"] = "approved"
+            _write_text_atomic(vdir / MANIFEST_NAME, _json_text(manifest))
+            manifest_changed = True
+            current = {
+                "part_number": part_number,
+                "version": version,
+                "approved_by": by,
+                "approved_utc": now,
+                "reason": reason,
+            }
+            _write_text_atomic(self._part_dir(part_number) / CURRENT_NAME, _json_text(current))
+        except Exception as exc:
+            if manifest_changed:
+                manifest["status"] = old_status
+                try:
+                    _write_text_atomic(vdir / MANIFEST_NAME, _json_text(manifest))
+                except Exception:
+                    pass  # best effort; the status is not what decides what is active
+            self._log_failed_switch(part_number, version, action, now, exc)
+            raise ModelError(
+                f"could not switch the approved model for part {part_number} to version {version}: {exc}"
+            ) from exc
+        # 3. Retire the old version. Cosmetic: current.json already names the new one.
+        if previous_version is not None and previous_version != version:
+            try:
+                self._set_status(part_number, previous_version, "retired")
+            except (ModelError, OSError):
+                pass
         return _info(part_number, version, vdir, manifest, by, now, reason)
+
+
+_ACTIVATIONS = ("approve", "rollback")
+
+
+def _replay(entries: list[dict]) -> list[str]:
+    """The activation stack (oldest first, current last) from the raw approval log.
+
+    approve: the version moves to the top of the stack.
+    rollback: the version rolled back from is dropped and the stack is cut down to the version
+    rolled back to, so everything above it goes.
+    failed: cancels the nearest earlier unresolved approve/rollback for the same version.
+    """
+    cancelled: set[int] = set()
+    open_intents: list[int] = []
+    for idx, entry in enumerate(entries):
+        action = entry.get("action")
+        if action in _ACTIVATIONS:
+            open_intents.append(idx)
+        elif action == "failed":
+            for pos in range(len(open_intents) - 1, -1, -1):
+                if entries[open_intents[pos]].get("version") == entry.get("version"):
+                    cancelled.add(open_intents.pop(pos))
+                    break
+    stack: list[str] = []
+    for idx, entry in enumerate(entries):
+        version = entry.get("version")
+        if idx in cancelled or entry.get("action") not in _ACTIVATIONS or not isinstance(version, str):
+            continue
+        if version in stack:
+            if entry["action"] == "approve":
+                stack.remove(version)
+                stack.append(version)
+            else:
+                stack = stack[: stack.index(version) + 1]
+        else:
+            stack.append(version)
+    return stack
 
 
 def _info(part_number: str, version: str, vdir: Path, manifest: dict,
