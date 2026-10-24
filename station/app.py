@@ -24,7 +24,16 @@ from typing import Any, Callable, Mapping, Optional
 
 from station.auth import SessionManager, UserStore, load_users
 from station.cameras import FakeCameraSet, OpenCvCameraSet, make_blur_check, utc_now_iso
-from station.contracts import Frame, PartRecord, StationError, Thresholds
+from station.contracts import (
+    CAMERA_IDS,
+    Frame,
+    PartRecord,
+    StationError,
+    Thresholds,
+    camera_ids_for,
+    images_for,
+    is_full_station,
+)
 from station.inference import MarkerModel
 from station.mes_client import MesClient, MesConfig, build_request
 from station.outbox import Outbox
@@ -110,6 +119,12 @@ def _int(value: Any, path: str, *, lo: int, hi: int) -> int:
     return value
 
 
+def _bool(value: Any, path: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{path} must be true or false")
+    return value
+
+
 def _find_placeholders(value: Any, path: str = "", found: Optional[list] = None) -> list[str]:
     if found is None:
         found = []
@@ -128,7 +143,8 @@ def _validate_mes(raw: Any) -> dict:
     path = "mes"
     mes = _obj(raw, path)
     _check_keys(mes, ("base_url", "token_env", "criteria_ids", "class_to_criterion",
-                      "default_criterion_id", "sync_interval_s", "default_bad_disposition"),
+                      "default_criterion_id", "sync_interval_s", "default_bad_disposition",
+                      "allow_partial_cameras"),
                 path, required=("base_url", "token_env", "criteria_ids", "class_to_criterion"))
     base_url = _str(mes, "base_url", path)
     if not base_url.startswith(("http://", "https://")):
@@ -167,36 +183,56 @@ def _validate_mes(raw: Any) -> dict:
         "sync_interval_s": _number(mes.get("sync_interval_s", DEFAULT_SYNC_INTERVAL_S),
                                    "mes.sync_interval_s", positive=True),
         "default_bad_disposition": disposition,
+        "allow_partial_cameras": _bool(mes.get("allow_partial_cameras", False),
+                                       "mes.allow_partial_cameras"),
     }
 
 
 def _validate_cameras(raw: Any) -> dict:
     path = "cameras"
     cams = _obj(raw, path)
-    _check_keys(cams, ("kind", "devices", "width", "height", "manual"), path, required=("kind",))
+    _check_keys(cams, ("kind", "devices", "camera_count", "camera_ids", "width", "height", "manual"),
+                path, required=("kind",))
     kind = cams["kind"]
     if kind not in ("fake", "opencv"):
         raise ConfigError("cameras.kind must be 'fake' or 'opencv'")
     devices = cams.get("devices")
     if kind == "opencv":
-        if not isinstance(devices, list) or len(devices) != 4:
-            raise ConfigError("cameras.devices must be a list of 4 device indexes (C1..C4)")
+        if not isinstance(devices, list) or not 1 <= len(devices) <= len(CAMERA_IDS):
+            raise ConfigError("cameras.devices must be a list of 1 to 4 device indexes (C1..C4)")
         devices = [_int(d, "cameras.devices[]", lo=0, hi=255) for d in devices]
-    elif devices is not None:
-        devices = [_int(d, "cameras.devices[]", lo=0, hi=255) for d in devices]
+        if len(set(devices)) != len(devices):
+            raise ConfigError("cameras.devices must not contain duplicate device indexes")
+        if "camera_count" in cams:
+            raise ConfigError("cameras.camera_count is only for kind 'fake'; "
+                              "with 'opencv' the number of devices sets the count")
+        count = len(devices)
+    else:
+        if devices is not None:
+            devices = [_int(d, "cameras.devices[]", lo=0, hi=255) for d in devices]
+        count = _int(cams.get("camera_count", len(CAMERA_IDS)), "cameras.camera_count",
+                     lo=1, hi=len(CAMERA_IDS))
+    camera_ids = list(camera_ids_for(count))
+    if "camera_ids" in cams and cams["camera_ids"] != camera_ids:
+        raise ConfigError("cameras.camera_ids is derived from the devices (or camera_count); "
+                          "remove it from the config")
     manual_raw = _obj(cams.get("manual", {}), "cameras.manual")
     _check_keys(manual_raw, ("focus", "exposure", "white_balance"), "cameras.manual")
     manual = {
         key: None if value is None else _number(value, f"cameras.manual.{key}")
         for key, value in manual_raw.items()
     }
-    return {
+    out = {
         "kind": kind,
         "devices": devices,
+        "camera_ids": camera_ids,
         "width": _int(cams.get("width", DEFAULT_CAMERA_WIDTH), "cameras.width", lo=1, hi=100000),
         "height": _int(cams.get("height", DEFAULT_CAMERA_HEIGHT), "cameras.height", lo=1, hi=100000),
         "manual": manual,
     }
+    if kind == "fake":
+        out["camera_count"] = count  # kept so a validated config validates again to the same value
+    return out
 
 
 def _validate_model(raw: Any) -> dict:
@@ -204,11 +240,11 @@ def _validate_model(raw: Any) -> dict:
     model = _obj(raw, path)
     _check_keys(model, ("kind", "path", "version"), path, required=("kind", "version"))
     kind = model["kind"]
-    if kind not in ("marker", "onnx"):
-        raise ConfigError("model.kind must be 'marker' or 'onnx'")
+    if kind not in ("marker", "onnx", "golden"):
+        raise ConfigError("model.kind must be 'marker', 'onnx' or 'golden'")
     model_path = model.get("path")
-    if kind == "onnx" and (not isinstance(model_path, str) or not model_path):
-        raise ConfigError("model.path is required when model.kind is 'onnx'")
+    if kind in ("onnx", "golden") and (not isinstance(model_path, str) or not model_path):
+        raise ConfigError(f"model.path is required when model.kind is '{kind}'")
     if model_path is not None and not isinstance(model_path, str):
         raise ConfigError("model.path must be a string")
     return {"kind": kind, "path": model_path, "version": _str(model, "version", path)}
@@ -419,6 +455,18 @@ def _grey_decoder() -> Callable[[Frame], list]:
     return decode
 
 
+def _load_golden_model(model: dict) -> Any:
+    """Load a golden .npz made by `python -m station teach`. station.golden is imported here, lazily."""
+    from station.golden import GoldenModel, cv2_decoder  # noqa: PLC0415 - needs numpy and cv2 at run time
+
+    path = model["path"]
+    if not os.path.isfile(path):
+        raise StationError(f"golden model file not found: {path}; run python -m station teach first")
+    golden = GoldenModel.load(path, cv2_decoder())
+    golden.version = model["version"]  # stored records show the config version, not the file's
+    return golden
+
+
 class StationApp:
     """A fully wired station. Build with build_station(); call start() to run it."""
 
@@ -452,7 +500,11 @@ class StationApp:
         model = model if model is not None else self._make_model(cfg)
         outputs = outputs if outputs is not None else self._make_outputs(cfg)
 
-        self.store = Store(pathlib.Path(cfg["data_dir"]), site=cfg["site"], line=cfg["line"])
+        # A partial station (fewer than the 4 cameras) is proof-of-concept only: it is the
+        # only kind of station allowed to store fewer than 8 images.
+        self.partial = not is_full_station(cfg["cameras"]["camera_ids"])
+        self.store = Store(pathlib.Path(cfg["data_dir"]), site=cfg["site"], line=cfg["line"],
+                           allow_partial=self.partial)
         self._outbox_root = pathlib.Path(cfg["data_dir"]) / "outbox"
         self.outbox = Outbox(self._outbox_root)
         try:
@@ -467,7 +519,7 @@ class StationApp:
     def _make_cameras(cfg: dict):
         cams = cfg["cameras"]
         if cams["kind"] == "fake":
-            return FakeCameraSet()
+            return FakeCameraSet(camera_ids=cams["camera_ids"])
         return OpenCvCameraSet(
             cams["devices"], width=cams["width"], height=cams["height"],
             manual_settings={k: v for k, v in cams["manual"].items() if v is not None},
@@ -478,6 +530,8 @@ class StationApp:
         model = cfg["model"]
         if model["kind"] == "marker":
             return MarkerModel(version=model["version"])
+        if model["kind"] == "golden":
+            return _load_golden_model(model)
         raise StationError(
             "model.kind 'onnx' is not wired yet: the ONNX pre- and postprocessing are not written "
             "(see README, 'Not done'). Use model.kind 'marker' with --demo, or inject a model."
@@ -494,12 +548,16 @@ class StationApp:
         self.session_thresholds = Thresholds(t_low=cfg["thresholds"]["t_low"],
                                              t_img=cfg["thresholds"]["t_img"])
 
-        # MES: a missing token disables posting, not inspection.
+        # MES: a missing token disables posting, not inspection. A partial station never
+        # posts unless mes.allow_partial_cameras is true.
         mes = cfg["mes"]
         self._demo = demo
+        camera_ids = tuple(cfg["cameras"]["camera_ids"])
+        allow_partial = mes["allow_partial_cameras"]
+        self._partial_blocked = self.partial and not allow_partial
         if token is None:
             token = os.environ.get(mes["token_env"], "")
-        self.mes_enabled = bool(token) and not demo
+        self.mes_enabled = bool(token) and not demo and not self._partial_blocked
         self._mes_cfg = MesConfig(
             base_url=mes["base_url"],
             token=token or "",
@@ -511,9 +569,21 @@ class StationApp:
         self._client = MesClient(self._mes_cfg) if self.mes_enabled else None
         if demo:
             self.store.append_event("mes_disabled", {"reason": "demo mode: parts are not sent to MES"})
-        elif not token:
-            self.store.append_event("mes_disabled", {
-                "reason": f"no token: the environment variable {mes['token_env']} is not set",
+        else:
+            if self._partial_blocked:
+                self.store.append_event("mes_disabled", {
+                    "reason": f"partial station ({len(camera_ids)} camera(s)): "
+                              "parts are not sent to the MES",
+                })
+            if not token:
+                self.store.append_event("mes_disabled", {
+                    "reason": f"no token: the environment variable {mes['token_env']} is not set",
+                })
+        if self.partial and allow_partial:
+            self.store.append_event("mes_partial_allowed", {
+                "camera_ids": list(camera_ids),
+                "images_per_part": images_for(camera_ids),
+                "reason": "mes.allow_partial_cameras is true: parts with fewer than 8 images are sent to the MES",
             })
 
         frame_ok = None
@@ -535,6 +605,7 @@ class StationApp:
             part_id_factory=_PartIdFactory(self.store, self._now_utc),
             on_complete=self._enqueue,
             initial_counters=self.store.counters(),
+            camera_ids=camera_ids,
         )
 
         try:
@@ -564,6 +635,8 @@ class StationApp:
         """on_complete hook: queue the saved part for MES. Never raises."""
         if self._demo:
             return  # demo parts must never reach the outbox, which a later real run would send
+        if self._partial_blocked:
+            return  # a partial station posts only when mes.allow_partial_cameras is true
         try:
             part_dir = self.store._known_path(record.session_id)
             if part_dir is None:

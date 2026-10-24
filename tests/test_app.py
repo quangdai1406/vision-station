@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 import urllib.request
+from unittest import mock
 
 from station import users_cli
 from station.app import (
@@ -25,10 +26,16 @@ from station.app import (
 )
 from station.auth import UserStore, hash_password, load_users
 from station.cameras import FakeCameraSet
-from station.contracts import Frame, Side, State
+from station.contracts import Frame, Side, StationError, State, is_full_station
 from station.inference import MarkerModel
 from station.outputs import RecordingOutputs
 from station.storage import Store
+
+try:
+    import numpy  # noqa: F401 - only for the golden model tests
+    HAVE_NUMPY = True
+except ImportError:
+    HAVE_NUMPY = False
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 TOKEN_ENV = "VISION_TEST_APP_TOKEN"
@@ -156,7 +163,7 @@ class ConfigTests(TmpCase):
 
     def test_camera_and_model_rules(self) -> None:
         data = base_config(self.tmp)
-        data["cameras"] = {"kind": "opencv", "devices": [0, 1, 2]}
+        data["cameras"] = {"kind": "opencv", "devices": [0, 1, 2, 3, 4]}
         with self.assertRaisesRegex(ConfigError, "4 device"):
             validate_config(data)
         data = base_config(self.tmp)
@@ -389,6 +396,225 @@ class BuildTests(TmpCase):
             return [r[0] for r in conn.execute("SELECT kind FROM events ORDER BY id").fetchall()]
         finally:
             conn.close()
+
+
+class CameraConfigTests(TmpCase):
+    def test_one_opencv_device_is_a_partial_station(self) -> None:
+        data = base_config(self.tmp)
+        data["cameras"] = {"kind": "opencv", "devices": [0]}
+        cfg = validate_config(data)
+        self.assertEqual(cfg["cameras"]["camera_ids"], ["C1"])
+        self.assertFalse(is_full_station(cfg["cameras"]["camera_ids"]))
+
+    def test_four_opencv_devices_are_the_full_station(self) -> None:
+        data = base_config(self.tmp)
+        data["cameras"] = {"kind": "opencv", "devices": [0, 1, 2, 3]}
+        cfg = validate_config(data)
+        self.assertEqual(cfg["cameras"]["camera_ids"], ["C1", "C2", "C3", "C4"])
+        self.assertTrue(is_full_station(cfg["cameras"]["camera_ids"]))
+
+    def test_zero_or_five_devices_are_rejected(self) -> None:
+        for devices in ([], [0, 1, 2, 3, 4]):
+            data = base_config(self.tmp)
+            data["cameras"] = {"kind": "opencv", "devices": devices}
+            with self.assertRaisesRegex(ConfigError, "1 to 4 device"):
+                validate_config(data)
+
+    def test_duplicate_device_indexes_are_rejected(self) -> None:
+        data = base_config(self.tmp)
+        data["cameras"] = {"kind": "opencv", "devices": [0, 0]}
+        with self.assertRaisesRegex(ConfigError, "duplicate"):
+            validate_config(data)
+
+    def test_fake_camera_count_selects_the_camera_ids(self) -> None:
+        for count, ids in ((1, ["C1"]), (2, ["C1", "C2"]), (4, ["C1", "C2", "C3", "C4"])):
+            data = base_config(self.tmp)
+            data["cameras"] = {"kind": "fake", "camera_count": count}
+            self.assertEqual(validate_config(data)["cameras"]["camera_ids"], ids)
+        data = base_config(self.tmp)  # default is the full 4-camera station
+        self.assertEqual(validate_config(data)["cameras"]["camera_ids"], ["C1", "C2", "C3", "C4"])
+
+    def test_fake_camera_count_out_of_range_and_opencv_count_are_rejected(self) -> None:
+        for count in (0, 5):
+            data = base_config(self.tmp)
+            data["cameras"] = {"kind": "fake", "camera_count": count}
+            with self.assertRaisesRegex(ConfigError, "camera_count"):
+                validate_config(data)
+        data = base_config(self.tmp)
+        data["cameras"] = {"kind": "opencv", "devices": [0], "camera_count": 1}
+        with self.assertRaisesRegex(ConfigError, "only for kind 'fake'"):
+            validate_config(data)
+
+    def test_camera_ids_in_config_must_match_the_devices(self) -> None:
+        data = base_config(self.tmp)
+        data["cameras"] = {"kind": "opencv", "devices": [0], "camera_ids": ["C2"]}
+        with self.assertRaisesRegex(ConfigError, "derived"):
+            validate_config(data)
+
+    def test_validated_config_validates_again_to_the_same_value(self) -> None:
+        data = base_config(self.tmp)  # StationApp validates an already validated config
+        data["cameras"] = {"kind": "fake", "camera_count": 1}
+        data["mes"]["allow_partial_cameras"] = True
+        once = validate_config(data)
+        self.assertEqual(validate_config(once), once)
+
+    def test_allow_partial_cameras_must_be_a_boolean(self) -> None:
+        data = base_config(self.tmp)
+        self.assertFalse(validate_config(data)["mes"]["allow_partial_cameras"])
+        data["mes"]["allow_partial_cameras"] = "yes"
+        with self.assertRaisesRegex(ConfigError, "allow_partial_cameras"):
+            validate_config(data)
+
+
+class PartialStationTests(TmpCase):
+    def setUp(self) -> None:
+        super().setUp()
+        with open(os.path.join(self.tmp, "users.json"), "w", encoding="utf-8") as fh:
+            json.dump({"op1": {"password_hash": hash_password("operator-pass-1"), "role": "operator"}}, fh)
+
+    def _one_camera_config(self, allow: bool = False) -> dict:
+        cfg = base_config(self.tmp)
+        cfg["cameras"] = {"kind": "fake", "camera_count": 1}
+        cfg["mes"]["allow_partial_cameras"] = allow
+        return cfg
+
+    def test_one_camera_part_is_stored_with_two_images_and_never_queued(self) -> None:
+        os.environ[TOKEN_ENV] = "not-a-real-token-for-tests"  # a token is present, MES still off
+        clock = FakeClock()
+        app = build_station(self._one_camera_config(), model=MarkerModel("test-1"),
+                            outputs=RecordingOutputs(), clock=clock)
+        self.addCleanup(app.stop)
+        self.assertTrue(app.partial)
+        self.assertFalse(app.mes_enabled)
+        self.assertEqual(app.session.snapshot()["camera_ids"], ["C1"])
+
+        self.assertTrue(app.session.press())  # TOP
+        clock.now += 1.0
+        self.assertTrue(app.session.press())  # BOTTOM: fuse and save
+        self.assertEqual(app.session.counters["total"], 1)
+
+        part = app.store.recent_parts(1)[0]
+        with open(os.path.join(part["path"], "part.json"), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        self.assertTrue(doc["partial_station"])
+        self.assertEqual(doc["camera_count"], 1)
+        self.assertEqual(len(doc["images"]), 2)
+        self.assertEqual(app.outbox.pending_count(), 0)
+
+        reasons = [json.loads(r["payload_json"])["reason"]
+                   for r in BuildTests._events(app.store, "mes_disabled")]
+        self.assertIn("partial station (1 camera(s)): parts are not sent to the MES", reasons)
+
+    def test_partial_station_with_the_flag_queues_the_part(self) -> None:
+        os.environ[TOKEN_ENV] = "not-a-real-token-for-tests"
+        clock = FakeClock()
+        app = build_station(self._one_camera_config(allow=True), model=MarkerModel("test-1"),
+                            outputs=RecordingOutputs(), clock=clock)
+        self.addCleanup(app.stop)
+        self.assertTrue(app.mes_enabled)
+        self.assertIn("mes_partial_allowed", BuildTests._event_kinds(app.store))
+        self.assertNotIn("mes_disabled", BuildTests._event_kinds(app.store))
+
+        app.session.press()
+        clock.now += 1.0
+        app.session.press()
+        self.assertEqual(app.session.counters["total"], 1)
+        self.assertEqual(app.outbox.pending_count(), 1)
+
+    def test_partial_station_does_not_post_without_a_token_either_way(self) -> None:
+        clock = FakeClock()
+        app = build_station(self._one_camera_config(), model=MarkerModel("test-1"),
+                            outputs=RecordingOutputs(), clock=clock)
+        self.addCleanup(app.stop)
+        self.assertFalse(app.mes_enabled)
+        kinds = BuildTests._event_kinds(app.store)
+        self.assertEqual(kinds.count("mes_disabled"), 2)  # partial reason and no-token reason
+
+    def test_full_station_is_not_partial(self) -> None:
+        os.environ[TOKEN_ENV] = "not-a-real-token-for-tests"
+        app = build_station(base_config(self.tmp), cameras=FakeCameraSet(),
+                            model=MarkerModel("test-1"), outputs=RecordingOutputs(),
+                            clock=FakeClock())
+        self.addCleanup(app.stop)
+        self.assertFalse(app.partial)
+        self.assertTrue(app.mes_enabled)
+        self.assertNotIn("mes_partial_allowed", BuildTests._event_kinds(app.store))
+
+
+class GoldenModelConfigTests(TmpCase):
+    def test_golden_kind_needs_a_path(self) -> None:
+        data = base_config(self.tmp)
+        data["model"] = {"kind": "golden", "version": "golden-poc-1"}
+        with self.assertRaisesRegex(ConfigError, "model.path is required when model.kind is 'golden'"):
+            validate_config(data)
+
+    def test_missing_golden_file_gives_a_clear_error(self) -> None:
+        cfg = base_config(self.tmp)
+        cfg["model"] = {"kind": "golden", "path": os.path.join(self.tmp, "golden.npz"),
+                        "version": "golden-poc-1"}
+        with self.assertRaisesRegex(StationError, "golden model file not found.*run python -m station teach first"):
+            build_station(cfg, cameras=FakeCameraSet(), outputs=RecordingOutputs())
+
+    @unittest.skipUnless(HAVE_NUMPY, "numpy is needed to build a golden model")
+    def test_saved_golden_model_loads_and_predicts(self) -> None:
+        import numpy as np
+
+        from station.app import StationApp
+        from station.golden import GoldenBuilder
+
+        def decode(frame: Frame):  # the bytes are one grey value: a flat 8x8 image
+            return np.full((8, 8), float(frame.data[0]))
+
+        builder = GoldenBuilder(decode)
+        for side in (Side.TOP, Side.BOTTOM):
+            for value in (100, 102, 98):
+                builder.add(Frame(camera_id="C1", side=side, seq=0,
+                                  timestamp_utc="2026-10-23T08:30:12Z", data=bytes([value])))
+        path = os.path.join(self.tmp, "golden.npz")
+        builder.build("file-version").save(path)
+
+        cfg = base_config(self.tmp)
+        cfg["cameras"] = {"kind": "fake", "camera_count": 1}
+        cfg["model"] = {"kind": "golden", "path": path, "version": "golden-poc-1"}
+        with mock.patch("station.golden.cv2_decoder", return_value=decode):
+            model = StationApp._make_model(validate_config(cfg))
+
+        self.assertEqual(model.version, "golden-poc-1")  # the config version, not the file's
+        ts = "2026-10-23T08:30:12Z"
+        good = model.predict(Frame("C1", Side.TOP, 0, ts, bytes([100])))
+        bad = model.predict(Frame("C1", Side.TOP, 0, ts, bytes([200])))
+        self.assertEqual(good.score, 0.0)
+        self.assertGreater(bad.score, 0.5)
+
+
+class PocConfigTests(TmpCase):
+    def test_poc_example_fails_only_on_placeholders_and_loads_once_filled(self) -> None:
+        text = (REPO / "config.poc.example.json").read_text(encoding="utf-8")
+        example = json.loads(text)
+        with self.assertRaisesRegex(ConfigError, "placeholders"):
+            validate_config(example)
+
+        filled = copy.deepcopy(example)
+        filled.update({
+            "site": "SITE1", "line": "L1", "station_id": "VIS-POC-1", "part_number": "PN-100",
+            "lot": "LOT-1", "operator": "op1", "supervisor": "sup1", "material_handler": "mh1",
+        })
+        filled["thresholds"] = {"t_low": 0.5, "t_img": 0.8}
+        filled["mes"].update({
+            "base_url": "http://127.0.0.1:3000",
+            "token_env": "STATION_MES_TOKEN",
+            "criteria_ids": ["CR-1"],
+            "class_to_criterion": {"scratch": "CR-1"},
+        })
+        self.assertNotRegex(json.dumps(filled), r'"\[', "a bracketed placeholder is left")
+
+        cfg = load_config(self.write_config(filled, "poc.json"))
+        self.assertEqual(cfg["cameras"]["camera_ids"], ["C1"])
+        self.assertFalse(is_full_station(cfg["cameras"]["camera_ids"]))  # partial
+        self.assertFalse(cfg["mes"]["allow_partial_cameras"])
+        self.assertEqual(cfg["model"]["kind"], "golden")
+        self.assertTrue(cfg["model"]["path"].endswith("golden.npz"))
+        self.assertEqual(cfg["ui"]["port"], 8000)
 
 
 class UsersCliTests(TmpCase):

@@ -2,6 +2,7 @@
 
     python -m station --config config.json [--demo]
     python -m station users add <username> <role> [--config config.json | --users-file FILE]
+    python -m station teach --config config.json [--frames-per-side N] [--parts K] [--out PATH] [--force]
 """
 from __future__ import annotations
 
@@ -13,9 +14,11 @@ from typing import Optional, Sequence
 from station.app import ConfigError, StationApp, build_station, load_config
 
 EPILOG = (
-    "other command:\n"
+    "other commands:\n"
     "  python -m station users add <username> <role> [--config FILE | --users-file FILE]\n"
     "      create a login (roles: operator, supervisor, admin); the password is prompted for\n"
+    "  python -m station teach --config FILE [--frames-per-side N] [--parts K] [--out PATH] [--force]\n"
+    "      learn the golden model from GOOD parts on the real cameras (demo heuristic)\n"
 )
 
 
@@ -80,6 +83,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from station.users_cli import main as users_main
 
         return users_main(args[1:])
+    if args and args[0] == "teach":
+        from station.teach import teach_main
+
+        return teach_main(args[1:])
     return _run(args)
 
 
