@@ -28,6 +28,10 @@ AUTO_WB_OFF = 0
 # JPEG-encoded at this quality.
 PREVIEW_WIDTH = 640
 PREVIEW_JPEG_QUALITY = 70
+# After a failed open, preview() waits this long before it tries to open the
+# devices again (engineering choice: keeps the live view from re-opening a
+# missing camera on every poll).
+PREVIEW_REOPEN_COOLDOWN_S = 5.0
 
 _MANUAL_KEYS = ("focus", "exposure", "white_balance")
 
@@ -71,6 +75,15 @@ class FakeCameraSet:
     @property
     def camera_ids(self) -> tuple[str, ...]:
         return self._camera_ids
+
+    @property
+    def is_open(self) -> bool:
+        """Always True: the fake cameras need no device."""
+        return True
+
+    @property
+    def last_open_error(self) -> Optional[str]:
+        return None
 
     def capture(self, side: Side) -> Sequence[Frame]:
         side = Side(side)
@@ -118,9 +131,14 @@ class OpenCvCameraSet:
 
     device_indexes map in order to camera_ids_for(len(device_indexes)): one
     device is C1, two are C1 and C2, and so on up to C4. Devices are opened on
-    the first capture() (or by an explicit open()). Each capture grabs all
-    cameras first, then retrieves and PNG-encodes them, so the frames are close
-    in time. last_skew_s holds max-min of the grab times for the last capture.
+    the first capture(), by an explicit open(), or by the live view (preview()),
+    whichever comes first. Each capture grabs all cameras first, then retrieves
+    and PNG-encodes them, so the frames are close in time. last_skew_s holds
+    max-min of the grab times for the last capture.
+
+    last_open_error is the text of the last failed open (None when the last open
+    worked). After a failed open, preview() waits reopen_cooldown_s before it
+    tries again; capture() always tries at once.
     """
 
     def __init__(
@@ -132,6 +150,8 @@ class OpenCvCameraSet:
         cv2_module: Any = None,
         now_utc: NowUtc = utc_now_iso,
         manual_settings: Optional[Mapping[str, Optional[float]]] = None,
+        reopen_cooldown_s: float = PREVIEW_REOPEN_COOLDOWN_S,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         indexes = list(device_indexes)
         if not 1 <= len(indexes) <= len(CAMERA_IDS):
@@ -154,10 +174,22 @@ class OpenCvCameraSet:
         # (non-blocking), so a preview never interleaves with a capture.
         self._lock = threading.Lock()
         self.last_skew_s: Optional[float] = None
+        self._reopen_cooldown_s = float(reopen_cooldown_s)
+        self._monotonic = monotonic
+        self._last_open_error: Optional[str] = None
+        self._failed_open_at: Optional[float] = None
 
     @property
     def camera_ids(self) -> tuple[str, ...]:
         return self._camera_ids
+
+    @property
+    def is_open(self) -> bool:
+        return self._caps is not None
+
+    @property
+    def last_open_error(self) -> Optional[str]:
+        return self._last_open_error
 
     def open(self) -> None:
         if self._caps is not None:
@@ -166,13 +198,20 @@ class OpenCvCameraSet:
         caps: list[Any] = []
         try:
             for cam, index in zip(self._camera_ids, self._indexes):
-                cap = cv2.VideoCapture(index)
+                try:
+                    cap = cv2.VideoCapture(index)
+                except Exception as exc:
+                    raise CameraError(f"{cam}: could not open device {index}: {exc}") from exc
                 caps.append(cap)
                 self._open_one(cam, index, cap)
-        except BaseException:
+        except BaseException as exc:
             _release_quietly(caps)
+            self._last_open_error = str(exc) or type(exc).__name__
+            self._failed_open_at = self._monotonic()
             raise
         self._caps = caps
+        self._last_open_error = None
+        self._failed_open_at = None
 
     def _open_one(self, cam: str, index: int, cap: Any) -> None:
         cv2 = self._cv2
@@ -210,16 +249,25 @@ class OpenCvCameraSet:
 
         Engineering defaults: width=PREVIEW_WIDTH (640) and quality=70; a frame
         wider than `width` is downscaled with INTER_AREA, aspect ratio kept,
-        and never upscaled. Returns None, and never raises, when camera_id is
-        unknown, the camera is not open (preview never opens devices), a
-        capture holds the lock (this call does not wait), or any grab,
-        retrieve or encode problem occurs. Only this camera is grabbed.
+        and never upscaled. If the devices are not open, preview opens them
+        (inside the lock), unless the last open failed less than
+        reopen_cooldown_s ago. Returns None, and never raises, when camera_id
+        is unknown, the devices cannot be opened, a capture holds the lock
+        (this call does not wait), or any grab, retrieve or encode problem
+        occurs. Only this camera is grabbed.
         """
         if camera_id not in self._camera_ids:
             return None
         if not self._lock.acquire(blocking=False):
             return None
         try:
+            if self._caps is None:
+                if not self._reopen_due():
+                    return None
+                try:
+                    self.open()  # records last_open_error, or clears it on success
+                except Exception:
+                    return None
             caps = self._caps
             if caps is None:
                 return None
@@ -242,6 +290,11 @@ class OpenCvCameraSet:
             return None
         finally:
             self._lock.release()
+
+    def _reopen_due(self) -> bool:
+        if self._failed_open_at is None:
+            return True
+        return self._monotonic() - self._failed_open_at >= self._reopen_cooldown_s
 
     def _capture_locked(self, side: Side) -> Sequence[Frame]:
         side = Side(side)

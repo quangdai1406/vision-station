@@ -18,6 +18,7 @@ import json
 import os
 import pathlib
 import re
+import sys
 import threading
 import time
 from typing import Any, Callable, Mapping, Optional
@@ -514,6 +515,8 @@ class StationApp:
 
         # Devices and model first: a failure here leaves nothing open.
         cameras = cameras if cameras is not None else self._make_cameras(cfg)
+        self._cameras = cameras
+        self._camera_ids = tuple(cfg["cameras"]["camera_ids"])
         model = model if model is not None else self._make_model(cfg)
         outputs = outputs if outputs is not None else self._make_outputs(cfg)
 
@@ -697,6 +700,7 @@ class StationApp:
         if self._started:
             return
         self._started = True
+        self._open_cameras()
         self._ui_thread = threading.Thread(
             target=self.server.serve_forever, kwargs={"poll_interval": 0.2},
             name="station-ui", daemon=True,
@@ -705,6 +709,41 @@ class StationApp:
         if self._client is not None:
             self._sync_thread = threading.Thread(target=self._sync_loop, name="mes-sync", daemon=True)
             self._sync_thread.start()
+
+    def _open_cameras(self) -> None:
+        """Open the cameras before the UI starts. Never raises.
+
+        A failure is logged ('camera_open_failed' and one stderr line) and the
+        station still starts: the live view retries, and capture() retries on Enter.
+        """
+        opener = getattr(self._cameras, "open", None)
+        if not callable(opener):
+            return
+        try:
+            opener()
+        except Exception as exc:
+            text = str(exc) or type(exc).__name__
+            self._log_quietly("camera_open_failed", {"error": text})
+            try:
+                print(f"camera not opened: {text}. The live view will keep retrying every few seconds.",
+                      file=sys.stderr)
+            except Exception:
+                pass
+            return
+        self._log_quietly("camera_open", {"camera_ids": list(self._camera_ids)})
+
+    def _log_quietly(self, kind: str, payload: dict) -> None:
+        try:
+            self.store.append_event(kind, payload)
+        except Exception:
+            pass
+
+    def camera_status(self) -> dict:
+        """{'open': bool, 'last_error': str or None} for the UI. Cameras without is_open count as open."""
+        cams = self._cameras
+        if not hasattr(cams, "is_open"):
+            return {"open": True, "last_error": None}
+        return {"open": bool(cams.is_open), "last_error": getattr(cams, "last_open_error", None)}
 
     def stop(self) -> None:
         if self._closed:

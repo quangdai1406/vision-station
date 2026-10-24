@@ -377,17 +377,24 @@ class OpenCvPreviewTests(unittest.TestCase):
         self.assertIsNone(cams.preview("C9"))
         self.assertIsNone(cams.preview(""))
 
-    def test_preview_before_open_is_none_and_opens_nothing(self):
+    def test_preview_before_open_opens_devices_and_returns_jpeg(self):
+        # Changed: the live view opens the devices itself, so the picture shows before the first Enter.
         cv2 = FakeCv2()
-        cams = OpenCvCameraSet([0, 1], cv2_module=cv2)
-        self.assertIsNone(cams.preview("C1"))
-        self.assertEqual(cv2.captures, [])
+        cams = OpenCvCameraSet([0, 1], cv2_module=cv2, now_utc=_fixed_clock())
+        self.assertFalse(cams.is_open)
+        self.assertEqual(cams.preview("C1"), b"JPG:img0")
+        self.assertEqual(len(cv2.captures), 2)
+        self.assertTrue(cams.is_open)
+        self.assertIsNone(cams.last_open_error)
 
-    def test_preview_after_release_is_none(self):
+    def test_preview_after_release_reopens_devices(self):
+        # Changed: preview() opens closed devices, so after release() the next preview reopens them.
         cv2, cams = self._opened()
         self.assertIsNotNone(cams.preview("C1"))
         cams.release()
-        self.assertIsNone(cams.preview("C1"))
+        self.assertFalse(cams.is_open)
+        self.assertEqual(cams.preview("C1"), b"JPG:img0")
+        self.assertTrue(cams.is_open)
 
     def test_preview_returns_none_immediately_while_capture_holds_lock(self):
         cv2, cams = self._opened()
@@ -489,6 +496,123 @@ class OpenCvPreviewTests(unittest.TestCase):
         self.assertEqual(frames[3].data, b"PNG:img3")
         self.assertIsNotNone(cams.last_skew_s)
         self.assertIsNotNone(cams.preview("C1"))
+
+
+class _Clock:
+    def __init__(self, now=100.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def _working(cv2, index):
+    return FakeCapture(cv2, index, cv2.log)
+
+
+class OpenCvLiveViewOpenTests(unittest.TestCase):
+    def test_capture_after_preview_reuses_the_open_devices(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet([0, 1, 2, 3], cv2_module=cv2, now_utc=_fixed_clock())
+        cams.preview("C1")
+        self.assertEqual(len(cv2.captures), 4)
+        frames = cams.capture(Side.TOP)
+        self.assertEqual(len(frames), 4)
+        self.assertEqual(len(cv2.captures), 4)  # no second open
+
+    def test_failed_open_returns_none_and_waits_for_the_cooldown(self):
+        cv2 = FakeCv2()
+        calls = []
+
+        def video_capture(index):
+            calls.append(index)
+            return _closed(cv2, index)
+
+        cv2.VideoCapture = video_capture
+        clock = _Clock(100.0)
+        cams = OpenCvCameraSet([0], cv2_module=cv2, monotonic=clock, reopen_cooldown_s=5.0)
+
+        self.assertIsNone(cams.preview("C1"))
+        self.assertEqual(calls, [0])
+        self.assertIsNotNone(cams.last_open_error)
+        self.assertIn("C1", cams.last_open_error)
+        self.assertIn("0", cams.last_open_error)
+        self.assertFalse(cams.is_open)
+
+        clock.now = 104.9
+        self.assertIsNone(cams.preview("C1"))
+        self.assertEqual(calls, [0])  # no retry before the cooldown
+
+        clock.now = 105.0
+        cv2.VideoCapture = lambda index: _working(cv2, index)
+        self.assertEqual(cams.preview("C1"), b"JPG:img0")  # retried after the cooldown
+        self.assertIsNone(cams.last_open_error)
+        self.assertTrue(cams.is_open)
+
+    def test_preview_while_capture_holds_the_lock_returns_none_and_opens_nothing(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet([0, 1], cv2_module=cv2)
+        self.assertTrue(cams._lock.acquire(blocking=False))
+        try:
+            started = time.monotonic()
+            self.assertIsNone(cams.preview("C1"))
+            self.assertLess(time.monotonic() - started, 1.0)
+        finally:
+            cams._lock.release()
+        self.assertEqual(cv2.captures, [])
+        self.assertFalse(cams.is_open)
+
+    def test_camera_that_does_not_open_gives_none_and_names_camera_and_index(self):
+        cv2 = FakeCv2()
+        cv2.VideoCapture = lambda index: _closed(cv2, index)
+        cams = OpenCvCameraSet([5, 6], cv2_module=cv2)
+        self.assertIsNone(cams.preview("C2"))
+        self.assertIn("C1", cams.last_open_error)
+        self.assertIn("5", cams.last_open_error)
+
+    def test_second_camera_failing_releases_the_first(self):
+        cv2 = FakeCv2()
+        cv2.VideoCapture = lambda index: _closed(cv2, index) if index == 6 else _working(cv2, index)
+        cams = OpenCvCameraSet([5, 6], cv2_module=cv2)
+        self.assertIsNone(cams.preview("C1"))
+        self.assertIn("C2", cams.last_open_error)
+        self.assertIn("6", cams.last_open_error)
+        self.assertEqual(sorted(e[1] for e in cv2.log if e[0] == "release"), [5, 6])
+        self.assertFalse(cams.is_open)
+
+    def test_open_failure_in_capture_still_raises_and_records_the_error(self):
+        cv2 = FakeCv2()
+        cv2.VideoCapture = lambda index: _closed(cv2, index)
+        cams = OpenCvCameraSet([7], cv2_module=cv2)
+        with self.assertRaises(CameraError):
+            cams.capture(Side.TOP)
+        self.assertIn("C1", cams.last_open_error)
+
+    def test_open_success_clears_last_open_error(self):
+        cv2 = FakeCv2()
+        cv2.VideoCapture = lambda index: _closed(cv2, index)
+        cams = OpenCvCameraSet([7], cv2_module=cv2, monotonic=_Clock(0.0))
+        with self.assertRaises(CameraError):
+            cams.open()
+        self.assertIsNotNone(cams.last_open_error)
+        cv2.VideoCapture = lambda index: _working(cv2, index)
+        cams.open()
+        self.assertIsNone(cams.last_open_error)
+        self.assertTrue(cams.is_open)
+
+    def test_last_open_error_is_read_only(self):
+        cams = OpenCvCameraSet([0], cv2_module=FakeCv2())
+        with self.assertRaises(AttributeError):
+            cams.last_open_error = "x"
+        with self.assertRaises(AttributeError):
+            cams.is_open = True
+
+
+class FakeCameraSetStatusTests(unittest.TestCase):
+    def test_fake_cameras_report_open_with_no_error(self):
+        cams = FakeCameraSet()
+        self.assertIs(cams.is_open, True)
+        self.assertIsNone(cams.last_open_error)
 
 
 class BlurCheckTests(unittest.TestCase):

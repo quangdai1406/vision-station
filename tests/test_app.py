@@ -28,7 +28,7 @@ from station.app import (
 )
 from station.auth import UserStore, hash_password, load_users
 from station.cameras import FakeCameraSet
-from station.contracts import Frame, Side, StationError, State, is_full_station
+from station.contracts import CameraError, Frame, Side, StationError, State, is_full_station
 from station.inference import MarkerModel
 from station.outputs import RecordingOutputs
 from station.storage import Store
@@ -719,6 +719,94 @@ class PreviewWrapperTests(unittest.TestCase):
         self.assertIsNone(wrapped.preview("C2"))
         self.assertTrue(lock.acquire(blocking=False))  # released despite the error
         lock.release()
+
+
+class ScriptedCameras(FakeCameraSet):
+    """A FakeCameraSet whose open() succeeds or raises, like OpenCvCameraSet.open()."""
+
+    def __init__(self, open_error=None) -> None:
+        super().__init__()
+        self._open_error = open_error
+        self.open_calls = 0
+        self._open = False
+        self._last_error = None
+
+    def open(self) -> None:
+        self.open_calls += 1
+        if self._open_error is not None:
+            self._last_error = str(self._open_error) or type(self._open_error).__name__
+            raise self._open_error
+        self._open = True
+        self._last_error = None
+
+    @property
+    def is_open(self) -> bool:
+        return self._open
+
+    @property
+    def last_open_error(self):
+        return self._last_error
+
+
+class CameraOpenTests(TmpCase):
+    def setUp(self) -> None:
+        super().setUp()
+        with open(os.path.join(self.tmp, "users.json"), "w", encoding="utf-8") as fh:
+            json.dump({"op1": {"password_hash": hash_password("operator-pass-1"), "role": "operator"}}, fh)
+
+    def _app(self, cameras) -> StationApp:
+        app = build_station(base_config(self.tmp), cameras=cameras, model=MarkerModel("test-1"),
+                            outputs=RecordingOutputs(), clock=FakeClock())
+        self.addCleanup(app.stop)
+        return app
+
+    def test_start_opens_the_cameras_once_and_logs_camera_open(self) -> None:
+        cams = ScriptedCameras()
+        app = self._app(cams)
+        app.start()
+        app.stop()
+        self.assertEqual(cams.open_calls, 1)
+        rows = BuildTests._events(app.store, "camera_open")
+        self.assertEqual(len(rows), 1)
+        self.assertIn('"C1"', rows[0]["payload_json"])
+        self.assertNotIn("camera_open_failed", BuildTests._event_kinds(app.store))
+        self.assertEqual(app.camera_status(), {"open": True, "last_error": None})
+
+    def test_failed_open_is_logged_printed_and_does_not_stop_start(self) -> None:
+        cams = ScriptedCameras(open_error=CameraError("C1: could not open device 0"))
+        app = self._app(cams)
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            app.start()  # must not raise
+        app.stop()
+        self.assertEqual(cams.open_calls, 1)
+        rows = BuildTests._events(app.store, "camera_open_failed")
+        self.assertEqual(len(rows), 1)
+        self.assertIn("could not open device 0", rows[0]["payload_json"])
+        self.assertNotIn("camera_open", BuildTests._event_kinds(app.store))
+        self.assertEqual(
+            err.getvalue(),
+            "camera not opened: C1: could not open device 0. "
+            "The live view will keep retrying every few seconds.\n",
+        )
+        self.assertEqual(app.camera_status(), {"open": False, "last_error": "C1: could not open device 0"})
+
+    def test_non_camera_error_from_open_is_also_contained(self) -> None:
+        app = self._app(ScriptedCameras(open_error=RuntimeError("driver busy")))
+        with mock.patch("sys.stderr", io.StringIO()):
+            app.start()
+        app.stop()
+        rows = BuildTests._events(app.store, "camera_open_failed")
+        self.assertIn("driver busy", rows[0]["payload_json"])
+
+    def test_fake_cameras_have_no_open_call_and_report_open(self) -> None:
+        app = self._app(FakeCameraSet())
+        app.start()
+        app.stop()
+        kinds = BuildTests._event_kinds(app.store)
+        self.assertNotIn("camera_open", kinds)
+        self.assertNotIn("camera_open_failed", kinds)
+        self.assertEqual(app.camera_status(), {"open": True, "last_error": None})
 
 
 class UsersCliTests(TmpCase):
