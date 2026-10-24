@@ -75,6 +75,7 @@ class FakeCv2:
     CAP_PROP_FOCUS = 28
     CAP_PROP_EXPOSURE = 15
     CAP_PROP_WB_TEMPERATURE = 45
+    CAP_PROP_BUFFERSIZE = 38
     IMWRITE_JPEG_QUALITY = 1
     INTER_AREA = 3
 
@@ -223,7 +224,14 @@ class OpenCvCameraSetTests(unittest.TestCase):
         ):
             with self.subTest(count=len(indexes)):
                 cv2 = FakeCv2()
-                cams = OpenCvCameraSet(indexes, cv2_module=cv2, now_utc=_fixed_clock())
+                # Warm-up and stale flush off: this test checks one grab per device, in order.
+                cams = OpenCvCameraSet(
+                    indexes,
+                    cv2_module=cv2,
+                    now_utc=_fixed_clock(),
+                    open_warmup_frames=0,
+                    stale_flush_frames=0,
+                )
                 self.assertEqual(cams.camera_ids, expected)
                 frames = cams.capture(Side.TOP)
                 self.assertEqual([f.camera_id for f in frames], list(expected))
@@ -259,9 +267,12 @@ class OpenCvCameraSetTests(unittest.TestCase):
     def test_capture_grabs_all_before_any_retrieve(self):
         cv2 = FakeCv2()
         cams = OpenCvCameraSet([0, 1, 2, 3], cv2_module=cv2, now_utc=_fixed_clock())
+        cams.open()
+        cv2.log.clear()  # drop the open-time warm-up reads
         frames = cams.capture(Side.TOP)
         ops = [entry[0] for entry in cv2.log if entry[0] in ("grab", "retrieve")]
-        self.assertEqual(ops, ["grab"] * 4 + ["retrieve"] * 4)
+        # Updated: 2 stale-flush grabs per device now come first; then the real grabs, then the retrieves.
+        self.assertEqual(ops, ["grab"] * 12 + ["retrieve"] * 4)
         last_grab = max(i for i, e in enumerate(cv2.log) if e[0] == "grab")
         first_retrieve = min(i for i, e in enumerate(cv2.log) if e[0] == "retrieve")
         self.assertLess(last_grab, first_retrieve)
@@ -651,6 +662,262 @@ class BlurCheckTests(unittest.TestCase):
 
         make_blur_check(decode, min_variance=0.0)(frame)
         self.assertEqual(seen, [frame])
+
+
+def _recorded(make):
+    """VideoCapture factory that also records each capture in cv2.captures."""
+
+    def video_capture(cv2, index):
+        cap = make(cv2, index)
+        cv2.captures.append(cap)
+        return cap
+
+    return video_capture
+
+
+def _failing_reads(cv2, index):
+    cap = FakeCapture(cv2, index, cv2.log)
+    cap.grab_ok = False
+    cap.retrieve_ok = False
+    return cap
+
+
+class OpenCvStallReopenTests(unittest.TestCase):
+    def test_five_consecutive_preview_failures_release_devices_then_cooldown_reopens(self):
+        cv2 = FakeCv2()
+        clock = _Clock(100.0)
+        cams = OpenCvCameraSet([0], cv2_module=cv2, monotonic=clock, reopen_cooldown_s=5.0)
+        cams.open()
+        cv2.captures[0].grab_ok = False
+        for _ in range(4):
+            self.assertIsNone(cams.preview("C1"))
+        self.assertTrue(cams.is_open)
+        self.assertEqual(cams.status()["consecutive_failures"], 4)
+
+        self.assertIsNone(cams.preview("C1"))  # the fifth failure stalls the set
+        self.assertFalse(cams.is_open)
+        self.assertEqual([e[1] for e in cv2.log if e[0] == "release"], [0])
+        self.assertEqual(cams.last_open_error, "camera stopped delivering pictures; reopening")
+        self.assertEqual(cams.status()["consecutive_failures"], 0)
+
+        clock.now = 104.9
+        self.assertIsNone(cams.preview("C1"))
+        self.assertEqual(len(cv2.captures), 1)  # still cooling down, no reopen
+
+        clock.now = 105.0
+        cv2.VideoCapture = lambda index: _recorded(_working)(cv2, index)
+        self.assertEqual(cams.preview("C1"), b"JPG:img0")  # reopened, picture back
+        self.assertEqual(len(cv2.captures), 2)
+        self.assertTrue(cams.is_open)
+        self.assertIsNone(cams.last_open_error)
+
+    def test_one_success_resets_the_failure_count(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet([0], cv2_module=cv2)
+        cams.open()
+        cap = cv2.captures[0]
+        cap.grab_ok = False
+        for _ in range(4):
+            self.assertIsNone(cams.preview("C1"))
+        cap.grab_ok = True
+        self.assertEqual(cams.preview("C1"), b"JPG:img0")
+        self.assertEqual(cams.status()["consecutive_failures"], 0)
+        cap.grab_ok = False
+        for _ in range(4):
+            self.assertIsNone(cams.preview("C1"))
+        self.assertTrue(cams.is_open)
+        self.assertIsNone(cams.last_open_error)
+        self.assertEqual(cams.status()["consecutive_failures"], 4)
+
+    def test_fails_before_reopen_kwarg_is_honoured(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet([0], cv2_module=cv2, fails_before_reopen=2)
+        cams.open()
+        cv2.captures[0].grab_ok = False
+        cams.preview("C1")
+        self.assertTrue(cams.is_open)
+        cams.preview("C1")
+        self.assertFalse(cams.is_open)
+
+    def test_capture_failure_raises_and_the_next_capture_reopens(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet([0], cv2_module=cv2, now_utc=_fixed_clock())
+        cams.open()
+        cv2.captures[0].grab_ok = False
+        with self.assertRaises(CameraError):
+            cams.capture(Side.TOP)
+        self.assertFalse(cams.is_open)
+        self.assertEqual([e[1] for e in cv2.log if e[0] == "release"], [0])
+        frames = cams.capture(Side.TOP)  # no cooldown for capture
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(len(cv2.captures), 2)
+        self.assertTrue(cams.is_open)
+
+
+class OpenCvReleaseTests(unittest.TestCase):
+    def test_release_twice_is_safe(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet([0, 1], cv2_module=cv2)
+        cams.open()
+        cams.release()
+        cams.release()
+        self.assertFalse(cams.is_open)
+        self.assertEqual(sorted(e[1] for e in cv2.log if e[0] == "release"), [0, 1])
+
+    def test_release_takes_the_lock_and_leaves_it_free(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet([0], cv2_module=cv2)
+        cams.open()
+        cams.release()
+        self.assertTrue(cams._lock.acquire(blocking=False))
+        cams._lock.release()
+
+    def test_release_does_not_hang_while_a_preview_holds_the_lock(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet([0], cv2_module=cv2)
+        cams.open()
+        held = threading.Event()
+        done = threading.Event()
+
+        def hold():
+            with cams._lock:
+                held.set()
+                done.wait(5)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        try:
+            self.assertTrue(held.wait(5))
+            with mock.patch("station.cameras.RELEASE_LOCK_TIMEOUT_S", 0.05):
+                started = time.monotonic()
+                cams.release()
+                self.assertLess(time.monotonic() - started, 1.0)
+        finally:
+            done.set()
+            holder.join(5)
+        self.assertFalse(cams.is_open)
+        self.assertEqual([e[1] for e in cv2.log if e[0] == "release"], [0])
+
+
+class OpenCvWarmupAndFlushTests(unittest.TestCase):
+    def test_open_discards_warmup_frames_on_each_device(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet([0, 1], cv2_module=cv2)
+        cams.open()
+        self.assertEqual([e[1] for e in cv2.log if e[0] == "grab"], [0] * 5 + [1] * 5)
+        self.assertEqual([e[1] for e in cv2.log if e[0] == "retrieve"], [0] * 5 + [1] * 5)
+
+    def test_zero_warmup_frames_disables_warmup(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet([0, 1], cv2_module=cv2, open_warmup_frames=0)
+        cams.open()
+        self.assertEqual([e for e in cv2.log if e[0] in ("grab", "retrieve")], [])
+
+    def test_warmup_failures_are_ignored(self):
+        cv2 = FakeCv2()
+        cv2.VideoCapture = lambda index: _failing_reads(cv2, index)
+        cams = OpenCvCameraSet([0], cv2_module=cv2)
+        cams.open()
+        self.assertTrue(cams.is_open)
+        self.assertIsNone(cams.last_open_error)
+
+    def test_buffer_size_is_set_to_one_best_effort(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet([0], cv2_module=cv2)
+        cams.open()
+        self.assertEqual(cv2.captures[0].props[FakeCv2.CAP_PROP_BUFFERSIZE], 1)
+
+    def test_buffer_size_error_is_ignored(self):
+        class NoBufferSize(FakeCapture):
+            def set(self, prop, value):
+                if prop == FakeCv2.CAP_PROP_BUFFERSIZE:
+                    raise RuntimeError("driver refuses buffer size")
+                return super().set(prop, value)
+
+        cv2 = FakeCv2()
+        cv2.VideoCapture = lambda index: NoBufferSize(cv2, index, cv2.log)
+        cams = OpenCvCameraSet([0], cv2_module=cv2)
+        cams.open()
+        self.assertTrue(cams.is_open)
+        self.assertIsNone(cams.last_open_error)
+
+    def test_stale_flush_runs_before_the_real_grabs(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet(
+            [0, 1, 2, 3], cv2_module=cv2, now_utc=_fixed_clock(), open_warmup_frames=0
+        )
+        cams.open()
+        cv2.log.clear()
+        frames = cams.capture(Side.TOP)
+        self.assertEqual(len(frames), 4)
+        grabs = [e[1] for e in cv2.log if e[0] == "grab"]
+        self.assertEqual(grabs, [0, 1, 2, 3] * 3)  # 2 flush rounds, then the real round
+
+    def test_zero_stale_flush_grabs_each_device_once(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet([0, 1], cv2_module=cv2, stale_flush_frames=0)
+        cams.open()
+        cv2.log.clear()
+        cams.capture(Side.BOTTOM)
+        self.assertEqual([e[1] for e in cv2.log if e[0] == "grab"], [0, 1])
+
+    def test_skew_excludes_the_flush_time(self):
+        cv2 = FakeCv2()
+        clock = _Clock(0.0)
+        cams = OpenCvCameraSet(
+            [0, 1, 2, 3],
+            cv2_module=cv2,
+            now_utc=_fixed_clock(),
+            monotonic=clock,
+            open_warmup_frames=0,
+        )
+        cams.open()
+        calls = []
+
+        def make_ticking(cap):
+            real_grab = cap.grab
+
+            def ticking():
+                calls.append(None)
+                # The first 8 grabs are the flush: a long time passes there.
+                clock.now += 5.0 if len(calls) <= 8 else 0.01
+                return real_grab()
+
+            return ticking
+
+        for cap in cv2.captures:
+            cap.grab = make_ticking(cap)
+        cams.capture(Side.TOP)
+        self.assertEqual(len(calls), 12)
+        self.assertAlmostEqual(cams.last_skew_s, 0.03, places=6)
+
+
+class StatusTests(unittest.TestCase):
+    def test_fake_camera_set_status(self):
+        self.assertEqual(
+            FakeCameraSet().status(),
+            {"open": True, "last_error": None, "consecutive_failures": 0},
+        )
+
+    def test_opencv_status_tracks_open_error_and_failures(self):
+        cv2 = FakeCv2()
+        cv2.VideoCapture = lambda index: _recorded(_closed)(cv2, index)
+        cams = OpenCvCameraSet([7], cv2_module=cv2, monotonic=_Clock(0.0))
+        with self.assertRaises(CameraError):
+            cams.open()
+        status = cams.status()
+        self.assertFalse(status["open"])
+        self.assertIn("C1", status["last_error"])
+        self.assertEqual(status["consecutive_failures"], 0)
+
+        cv2.VideoCapture = lambda index: _recorded(_working)(cv2, index)
+        cams.open()
+        self.assertEqual(
+            cams.status(), {"open": True, "last_error": None, "consecutive_failures": 0}
+        )
+        cv2.captures[-1].grab_ok = False
+        self.assertIsNone(cams.preview("C1"))
+        self.assertEqual(cams.status()["consecutive_failures"], 1)
 
 
 if __name__ == "__main__":
