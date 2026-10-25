@@ -49,6 +49,13 @@ OPEN_WARMUP_FRAMES = 5
 STALE_FLUSH_FRAMES = 2
 # Seconds release() waits for a running capture or preview before it releases anyway.
 RELEASE_LOCK_TIMEOUT_S = 2.0
+# Open-per-shot live view (engineering choice): at most one camera is opened for a
+# live-view refresh per this many seconds, so tile polling cannot cause back-to-back
+# open/release cycles. 0 disables the limit.
+PREVIEW_SEQ_MIN_INTERVAL_S = 1.0
+# A cached live-view frame older than this is dropped (engineering setting for how
+# old a shown picture may be; not a quality limit).
+PREVIEW_CACHE_MAX_AGE_S = 10.0
 
 _MANUAL_KEYS = ("focus", "exposure", "white_balance")
 
@@ -187,6 +194,12 @@ class OpenCvCameraSet:
     before the next one is opened. With True, all devices stay open and only one
     is grabbed and retrieved at a time.
 
+    Open-per-shot: open() opens nothing and is_open is True (no device is held
+    between shots), so at most one device is open at any moment. A preview
+    refresh there opens one device without warm-up, reads one frame and releases
+    it, at most once per preview_seq_min_interval_s; other calls get the cached
+    JPEG (kept preview_cache_max_age_s at most).
+
     last_skew_s is max-min of the per-camera grab end times (in sequential mode
     it is large by design). last_capture_total_s runs from the start of the first
     grab to the end of the last grab. last_capture_times_s lists each camera's
@@ -220,6 +233,8 @@ class OpenCvCameraSet:
         stale_flush_frames: int = STALE_FLUSH_FRAMES,
         capture_mode: str = "simultaneous",
         sequential_keep_open: bool = False,
+        preview_seq_min_interval_s: float = PREVIEW_SEQ_MIN_INTERVAL_S,
+        preview_cache_max_age_s: float = PREVIEW_CACHE_MAX_AGE_S,
     ) -> None:
         indexes = list(device_indexes)
         if not 1 <= len(indexes) <= len(CAMERA_IDS):
@@ -268,6 +283,15 @@ class OpenCvCameraSet:
         self._seq_fail_counts: dict[str, int] = {}
         self._preview_turn = 0
         self._preview_cache: dict[str, tuple[float, bytes]] = {}
+        # Guards _preview_cache only: held for one dict read or write, never across a
+        # device call, so a preview can read the cache while a capture holds _lock.
+        self._cache_lock = threading.Lock()
+        if preview_seq_min_interval_s < 0 or preview_cache_max_age_s < 0:
+            raise ValueError("preview_seq_min_interval_s and preview_cache_max_age_s must not be negative")
+        self._preview_seq_min_interval_s = float(preview_seq_min_interval_s)
+        self._preview_cache_max_age_s = float(preview_cache_max_age_s)
+        # Monotonic time of the last open-per-shot live-view device open (None before the first).
+        self._seq_last_refresh_at: Optional[float] = None
 
     @property
     def camera_ids(self) -> tuple[str, ...]:
@@ -275,6 +299,9 @@ class OpenCvCameraSet:
 
     @property
     def is_open(self) -> bool:
+        if self._capture_mode == "sequential" and not self._seq_keep:
+            # Open-per-shot is ready by design: no device is held between shots.
+            return True
         return self._caps is not None or bool(self._seq_devices)
 
     @property
@@ -291,8 +318,11 @@ class OpenCvCameraSet:
         }
 
     def open(self) -> None:
-        if self._seq_keep:
-            self._open_seq_devices()
+        if self._capture_mode == "sequential":
+            # Keep-open opens its devices now. Open-per-shot opens nothing: each shot
+            # opens its own device, so startup holds zero devices.
+            if self._seq_keep:
+                self._open_seq_devices()
             return
         if self._caps is not None:
             return
@@ -329,15 +359,18 @@ class OpenCvCameraSet:
         self._last_open_error = None
         self._consecutive_failures = 0
 
-    def _open_for_shot(self, cam: str, index: int) -> Any:
-        """Open, configure and warm up one device. A failure is recorded in last_open_error."""
+    def _open_for_shot(self, cam: str, index: int, *, warm_up: bool = True) -> Any:
+        """Open, configure and (unless warm_up is False) warm up one device.
+
+        A failure is recorded in last_open_error.
+        """
         try:
             try:
                 cap = self._cv2.VideoCapture(index)
             except Exception as exc:
                 raise CameraError(f"{cam}: could not open device {index}: {exc}") from exc
             try:
-                self._open_one(cam, index, cap)
+                self._open_one(cam, index, cap, warm_up=warm_up)
             except BaseException:
                 _release_quietly([cap])
                 raise
@@ -346,7 +379,7 @@ class OpenCvCameraSet:
             raise
         return cap
 
-    def _open_one(self, cam: str, index: int, cap: Any) -> None:
+    def _open_one(self, cam: str, index: int, cap: Any, *, warm_up: bool = True) -> None:
         cv2 = self._cv2
         try:
             if not cap.isOpened():
@@ -371,7 +404,8 @@ class OpenCvCameraSet:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
             pass
-        self._warm_up(cap)
+        if warm_up:
+            self._warm_up(cap)
 
     def _warm_up(self, cap: Any) -> None:
         """Read and discard the first frames after open. Failures are ignored."""
@@ -409,18 +443,18 @@ class OpenCvCameraSet:
         (this call does not wait), or any grab, retrieve or encode problem
         occurs. Only this camera is grabbed.
 
-        In sequential mode each call grabs one camera in round-robin order (see
-        _preview_sequential_locked): it returns a fresh frame only when
-        camera_id is that camera's turn, otherwise the last JPEG cached for
-        camera_id, or None.
+        In sequential mode the answer is always the cached JPEG for camera_id
+        (not older than preview_cache_max_age_s), refreshed from the camera in
+        round-robin turns (see _preview_sequential_locked). While a capture holds
+        the lock, sequential mode returns that cached JPEG without waiting.
         """
         if camera_id not in self._camera_ids:
             return None
+        if self._capture_mode == "sequential":
+            return self._preview_sequential(camera_id, width, quality)
         if not self._lock.acquire(blocking=False):
             return None
         try:
-            if self._capture_mode == "sequential":
-                return self._preview_sequential_locked(camera_id, width, quality)
             if self._caps is None:
                 if not self._reopen_due():
                     return None
@@ -440,6 +474,36 @@ class OpenCvCameraSet:
             return None
         finally:
             self._lock.release()
+
+    def _preview_sequential(self, camera_id: str, width: int, quality: int) -> Optional[bytes]:
+        """Sequential live view. Never waits for a capture that holds the lock."""
+        if not self._lock.acquire(blocking=False):
+            return self._cached_preview(camera_id)
+        try:
+            return self._preview_sequential_locked(camera_id, width, quality)
+        except Exception:
+            return None
+        finally:
+            self._lock.release()
+
+    def _cached_preview(self, camera_id: str) -> Optional[bytes]:
+        """The cached JPEG for camera_id, or None when absent or older than the max age.
+
+        Takes only _cache_lock, never the capture lock. An expired entry is dropped.
+        """
+        with self._cache_lock:
+            entry = self._preview_cache.get(camera_id)
+            if entry is None:
+                return None
+            stamp, data = entry
+            if self._monotonic() - stamp > self._preview_cache_max_age_s:
+                del self._preview_cache[camera_id]
+                return None
+            return data
+
+    def _cache_put(self, camera_id: str, data: bytes) -> None:
+        with self._cache_lock:
+            self._preview_cache[camera_id] = (self._monotonic(), data)
 
     def _encode_preview(self, image: Any, width: int, quality: int) -> Optional[bytes]:
         cv2 = self._cv2
@@ -643,22 +707,24 @@ class OpenCvCameraSet:
     ) -> Optional[bytes]:
         """Sequential live view (lock held by the caller).
 
-        Each call takes the next camera in C1..C4 order (the turn), grabs one
-        frame from it and caches its JPEG with a monotonic timestamp. The call
-        returns a fresh frame only when camera_id is the turn camera; otherwise
-        it returns the cached JPEG for camera_id, or None.
+        Each turn takes the next camera in C1..C4 order, reads one frame from it
+        and caches its JPEG with a monotonic timestamp. Open-per-shot allows one
+        such refresh per preview_seq_min_interval_s: inside that interval no
+        turn is taken and no device is touched. The answer is the cached JPEG for
+        camera_id (or None if absent or expired), so an unusable frame keeps the
+        previous picture.
         """
+        if not self._seq_keep and self._seq_last_refresh_at is not None:
+            if self._monotonic() - self._seq_last_refresh_at < self._preview_seq_min_interval_s:
+                return self._cached_preview(camera_id)
         count = len(self._camera_ids)
         turn = self._preview_turn % count
         self._preview_turn = (turn + 1) % count
         turn_cam = self._camera_ids[turn]
         data = self._preview_turn_locked(turn, turn_cam, width, quality)
         if data is not None:
-            self._preview_cache[turn_cam] = (self._monotonic(), data)
-        if camera_id == turn_cam:
-            return data
-        cached = self._preview_cache.get(camera_id)
-        return None if cached is None else cached[1]
+            self._cache_put(turn_cam, data)
+        return self._cached_preview(camera_id)
 
     def _preview_turn_locked(self, idx: int, cam: str, width: int, quality: int) -> Optional[bytes]:
         """Grab one frame from the turn camera and return its JPEG, or None.
@@ -692,8 +758,10 @@ class OpenCvCameraSet:
 
         if not self._seq_reopen_due(cam):
             return None
+        # One open, no warm-up and one grab: the live view must hold the lock only briefly.
+        self._seq_last_refresh_at = self._monotonic()
         try:
-            cap = self._open_for_shot(cam, self._indexes[idx])
+            cap = self._open_for_shot(cam, self._indexes[idx], warm_up=False)
         except Exception:
             self._seq_failed_at[cam] = self._monotonic()
             return None
@@ -703,7 +771,7 @@ class OpenCvCameraSet:
         finally:
             _release_quietly([cap])
         if image is None:
-            return None
+            return None  # unusable frame: the caller keeps the cached one
         return self._encode_preview(image, width, quality)
 
     def _seq_reopen_due(self, cam: str) -> bool:
