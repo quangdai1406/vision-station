@@ -497,6 +497,127 @@ class CameraConfigTests(TmpCase):
             validate_config(data)
 
 
+class CaptureModeConfigTests(TmpCase):
+    """cameras.capture_mode and cameras.sequential_keep_open: validation and the kwargs passed to OpenCvCameraSet."""
+
+    def _opencv(self, devices=(0, 1, 2, 3), **cams) -> dict:
+        data = base_config(self.tmp)
+        data["cameras"] = {"kind": "opencv", "devices": list(devices), **cams}
+        return data
+
+    def test_default_is_simultaneous_and_has_no_keep_open_key(self) -> None:
+        cfg = validate_config(self._opencv())
+        self.assertEqual(cfg["cameras"]["capture_mode"], "simultaneous")
+        self.assertNotIn("sequential_keep_open", cfg["cameras"])
+
+    def test_sequential_keep_open_defaults_to_false(self) -> None:
+        cfg = validate_config(self._opencv(capture_mode="sequential"))
+        self.assertEqual(cfg["cameras"]["capture_mode"], "sequential")
+        self.assertIs(cfg["cameras"]["sequential_keep_open"], False)
+        cfg = validate_config(self._opencv(capture_mode="sequential", sequential_keep_open=True))
+        self.assertIs(cfg["cameras"]["sequential_keep_open"], True)
+
+    def test_unknown_capture_mode_and_wrong_types_are_rejected(self) -> None:
+        for bad in ("parallel", "Sequential", "", None, 1, ["sequential"]):
+            with self.assertRaisesRegex(ConfigError, "cameras.capture_mode must be"):
+                validate_config(self._opencv(capture_mode=bad))
+        with self.assertRaisesRegex(ConfigError, "cameras.sequential_keep_open must be true or false"):
+            validate_config(self._opencv(capture_mode="sequential", sequential_keep_open="yes"))
+        with self.assertRaisesRegex(ConfigError, "cameras.sequential_keep_open must be true or false"):
+            validate_config(self._opencv(capture_mode="sequential", sequential_keep_open=1))
+
+    def test_keep_open_while_simultaneous_is_rejected(self) -> None:
+        for value in (True, False):
+            with self.assertRaisesRegex(ConfigError, "only applies when cameras.capture_mode is 'sequential'"):
+                validate_config(self._opencv(sequential_keep_open=value))
+            with self.assertRaisesRegex(ConfigError, "only applies when cameras.capture_mode is 'sequential'"):
+                validate_config(self._opencv(capture_mode="simultaneous", sequential_keep_open=value))
+
+    def test_validated_config_validates_again_to_the_same_value(self) -> None:
+        for cams in ({}, {"capture_mode": "sequential"},
+                     {"capture_mode": "sequential", "sequential_keep_open": True}):
+            once = validate_config(self._opencv(**cams))
+            self.assertEqual(validate_config(once), once)
+
+    def test_capture_mode_is_also_accepted_for_the_fake_kind(self) -> None:
+        data = base_config(self.tmp)
+        data["cameras"] = {"kind": "fake", "capture_mode": "sequential", "sequential_keep_open": True}
+        cfg = validate_config(data)
+        self.assertEqual(cfg["cameras"]["capture_mode"], "sequential")
+
+    def test_example_configs_say_simultaneous(self) -> None:
+        for name in ("config.example.json", "config.poc.example.json"):
+            example = json.loads((REPO / name).read_text(encoding="utf-8"))
+            self.assertEqual(example["cameras"]["capture_mode"], "simultaneous", name)
+            self.assertNotIn("sequential_keep_open", example["cameras"], name)
+
+
+class RecordingCameraFactory:
+    """Stands in for OpenCvCameraSet: records the devices and the capture-mode kwargs it is built with."""
+
+    CAPTURE_KWARGS = ("capture_mode", "sequential_keep_open")
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[list, dict]] = []
+
+    def __call__(self, devices, **kwargs):
+        capture = {k: v for k, v in kwargs.items() if k in self.CAPTURE_KWARGS}
+        self.calls.append((list(devices), capture))
+        return FakeCameraSet(camera_ids=tuple(f"C{i + 1}" for i in range(len(devices))))
+
+
+class CaptureModeBuildTests(TmpCase):
+    def setUp(self) -> None:
+        super().setUp()
+        with open(os.path.join(self.tmp, "users.json"), "w", encoding="utf-8") as fh:
+            json.dump({"op1": {"password_hash": hash_password("operator-pass-1"), "role": "operator"}}, fh)
+
+    def _build(self, cams: dict, factory: RecordingCameraFactory) -> StationApp:
+        data = base_config(self.tmp)
+        data["cameras"] = {"kind": "opencv", **cams}
+        with mock.patch("station.app.OpenCvCameraSet", side_effect=factory):
+            app = build_station(data, model=MarkerModel("test-1"), outputs=RecordingOutputs(),
+                                clock=FakeClock(), token="")
+        self.addCleanup(app.stop)
+        return app
+
+    def test_simultaneous_passes_no_capture_kwargs(self) -> None:
+        factory = RecordingCameraFactory()
+        self._build({"devices": [0, 1, 2, 3]}, factory)
+        self.assertEqual(factory.calls, [([0, 1, 2, 3], {})])
+
+    def test_explicit_simultaneous_passes_no_capture_kwargs(self) -> None:
+        factory = RecordingCameraFactory()
+        self._build({"devices": [0, 1, 2, 3], "capture_mode": "simultaneous"}, factory)
+        self.assertEqual(factory.calls, [([0, 1, 2, 3], {})])
+
+    def test_sequential_passes_the_mode_and_keep_open_flag(self) -> None:
+        factory = RecordingCameraFactory()
+        self._build({"devices": [0, 1, 2, 3], "capture_mode": "sequential",
+                     "sequential_keep_open": True}, factory)
+        self.assertEqual(factory.calls, [([0, 1, 2, 3], {"capture_mode": "sequential",
+                                                         "sequential_keep_open": True})])
+
+    def test_sequential_defaults_keep_open_to_false(self) -> None:
+        factory = RecordingCameraFactory()
+        self._build({"devices": [0, 1, 2, 3], "capture_mode": "sequential"}, factory)
+        self.assertEqual(factory.calls[0][1], {"capture_mode": "sequential", "sequential_keep_open": False})
+
+    def test_one_device_sequential_station_is_still_partial_and_never_posts(self) -> None:
+        os.environ[TOKEN_ENV] = "not-a-real-token-for-tests"
+        factory = RecordingCameraFactory()
+        data = base_config(self.tmp)
+        data["cameras"] = {"kind": "opencv", "devices": [0], "capture_mode": "sequential"}
+        with mock.patch("station.app.OpenCvCameraSet", side_effect=factory):
+            app = build_station(data, model=MarkerModel("test-1"), outputs=RecordingOutputs(),
+                                clock=FakeClock())
+        self.addCleanup(app.stop)
+        self.assertEqual(factory.calls[0][1]["capture_mode"], "sequential")
+        self.assertTrue(app.partial)
+        self.assertFalse(app.mes_enabled)  # mes.allow_partial_cameras is false
+        self.assertEqual(app.outbox.pending_count(), 0)
+
+
 class PartialStationTests(TmpCase):
     def setUp(self) -> None:
         super().setUp()
