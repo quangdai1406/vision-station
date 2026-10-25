@@ -508,8 +508,8 @@ class _LockedSession:
         return self._need_app().search_parts(q, limit)
 
     def select_part(self, part_number: str, by: str) -> dict:
-        with self._lock:
-            return self._need_app().select_part(part_number, by)
+        # No lock here: StationApp.select_part does its MES calls unlocked, then takes the lock.
+        return self._need_app().select_part(part_number, by)
 
     def current_part(self) -> dict:
         with self._lock:
@@ -908,15 +908,16 @@ class StationApp:
         if not isinstance(by, str) or not by.strip():
             raise ValueError("by is required")
         pn = part_number.strip()
+        # MES calls can take seconds: do them before the lock so presses and snapshots keep working.
+        client = self._require_parts_client()
+        if client.get_part(pn) is None:
+            raise PartsError(f"part {pn} not found in the MES")
+        part_cfg = build_part_config(client.criteria(pn))
+        warnings = list(part_cfg["warnings"])
         with self._session_lock:
             if self.session.state is not State.IDLE:
                 raise InvalidTransition(f"a part cannot be selected while {self.session.state.value}")
-            client = self._require_parts_client()
-            if client.get_part(pn) is None:
-                raise PartsError(f"part {pn} not found in the MES")
-            part_cfg = build_part_config(client.criteria(pn))
             self._part_configs[pn] = part_cfg
-            warnings = list(part_cfg["warnings"])
             try:
                 info = ModelStore(self._models_dir).current(pn)
             except ModelError as exc:

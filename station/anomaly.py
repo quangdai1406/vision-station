@@ -11,8 +11,9 @@ PatchCoreBuilder.from_model(previous_model, ...) starts from the saved memory
 bank and the retained held-out features of the previous model. Only the NEW
 pictures are added. The coreset is then re-run over (old bank rows + new rows).
 Re-running the coreset on an existing coreset is a design choice that bounds
-memory; the old rows are kept first and the new allowance is
-coreset_ratio x new patches, capped by max_bank. Held-out features are kept
+memory; the coreset picks among old and new rows together (old rows can be
+dropped), and the size allowance is old rows + coreset_ratio x new patches,
+capped by max_bank. Held-out features are kept
 per key (newest max_holdout_images) so norm_ref is recalibrated from ALL
 retained held-out images against the new bank.
 
@@ -443,6 +444,9 @@ class PatchCoreBuilder:
             "max_holdout_images": self._max_holdout,
             "seed": self._seed,
         }
+        clear = getattr(self._backend, "clear", None)
+        if callable(clear):
+            clear()  # drop cached bank tensors made while building; scoring re-caches what it needs
         return PatchCoreModel(
             version,
             keys,
