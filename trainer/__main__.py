@@ -6,9 +6,11 @@ Add a command by writing both functions and one entry in that dict.
 from __future__ import annotations
 
 import argparse
+import importlib
 import sys
 from typing import Any, Callable, Optional, Sequence
 
+from trainer import weekly
 from trainer.dataset import GOOD_POLICIES, Dataset, iter_parts
 
 PROG = "python3 -m trainer"
@@ -73,9 +75,60 @@ def _run_inventory(args: argparse.Namespace) -> int:
     return 0
 
 
-# name -> (add_arguments, run)
+def _lazy_module(module_name: str) -> tuple[Any, Optional[str]]:
+    """Import a command module by name. (module, None) or (None, reason) when it is missing."""
+    try:
+        return importlib.import_module(module_name), None
+    except ImportError as exc:
+        return None, str(exc)
+
+
+def _first_callable(module: Any, names: Sequence[str]) -> Optional[Callable[..., Any]]:
+    if module is None:
+        return None
+    for name in names:
+        fn = getattr(module, name, None)
+        if callable(fn):
+            return fn
+    return None
+
+
+def _lazy_command(command: str, module_name: str, add_names: Sequence[str],
+                  run_names: Sequence[str]) -> tuple[Callable[[Any], None], Callable[[argparse.Namespace], int]]:
+    """Wire a command whose module may not exist yet. The module is imported when the command is
+    registered and again when it runs; a missing module gives a clear error instead of breaking the CLI."""
+
+    def add_arguments(sub: Any) -> None:
+        module, _reason = _lazy_module(module_name)
+        add = _first_callable(module, add_names)
+        if add is not None:
+            add(sub)
+            return
+        placeholder = sub.add_parser(command, help=f"not available: {module_name} is missing", add_help=False)
+        placeholder.add_argument("rest", nargs=argparse.REMAINDER)
+
+    def run(args: argparse.Namespace) -> int:
+        module, reason = _lazy_module(module_name)
+        fn = _first_callable(module, run_names)
+        if fn is None:
+            detail = reason or f"{module_name} has none of: {', '.join(run_names)}"
+            print(f"{command}: not available ({detail})", file=sys.stderr)
+            return 2
+        return int(fn(args))
+
+    return add_arguments, run
+
+
+# name -> (add_arguments(subparsers), run(args) -> int)
 COMMANDS: dict = {
     "inventory": (_add_inventory, _run_inventory),
+    "weekly": (weekly.add_arguments, weekly.run),
+    "purge": _lazy_command("purge", "trainer.purge", ("add_arguments",), ("run",)),
+    "promote": _lazy_command("promote", "trainer.promote",
+                             ("add_promote_arguments", "add_arguments"), ("run_promote", "run")),
+    "rollback": _lazy_command("rollback", "trainer.promote",
+                              ("add_rollback_arguments", "add_arguments"), ("run_rollback", "run")),
+    "selftest": _lazy_command("selftest", "trainer.selftest", ("add_arguments",), ("run",)),
 }
 
 
