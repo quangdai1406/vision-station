@@ -10,7 +10,7 @@ python3 .claude/skills/code-graph/scripts/gen_codegraph_doc.py [--check]
 
 Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` tests need numpy, no camera or network). Station core is standard library only; `tools/` imports numpy/opencv lazily.
 
-35 code files, 34 test files, 166 import edges.
+35 code files, 34 test files, 168 import edges.
 
 ## Modules
 
@@ -21,8 +21,8 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `station/anomaly.py` | 841 | 5 | 10 | PatchCore-style anomaly detection trained on GOOD parts only. |
 | `station/app.py` | 1050 | 7 | 5 | Wire the station together: config, build, run, and MES sync. |
 | `station/auth.py` | 178 | 9 | 7 | Password hashing, user store, role policy and in-memory session tokens. |
-| `station/cameras.py` | 793 | 8 | 6 | Camera sources for the inspection station. |
-| `station/contracts.py` | 170 | 37 | 25 | Shared types and interfaces for the camera inspection station. |
+| `station/cameras.py` | 861 | 10 | 7 | Camera sources for the inspection station. |
+| `station/contracts.py` | 170 | 37 | 26 | Shared types and interfaces for the camera inspection station. |
 | `station/features_torch.py` | 324 | 4 | 10 | PyTorch feature extractor and cdist backend for the PatchCore anomaly model. |
 | `station/fusion.py` | 87 | 2 | 7 | Per-image classification and per-part fusion. |
 | `station/golden.py` | 416 | 9 | 12 | Compare-with-a-good-part model for the one-camera proof of concept. |
@@ -41,7 +41,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `tools/analysis.py` | 263 | 3 | 3 | Numpy-only image repeatability metrics. Shapes and return keys: see tools/FORMAT.md. |
 | `tools/capture.py` | 1062 | 2 | 2 | Real-webcam capture for the repeatability study. Run on the user's Windows PC. |
 | `tools/criteria.py` | 465 | 3 | 3 | MES inspection criteria for a part -> station config pieces and a sample-collection checklist. |
-| `tools/hubtest.py` | 620 | 1 | 1 | USB hub feasibility test for several webcams. Run on the user's Windows PC. |
+| `tools/hubtest.py` | 717 | 1 | 1 | USB hub feasibility test for several webcams. Run on the user's Windows PC. |
 | `tools/report.py` | 949 | 2 | 2 | Plain-language repeatability report for capture session folders. |
 | `tools/thresholds.py` | 724 | 2 | 2 | Candidate thresholds (t_low, t_img) from labelled model scores. |
 | `trainer/__init__.py` | 6 | 0 | 0 | Weekly trainer: reads the stations' saved evidence and builds per-part datasets. |
@@ -55,10 +55,10 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 ## Hubs (change with care)
 
 - `station/contracts.py`: imported by 37 files
+- `station/cameras.py`: imported by 10 files
 - `station/modelstore.py`: imported by 10 files
 - `station/auth.py`: imported by 9 files
 - `station/golden.py`: imported by 9 files
-- `station/cameras.py`: imported by 8 files
 - `station/app.py`: imported by 7 files
 - `station/inference.py`: imported by 7 files
 - `station/outputs.py`: imported by 7 files
@@ -90,7 +90,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 - `tools/analysis.py` -> `tools/__init__.py`
 - `tools/capture.py` -> `tools/__init__.py`
 - `tools/criteria.py` -> (no internal imports)
-- `tools/hubtest.py` -> `tools/__init__.py`
+- `tools/hubtest.py` -> `station/cameras.py`, `tools/__init__.py`
 - `tools/report.py` -> `tools/__init__.py`, `tools/analysis.py`
 - `tools/thresholds.py` -> (no internal imports)
 - `trainer/__init__.py` -> (no internal imports)
@@ -113,7 +113,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 - `tests/test_features_torch.py` -> `station/anomaly.py`, `station/contracts.py`, `station/features_torch.py`
 - `tests/test_fusion.py` -> `station/contracts.py`, `station/fusion.py`
 - `tests/test_golden.py` -> `station/contracts.py`, `station/golden.py`
-- `tests/test_hubtest.py` -> `tools/hubtest.py`
+- `tests/test_hubtest.py` -> `station/cameras.py`, `tools/hubtest.py`
 - `tests/test_inference.py` -> `station/contracts.py`, `station/inference.py`
 - `tests/test_mes_client.py` -> `station/contracts.py`, `station/mes_client.py`
 - `tests/test_modelstore.py` -> `station/contracts.py`, `station/golden.py`, `station/modelstore.py`
