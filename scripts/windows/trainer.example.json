@@ -1,0 +1,17 @@
+{
+  "_comment": "Copy this file to %USERPROFILE%\\VisionStation\\trainer.json and replace every value that starts with '['. The weekly run refuses to start while any value is still a placeholder. min_good and min_holdout are Quality's numbers, not engineering defaults.",
+  "store": "[Engineer to define: local path of the synced evidence folder, the store/ of the SharePoint Quality/Automotive/VisionStation/evidence folder]",
+  "models": "[Engineer to define: local path of the synced models folder]",
+  "reports": "[Engineer to define: local path of the synced reports folder]",
+  "logs": "[Engineer to define: local folder for weekly run logs, e.g. under %USERPROFILE%\\VisionStation]",
+  "python": "[Engineer to define: python.exe that has torch with CUDA installed, or 'py' if that is the one]",
+  "extractor": {
+    "arch": "[Engineer to define: feature extractor architecture]",
+    "input_hw": ["[Engineer to define: height]", "[Engineer to define: width]"],
+    "weights_path": "[Engineer to define: local path of the extractor weights file]",
+    "device": "[Engineer to define: cuda or cpu]"
+  },
+  "min_good": "[Quality to define]",
+  "min_holdout": "[Quality to define]",
+  "holdout_fraction": "[Quality to define]"
+}

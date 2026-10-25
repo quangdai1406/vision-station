@@ -52,5 +52,6 @@
     "kind": "console"
   },
 
+  "parts": {"mode": "fixed", "models_dir": "./models"},
   "min_flip_s": 2.0
 }

@@ -179,7 +179,7 @@ class PreviewCameras(FakeCameras):
 class Harness:
     def __init__(self, fuse_verdict=Verdict.GOOD, frame_ok=None, max_retakes=2,
                  on_complete=None, initial_counters=None, camera_ids=CAMERA_IDS, fuse=None,
-                 min_flip_s=0.0, cameras=None):
+                 min_flip_s=0.0, cameras=None, part_number="PN-1", with_model=True):
         self.cameras = cameras if cameras is not None else FakeCameras(default_n=len(camera_ids))
         self.model = FakeModel()
         self.outputs = FakeOutputs()
@@ -188,8 +188,8 @@ class Harness:
         self.fuse = fuse if fuse is not None else FakeFuse(fuse_verdict)
         self.completed = []
         self.session = StationSession(
-            self.cameras, self.model, self.outputs, self.store, TH,
-            station_id="ST-1", part_number="PN-1", lot="LOT-1", operator="op",
+            self.cameras, self.model if with_model else None, self.outputs, self.store, TH,
+            station_id="ST-1", part_number=part_number, lot="LOT-1", operator="op",
             supervisor="sup", material_handler="mh",
             frame_ok=frame_ok, max_retakes=max_retakes, clock=self.clock,
             now_utc=lambda: TS, part_id_factory=_Ids("part"),
@@ -535,7 +535,8 @@ class SnapshotTests(_Base):
             set(snap),
             {"state", "counters", "part_id", "machine_verdict", "final_verdict",
              "verdict", "results", "fault", "images", "partial_station", "camera_ids",
-             "prompt", "press_ready", "flip_wait_s"},
+             "prompt", "press_ready", "flip_wait_s", "part_number", "part_selected",
+             "model_version", "can_inspect", "block_reason"},
         )
         self.assertEqual(snap["state"], "IDLE")
         self.assertEqual(snap["counters"], {"total": 0, "good": 0, "bad": 0})
@@ -1399,6 +1400,173 @@ class PreviewTests(_Base):
         cams.error = None
         self.assertEqual(s.preview("C3"), b"preview-C3")
         self.assertEqual(fingerprint(), before)
+
+
+class PartSelectionTests(_Base):
+    """Part number and model chosen at run time (multi-part station)."""
+
+    def _part_model(self, version):
+        m = FakeModel()
+        m.version = version
+        return m
+
+    def test_constructor_without_part_or_model_cannot_inspect(self):
+        h = self.harness(part_number="", with_model=False)
+        s = h.session
+        self.assertEqual(s.state, State.IDLE)
+        self.assertEqual(s.part_number, "")
+        self.assertEqual(s.model_version, "")
+        self.assertIs(s.can_inspect, False)
+        self.assertEqual(s.block_reason, "")
+        self.assertIs(s.snapshot()["part_selected"], False)
+        self.assertIs(s.snapshot()["press_ready"], False)
+        self.assertEqual(s.snapshot()["prompt"], "Choose a part number to start.")
+
+        self.assertFalse(h.press_at(0.0))
+        self.assertEqual(h.cameras.sides, [])
+        self.assertEqual(s.state, State.IDLE)
+        ignored = _events(h, "press_ignored")
+        self.assertEqual(ignored[-1]["reason"], "no_part_or_model")
+        self.assertEqual(ignored[-1]["block_reason"], "")
+
+    def test_constructor_with_part_and_model_can_inspect(self):
+        s = self.harness().session
+        self.assertIs(s.can_inspect, True)
+        self.assertEqual(s.part_number, "PN-1")
+        self.assertEqual(s.model_version, "model-test-1")
+
+    def test_set_part_then_good_part_saves_record_with_new_part_and_model(self):
+        h = self.harness(part_number="", with_model=False, fuse_verdict=Verdict.GOOD)
+        m = self._part_model("model-PN-9-2")
+        h.session.set_part("  PN-9 ", m, "model-PN-9-2")
+        self.assertIs(h.session.can_inspect, True)
+        self.assertEqual(h.session.part_number, "PN-9")
+        self.assertEqual(h.session.model_version, "model-PN-9-2")
+        self.assertEqual(_events(h, "part_selected"),
+                         [{"part_number": "PN-9", "model_version": "model-PN-9-2"}])
+
+        h.complete_part(0.0)
+        self.assertEqual(len(h.store.saved), 1)
+        rec = h.store.saved[0]
+        self.assertEqual(rec.part_number, "PN-9")
+        self.assertEqual(rec.model_version, "model-PN-9-2")
+        self.assertEqual(rec.final_verdict, Verdict.GOOD)
+        self.assertEqual(m.calls, 8)
+        self.assertEqual(h.model.calls, 0)
+
+    def test_set_part_refused_outside_idle(self):
+        cases = {}
+        wf = self.harness()
+        wf.press_at(0.0)
+        cases["WAIT_FLIP"] = wf
+        bad = self.harness(fuse_verdict=Verdict.BAD)
+        bad.complete_part(0.0)
+        cases["VERDICT"] = bad
+        rev = self.harness(fuse_verdict=Verdict.REVIEW)
+        rev.complete_part(0.0)
+        cases["SUPERVISOR_REVIEW"] = rev
+        fault = self.harness()
+        fault.cameras.script = [CameraError("C1 timeout")]
+        fault.press_at(0.0)
+        cases["FAULT"] = fault
+        for name, h in cases.items():
+            with self.subTest(state=name):
+                self.assertEqual(h.session.state, State(name))
+                with self.assertRaises(InvalidTransition):
+                    h.session.set_part("PN-2", self._part_model("v2"), "v2")
+                with self.assertRaises(InvalidTransition):
+                    h.session.clear_part()
+                with self.assertRaises(InvalidTransition):
+                    h.session.set_blocked("reason")
+                self.assertEqual(h.session.part_number, "PN-1")
+                self.assertEqual(h.session.model_version, "model-test-1")
+
+    def test_set_part_validation_raises_value_error(self):
+        h = self.harness(part_number="", with_model=False)
+        for bad_pn in ("", "   "):
+            with self.subTest(part_number=bad_pn):
+                with self.assertRaises(ValueError):
+                    h.session.set_part(bad_pn, self._part_model("v"), "v")
+        with self.assertRaises(ValueError):
+            h.session.set_part("PN-2", None, "v")
+        self.assertIs(h.session.can_inspect, False)
+        self.assertEqual(h.session.part_number, "")
+        self.assertNotIn("part_selected", h.store.kinds())
+
+    def test_clear_part_resets_selection_and_blocks_press(self):
+        h = self.harness()
+        h.session.clear_part()
+        s = h.session
+        self.assertEqual(s.part_number, "")
+        self.assertEqual(s.model_version, "")
+        self.assertIs(s.snapshot()["part_selected"], False)
+        self.assertIs(s.can_inspect, False)
+        self.assertIn("part_cleared", h.store.kinds())
+        self.assertEqual(s.snapshot()["prompt"], "Choose a part number to start.")
+        self.assertFalse(h.press_at(0.0))
+        self.assertEqual(h.cameras.sides, [])
+
+    def test_set_blocked_shows_reason_and_blocks_press_until_cleared(self):
+        h = self.harness()
+        s = h.session
+        s.set_blocked("No approved model for PN-1")
+        snap = s.snapshot()
+        self.assertEqual(snap["block_reason"], "No approved model for PN-1")
+        self.assertEqual(snap["prompt"], "No approved model for PN-1")
+        self.assertIs(snap["can_inspect"], False)
+        self.assertIs(snap["press_ready"], False)
+        self.assertEqual(s.block_reason, "No approved model for PN-1")
+
+        self.assertFalse(h.press_at(0.0))
+        self.assertEqual(h.cameras.sides, [])
+        ignored = _events(h, "press_ignored")[-1]
+        self.assertEqual(ignored["reason"], "no_part_or_model")
+        self.assertEqual(ignored["block_reason"], "No approved model for PN-1")
+
+        s.set_blocked("   ")  # blank clears, like None
+        self.assertIs(s.can_inspect, True)
+        self.assertEqual(s.block_reason, "")
+        self.assertEqual(s.snapshot()["block_reason"], "")
+        self.assertTrue(h.press_at(5.0))
+        self.assertEqual(s.state, State.WAIT_FLIP)
+
+    def test_set_part_clears_block_reason(self):
+        h = self.harness()
+        h.session.set_blocked("no model")
+        h.session.set_part("PN-2", self._part_model("v2"), "v2")
+        self.assertIs(h.session.can_inspect, True)
+        self.assertEqual(h.session.block_reason, "")
+
+    def test_two_parts_back_to_back_get_their_own_part_numbers(self):
+        h = self.harness(part_number="", with_model=False, fuse_verdict=Verdict.GOOD)
+        m1 = self._part_model("v-PN-A-1")
+        h.session.set_part("PN-A", m1, "v-PN-A-1")
+        h.complete_part(0.0)
+        m2 = self._part_model("v-PN-B-1")
+        h.session.set_part("PN-B", m2, "v-PN-B-1")
+        h.complete_part(10.0)
+
+        self.assertEqual([r.part_number for r in h.store.saved], ["PN-A", "PN-B"])
+        self.assertEqual([r.model_version for r in h.store.saved], ["v-PN-A-1", "v-PN-B-1"])
+        self.assertEqual([r.part_id for r in h.store.saved], ["part-1", "part-2"])
+        self.assertEqual(h.session.counters, {"total": 2, "good": 2, "bad": 0})
+        self.assertEqual((m1.calls, m2.calls), (8, 8))
+
+    def test_snapshot_part_keys_reflect_selection(self):
+        h = self.harness()
+        snap = h.session.snapshot()
+        self.assertEqual(snap["part_number"], "PN-1")
+        self.assertIs(snap["part_selected"], True)
+        self.assertEqual(snap["model_version"], "model-test-1")
+        self.assertIs(snap["can_inspect"], True)
+        self.assertEqual(snap["block_reason"], "")
+
+        h.session.clear_part()
+        snap = h.session.snapshot()
+        self.assertEqual(snap["part_number"], "")
+        self.assertIs(snap["part_selected"], False)
+        self.assertEqual(snap["model_version"], "")
+        self.assertIs(snap["can_inspect"], False)
 
 
 if __name__ == "__main__":

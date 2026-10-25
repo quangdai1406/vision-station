@@ -28,12 +28,12 @@ _MAX_P = 4
 _MIN_DIGEST_BYTES = 16
 _MAX_DIGEST_BYTES = 64
 
-ACTIONS = ("press", "ack", "resolve", "override", "clear_fault")
+ACTIONS = ("press", "ack", "resolve", "override", "clear_fault", "select_part")
 ROLES = ("operator", "supervisor", "admin")
 
 _POLICY: dict[str, frozenset[str]] = {
-    "operator": frozenset({"press", "ack"}),
-    "supervisor": frozenset({"press", "ack", "resolve", "override", "clear_fault"}),
+    "operator": frozenset({"press", "ack", "select_part"}),
+    "supervisor": frozenset({"press", "ack", "resolve", "override", "clear_fault", "select_part"}),
     "admin": frozenset(ACTIONS),
 }
 

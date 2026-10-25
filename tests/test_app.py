@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import http.server
 import io
 import json
 import os
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 import urllib.request
 from unittest import mock
 
@@ -28,9 +30,20 @@ from station.app import (
 )
 from station.auth import UserStore, hash_password, load_users
 from station.cameras import FakeCameraSet
-from station.contracts import Frame, Side, StationError, State, is_full_station
+from station.contracts import (
+    CameraError,
+    Frame,
+    InvalidTransition,
+    Side,
+    StationError,
+    State,
+    is_full_station,
+)
 from station.inference import MarkerModel
+from station.mes_client import build_request
+from station.modelstore import ModelStore, safe_part
 from station.outputs import RecordingOutputs
+from station.parts import PartsError
 from station.storage import Store
 
 try:
@@ -721,6 +734,94 @@ class PreviewWrapperTests(unittest.TestCase):
         lock.release()
 
 
+class ScriptedCameras(FakeCameraSet):
+    """A FakeCameraSet whose open() succeeds or raises, like OpenCvCameraSet.open()."""
+
+    def __init__(self, open_error=None) -> None:
+        super().__init__()
+        self._open_error = open_error
+        self.open_calls = 0
+        self._open = False
+        self._last_error = None
+
+    def open(self) -> None:
+        self.open_calls += 1
+        if self._open_error is not None:
+            self._last_error = str(self._open_error) or type(self._open_error).__name__
+            raise self._open_error
+        self._open = True
+        self._last_error = None
+
+    @property
+    def is_open(self) -> bool:
+        return self._open
+
+    @property
+    def last_open_error(self):
+        return self._last_error
+
+
+class CameraOpenTests(TmpCase):
+    def setUp(self) -> None:
+        super().setUp()
+        with open(os.path.join(self.tmp, "users.json"), "w", encoding="utf-8") as fh:
+            json.dump({"op1": {"password_hash": hash_password("operator-pass-1"), "role": "operator"}}, fh)
+
+    def _app(self, cameras) -> StationApp:
+        app = build_station(base_config(self.tmp), cameras=cameras, model=MarkerModel("test-1"),
+                            outputs=RecordingOutputs(), clock=FakeClock())
+        self.addCleanup(app.stop)
+        return app
+
+    def test_start_opens_the_cameras_once_and_logs_camera_open(self) -> None:
+        cams = ScriptedCameras()
+        app = self._app(cams)
+        app.start()
+        app.stop()
+        self.assertEqual(cams.open_calls, 1)
+        rows = BuildTests._events(app.store, "camera_open")
+        self.assertEqual(len(rows), 1)
+        self.assertIn('"C1"', rows[0]["payload_json"])
+        self.assertNotIn("camera_open_failed", BuildTests._event_kinds(app.store))
+        self.assertEqual(app.camera_status(), {"open": True, "last_error": None})
+
+    def test_failed_open_is_logged_printed_and_does_not_stop_start(self) -> None:
+        cams = ScriptedCameras(open_error=CameraError("C1: could not open device 0"))
+        app = self._app(cams)
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            app.start()  # must not raise
+        app.stop()
+        self.assertEqual(cams.open_calls, 1)
+        rows = BuildTests._events(app.store, "camera_open_failed")
+        self.assertEqual(len(rows), 1)
+        self.assertIn("could not open device 0", rows[0]["payload_json"])
+        self.assertNotIn("camera_open", BuildTests._event_kinds(app.store))
+        self.assertEqual(
+            err.getvalue(),
+            "camera not opened: C1: could not open device 0. "
+            "The live view will keep retrying every few seconds.\n",
+        )
+        self.assertEqual(app.camera_status(), {"open": False, "last_error": "C1: could not open device 0"})
+
+    def test_non_camera_error_from_open_is_also_contained(self) -> None:
+        app = self._app(ScriptedCameras(open_error=RuntimeError("driver busy")))
+        with mock.patch("sys.stderr", io.StringIO()):
+            app.start()
+        app.stop()
+        rows = BuildTests._events(app.store, "camera_open_failed")
+        self.assertIn("driver busy", rows[0]["payload_json"])
+
+    def test_fake_cameras_have_no_open_call_and_report_open(self) -> None:
+        app = self._app(FakeCameraSet())
+        app.start()
+        app.stop()
+        kinds = BuildTests._event_kinds(app.store)
+        self.assertNotIn("camera_open", kinds)
+        self.assertNotIn("camera_open_failed", kinds)
+        self.assertEqual(app.camera_status(), {"open": True, "last_error": None})
+
+
 class UsersCliTests(TmpCase):
     def run_cli(self, argv, passwords=("correct horse 1", "correct horse 1")):
         feed = iter(passwords)
@@ -801,6 +902,372 @@ class MainTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertIn("config error", proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
+
+
+class PartsConfigTests(TmpCase):
+    def test_parts_default_is_fixed_and_models_dir_is_resolved_from_the_config_folder(self) -> None:
+        cfg = load_config(self.write_config(base_config(self.tmp)))
+        self.assertEqual(cfg["parts"], {
+            "mode": "fixed",
+            "models_dir": os.path.join(os.path.realpath(self.tmp), "models"),
+        })
+        self.assertEqual(cfg["part_number"], "PN-100")
+
+    def test_mes_mode_may_omit_part_number_but_needs_an_existing_models_dir(self) -> None:
+        data = base_config(self.tmp)
+        del data["part_number"]
+        data["parts"] = {"mode": "mes", "models_dir": os.path.join(self.tmp, "models")}
+        with self.assertRaisesRegex(ConfigError, "parts.models_dir .* does not exist"):
+            validate_config(data)
+        os.makedirs(os.path.join(self.tmp, "models"))
+        cfg = validate_config(data)
+        self.assertEqual(cfg["part_number"], "")
+        self.assertEqual(cfg["parts"]["mode"], "mes")
+
+    def test_fixed_mode_still_requires_part_number(self) -> None:
+        data = base_config(self.tmp)
+        del data["part_number"]
+        with self.assertRaisesRegex(ConfigError, "part_number"):
+            validate_config(data)
+
+    def test_parts_section_rules_are_enforced(self) -> None:
+        cases = (
+            ({"mode": "auto"}, "parts.mode must be 'fixed' or 'mes'"),
+            ({"models": "x"}, "unknown key"),
+            ({"models_dir": ""}, "parts.models_dir must be a non-empty string"),
+            ("mes", "parts must be a JSON object"),
+        )
+        for raw, message in cases:
+            data = base_config(self.tmp)
+            data["parts"] = raw
+            with self.assertRaisesRegex(ConfigError, message):
+                validate_config(data)
+
+    def test_extractor_section_rules_are_enforced(self) -> None:
+        data = base_config(self.tmp)
+        data["model"] = {"kind": "golden", "path": os.path.join(self.tmp, "g.npz"), "version": "v1",
+                         "extractor": {"arch": "vgg16", "input_hw": [320, 320]}}
+        with self.assertRaisesRegex(ConfigError, "model.extractor.arch"):
+            validate_config(data)
+        data["model"]["extractor"] = {"arch": "resnet18", "input_hw": [16, 16]}
+        with self.assertRaisesRegex(ConfigError, "at least 32"):
+            validate_config(data)
+        data["model"]["extractor"] = {"arch": "resnet18", "input_hw": [320, 320], "device": "tpu"}
+        with self.assertRaisesRegex(ConfigError, "device"):
+            validate_config(data)
+        data["model"]["extractor"] = {"arch": "resnet18", "input_hw": [320, 320]}
+        self.assertEqual(validate_config(data)["model"]["extractor"]["device"], "auto")
+
+
+class MesPartsFakeHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        fake = self.server.fake  # type: ignore[attr-defined]
+        url = urllib.parse.urlsplit(self.path)
+        fake.requests.append((url.path, self.headers.get("Authorization")))
+        if self.headers.get("Authorization") != f"Bearer {FAKE_MES_TOKEN}":
+            status, data = 401, {"error": "unauthorized"}
+        elif url.path == "/api/machine/parts/search":
+            status, data = 200, FAKE_SEARCH
+        elif url.path.startswith("/api/machine/parts/"):
+            pn = urllib.parse.unquote(url.path[len("/api/machine/parts/"):])
+            status, data = (200, fake.parts[pn]) if pn in fake.parts else (404, {"error": "not found"})
+        elif url.path.startswith("/api/machine/criteria/"):
+            pn = urllib.parse.unquote(url.path[len("/api/machine/criteria/"):])
+            status, data = (200, fake.criteria[pn]) if pn in fake.criteria else (404, {"error": "not found"})
+        else:
+            status, data = 404, {"error": "not found"}
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args) -> None:  # keep test output quiet
+        pass
+
+
+FAKE_MES_TOKEN = "fake-token-for-tests-only-0002"
+FAKE_SEARCH = [{"part_number": "PN-A", "name": "Liner left"}, {"part_number": "PN-B", "name": "Liner right"}]
+FAKE_PARTS = {
+    "PN-A": {"part_number": "PN-A", "name": "Liner left"},
+    "PN-B": {"part_number": "PN-B", "name": "Liner right"},
+}
+FAKE_CRITERIA = {
+    "PN-A": [
+        {"id": "CR-1", "criteria_name": "Scratch", "check_type": "visual", "active": True},
+        {"id": "CR-2", "criteria_name": "Dent", "check_type": "visual", "active": True},
+    ],
+    "PN-B": [
+        {"id": "CR-7", "criteria_name": "Crack", "check_type": "visual", "active": True},
+    ],
+}
+
+
+class FakeMes:
+    """A local MES stand-in for the part search, part lookup and criteria routes."""
+
+    def __init__(self) -> None:
+        self.parts = copy.deepcopy(FAKE_PARTS)
+        self.criteria = copy.deepcopy(FAKE_CRITERIA)
+        self.requests: list[tuple[str, str]] = []
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MesPartsFakeHandler)
+        self.server.fake = self  # type: ignore[attr-defined]
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(5)
+
+
+class PartTestCase(TmpCase):
+    def setUp(self) -> None:
+        super().setUp()
+        with open(os.path.join(self.tmp, "users.json"), "w", encoding="utf-8") as fh:
+            json.dump({"op1": {"password_hash": hash_password("operator-pass-1"), "role": "operator"}}, fh)
+        self.models_dir = os.path.join(self.tmp, "models")
+        os.makedirs(self.models_dir)
+        self.fake = FakeMes()
+        self.addCleanup(self.fake.close)
+
+    def mes_config(self) -> dict:
+        cfg = base_config(self.tmp)
+        del cfg["part_number"]
+        cfg["mes"]["base_url"] = self.fake.base
+        cfg["parts"] = {"mode": "mes", "models_dir": self.models_dir}
+        return cfg
+
+    def build(self, cfg=None, token=FAKE_MES_TOKEN, clock=None, cameras=None) -> StationApp:
+        app = build_station(
+            cfg if cfg is not None else self.mes_config(),
+            cameras=cameras if cameras is not None else FakeCameraSet(),
+            outputs=RecordingOutputs(),
+            clock=clock or FakeClock(),
+            token=token,
+        )
+        self.addCleanup(app.stop)
+        return app
+
+    def approve_model(self, part_number: str, model_file: str, model_type: str = "golden",
+                      version: str = "2026-10-24-a"):
+        store = ModelStore(self.models_dir)
+        store.add_candidate(part_number, version, pathlib.Path(model_file),
+                            {"type": model_type, "camera_ids": ["C1", "C2", "C3", "C4"]},
+                            "2026-10-24T08:00:00Z")
+        return store.approve(part_number, version, by="quality.engineer", reason="approved for test",
+                             now_utc="2026-10-24T08:01:00Z")
+
+
+class MesPartsTests(PartTestCase):
+    def test_mes_mode_starts_with_no_part_and_no_model(self) -> None:
+        app = self.build()
+        self.assertFalse(app.session.can_inspect)
+        cp = app.current_part()
+        self.assertEqual(cp["parts_mode"], "mes")
+        self.assertFalse(cp["can_inspect"])
+        self.assertFalse(cp["part_number"])
+        self.assertEqual(app._locked.snapshot()["parts_mode"], "mes")
+
+    def test_search_returns_the_mes_list_with_the_token(self) -> None:
+        app = self.build()
+        self.assertEqual(app.search_parts("PN", 5), FAKE_SEARCH)
+        self.assertIn(f"Bearer {FAKE_MES_TOKEN}", [auth for _, auth in self.fake.requests])
+        with self.assertRaises(ValueError):
+            app.search_parts("   ")
+
+    def test_without_a_token_part_search_and_selection_are_unavailable(self) -> None:
+        app = self.build(token="")
+        with self.assertRaisesRegex(PartsError, "MES token not set: part search is unavailable"):
+            app.search_parts("PN")
+        with self.assertRaisesRegex(PartsError, "MES token not set"):
+            app.select_part("PN-A", "op1")
+
+    def test_unknown_part_raises_parts_error_and_changes_nothing(self) -> None:
+        app = self.build()
+        with self.assertRaisesRegex(PartsError, "part NOPE not found in the MES"):
+            app.select_part("NOPE", "op1")
+        self.assertFalse(app.session.can_inspect)
+
+    def test_part_without_an_approved_model_is_blocked_and_press_is_ignored(self) -> None:
+        self.fake.criteria["PN-A"].append(
+            {"id": "CR-9", "criteria_name": "Bore diameter", "check_type": "measurement", "active": True})
+        app = self.build()
+        result = app.select_part("PN-A", "op1")
+        self.assertEqual(result["part_number"], "PN-A")
+        self.assertFalse(result["can_inspect"])
+        self.assertEqual(result["reason"], "No approved model for part PN-A. Ask Quality to approve one.")
+        self.assertEqual(app.session.block_reason, result["reason"])
+        self.assertFalse(app.session.can_inspect)
+        self.assertEqual(len(result["warnings"]), 1)
+        self.assertIn("CR-9", result["warnings"][0])
+        self.assertFalse(app.session.press())
+        self.assertEqual(app.session.counters["total"], 0)
+        self.assertEqual(app.session.state, State.IDLE)
+
+    def test_patchcore_part_without_torch_is_blocked_with_the_torch_reason(self) -> None:
+        model_file = os.path.join(self.tmp, "anomaly.npz")
+        with open(model_file, "wb") as fh:
+            fh.write(b"not a real model: torch is missing, so it is never read")
+        self.approve_model("PN-A", model_file, model_type="patchcore")
+        app = self.build()
+        with mock.patch("station.app._torch_importable", return_value=False):
+            result = app.select_part("PN-A", "op1")
+        self.assertFalse(result["can_inspect"])
+        self.assertEqual(result["reason"], "This part needs the anomaly model, which needs torch on this PC.")
+        self.assertFalse(app.session.can_inspect)
+
+    def test_fixed_station_refuses_part_calls(self) -> None:
+        app = build_station(base_config(self.tmp), cameras=FakeCameraSet(), model=MarkerModel("test-1"),
+                            outputs=RecordingOutputs(), clock=FakeClock(), token=FAKE_MES_TOKEN)
+        self.addCleanup(app.stop)
+        with self.assertRaisesRegex(ValueError, "configured for a fixed part"):
+            app.select_part("PN-A", "op1")
+        with self.assertRaisesRegex(ValueError, "configured for a fixed part"):
+            app.search_parts("PN")
+        cp = app.current_part()
+        self.assertEqual(cp["parts_mode"], "fixed")
+        self.assertEqual(cp["part_number"], "PN-100")
+
+    def test_snapshot_reports_parts_mode_and_camera_state(self) -> None:
+        app = build_station(base_config(self.tmp), cameras=FakeCameraSet(), model=MarkerModel("test-1"),
+                            outputs=RecordingOutputs(), clock=FakeClock())
+        self.addCleanup(app.stop)
+        snap = app._locked.snapshot()
+        self.assertEqual(snap["parts_mode"], "fixed")
+        self.assertEqual(snap["camera"], {"open": True, "last_error": None})
+
+        cams = ScriptedCameras(open_error=CameraError("C1: could not open device 0"))
+        with self.assertRaises(CameraError):
+            cams.open()
+        app = self.build(cameras=cams)
+        self.assertEqual(app._locked.snapshot()["camera"],
+                         {"open": False, "last_error": "C1: could not open device 0"})
+
+    def test_locked_wrapper_delegates_the_part_calls(self) -> None:
+        app = self.build()
+        wrapped = app._locked
+        self.assertEqual(wrapped.search_parts("PN", 3), FAKE_SEARCH)
+        self.assertEqual(wrapped.current_part()["parts_mode"], "mes")
+        with self.assertRaisesRegex(PartsError, "not found"):
+            wrapped.select_part("NOPE", "op1")
+
+
+@unittest.skipUnless(HAVE_NUMPY, "numpy is needed to build a golden model")
+class GoldenPartTests(PartTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        import numpy as np
+
+        from station.golden import GoldenBuilder
+
+        def decode(frame: Frame):  # the bytes are one grey value: a flat 8x8 image
+            return np.full((8, 8), float(frame.data[0]))
+
+        patcher = mock.patch("station.golden.cv2_decoder", return_value=decode)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        builder = GoldenBuilder(decode)
+        for camera_id in ("C1", "C2", "C3", "C4"):
+            for side in (Side.TOP, Side.BOTTOM):
+                for value in (100, 102, 98):
+                    builder.add(Frame(camera_id=camera_id, side=side, seq=0,
+                                      timestamp_utc="2026-10-24T08:00:00Z", data=bytes([value])))
+        self.golden_file = os.path.join(self.tmp, "golden.npz")
+        builder.build("file-version").save(self.golden_file)
+        self.clock = FakeClock()
+
+    def good_cameras(self) -> FakeCameraSet:
+        return FakeCameraSet(frame_bytes=lambda cam, side, n: bytes([100]))
+
+    def test_approved_model_lets_a_good_part_be_stored(self) -> None:
+        self.approve_model("PN-A", self.golden_file)
+        app = self.build(clock=self.clock, cameras=self.good_cameras())
+        result = app.select_part("PN-A", "op1")
+        self.assertTrue(result["can_inspect"])
+        self.assertEqual(result["model_version"], "2026-10-24-a")
+        self.assertEqual(result["warnings"], [])
+        self.assertTrue(app.session.can_inspect)
+        self.assertEqual(app.current_part()["model_version"], "2026-10-24-a")
+
+        self.assertTrue(app.session.press())
+        self.clock.now += PAST_MIN_FLIP
+        self.assertTrue(app.session.press())
+        self.assertEqual(app.session.counters, {"total": 1, "good": 1, "bad": 0})
+        part = app.store.recent_parts(1)[0]
+        with open(os.path.join(part["path"], "part.json"), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        self.assertEqual(doc["part_number"], "PN-A")
+        self.assertEqual(doc["model_version"], "2026-10-24-a")
+        self.assertIn("part_selected", BuildTests._event_kinds(app.store))
+
+    def test_tampered_approved_model_blocks_the_part_with_the_error(self) -> None:
+        self.approve_model("PN-A", self.golden_file)
+        model_path = os.path.join(self.models_dir, safe_part("PN-A"), "2026-10-24-a", "golden.npz")
+        with open(model_path, "ab") as fh:
+            fh.write(b"tampered")
+        app = self.build(clock=self.clock, cameras=self.good_cameras())
+        result = app.select_part("PN-A", "op1")
+        self.assertFalse(result["can_inspect"])
+        self.assertIn("is not usable", result["reason"])
+        self.assertIn("sha256", result["reason"])
+        self.assertFalse(app.session.can_inspect)
+        self.assertFalse(app.session.press())
+
+    def test_switching_parts_posts_each_parts_own_criteria(self) -> None:
+        self.approve_model("PN-A", self.golden_file)
+        self.approve_model("PN-B", self.golden_file)
+        app = self.build(clock=self.clock, cameras=self.good_cameras())
+        seen: list[tuple[str, list, dict]] = []
+
+        def spy(record, cfg, archive_ref):
+            fields, files = build_request(record, cfg, archive_ref)
+            seen.append((record.part_number, list(cfg.criteria_ids),
+                         json.loads(fields["checklistResults"])))
+            return fields, files
+
+        with mock.patch("station.app.build_request", side_effect=spy):
+            for pn in ("PN-A", "PN-B"):
+                self.assertTrue(app.select_part(pn, "op1")["can_inspect"])
+                self.clock.now += PAST_MIN_FLIP
+                self.assertTrue(app.session.press())
+                self.clock.now += PAST_MIN_FLIP
+                self.assertTrue(app.session.press())
+
+        self.assertEqual([s[0] for s in seen], ["PN-A", "PN-B"])
+        self.assertEqual(seen[0][1], ["CR-1", "CR-2"])
+        self.assertEqual(sorted(seen[0][2]), ["CR-1", "CR-2"])
+        self.assertEqual(seen[1][1], ["CR-7"])
+        self.assertEqual(sorted(seen[1][2]), ["CR-7"])
+        self.assertEqual(app.session.counters["total"], 2)
+        self.assertEqual(app.outbox.pending_count(), 2)
+
+    def test_selecting_during_a_part_is_refused(self) -> None:
+        self.approve_model("PN-A", self.golden_file)
+        self.approve_model("PN-B", self.golden_file)
+        app = self.build(clock=self.clock, cameras=self.good_cameras())
+        app.select_part("PN-A", "op1")
+        self.assertTrue(app.session.press())  # TOP: the part is now waiting for the flip
+        with self.assertRaises(InvalidTransition):
+            app.select_part("PN-B", "op1")
+        self.assertEqual(app.session.part_number, "PN-A")
+        self.assertEqual(app.session.state, State.WAIT_FLIP)
+
+    def test_part_without_cached_criteria_logs_mes_enqueue_failed(self) -> None:
+        self.approve_model("PN-A", self.golden_file)
+        app = self.build(clock=self.clock, cameras=self.good_cameras())
+        app.select_part("PN-A", "op1")
+        app._part_configs.clear()  # simulate a lost cache: posting must fail, not raise
+        self.assertTrue(app.session.press())
+        self.clock.now += PAST_MIN_FLIP
+        self.assertTrue(app.session.press())
+        self.assertEqual(app.session.counters["total"], 1)
+        rows = BuildTests._events(app.store, "mes_enqueue_failed")
+        self.assertEqual(len(rows), 1)
+        self.assertIn("PN-A", rows[0]["payload_json"])
+        self.assertEqual(app.outbox.pending_count(), 0)
 
 
 if __name__ == "__main__":
