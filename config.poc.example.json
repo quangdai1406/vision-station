@@ -38,6 +38,7 @@
   "cameras": {
     "kind": "opencv",
     "devices": [0],
+    "capture_mode": "simultaneous",
     "width": 1920,
     "height": 1080
   },

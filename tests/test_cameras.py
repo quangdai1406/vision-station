@@ -896,7 +896,13 @@ class StatusTests(unittest.TestCase):
     def test_fake_camera_set_status(self):
         self.assertEqual(
             FakeCameraSet().status(),
-            {"open": True, "last_error": None, "consecutive_failures": 0},
+            {
+                "open": True,
+                "last_error": None,
+                "consecutive_failures": 0,
+                "capture_mode": "simultaneous",
+                "sequential_keep_open": False,
+            },
         )
 
     def test_opencv_status_tracks_open_error_and_failures(self):
@@ -913,11 +919,292 @@ class StatusTests(unittest.TestCase):
         cv2.VideoCapture = lambda index: _recorded(_working)(cv2, index)
         cams.open()
         self.assertEqual(
-            cams.status(), {"open": True, "last_error": None, "consecutive_failures": 0}
+            cams.status(),
+            {
+                "open": True,
+                "last_error": None,
+                "consecutive_failures": 0,
+                "capture_mode": "simultaneous",
+                "sequential_keep_open": False,
+            },
         )
         cv2.captures[-1].grab_ok = False
         self.assertIsNone(cams.preview("C1"))
         self.assertEqual(cams.status()["consecutive_failures"], 1)
+
+
+def _logged_opens(cv2, make=_working):
+    """VideoCapture factory that logs ("open", index), so open/release order can be checked."""
+
+    def video_capture(index):
+        cv2.log.append(("open", index))
+        return make(cv2, index)
+
+    return video_capture
+
+
+def _peak_open(log):
+    """Most devices open at once, from the ("open", i) and ("release", i) entries of a log."""
+    now = peak = 0
+    for entry in log:
+        if entry[0] == "open":
+            now += 1
+            peak = max(peak, now)
+        elif entry[0] == "release":
+            now -= 1
+    return peak
+
+
+def _device_ops(log):
+    return [e for e in log if e[0] in ("open", "grab", "retrieve", "release")]
+
+
+def _opens_of(log, index):
+    return sum(1 for e in log if e == ("open", index))
+
+
+class _Ticker:
+    """Monotonic clock that moves 1.0 s on every read: 0, 1, 2, ..."""
+
+    def __init__(self):
+        self.n = -1
+
+    def __call__(self):
+        self.n += 1
+        return float(self.n)
+
+
+class SequentialCaptureTests(unittest.TestCase):
+    def test_capture_mode_must_be_simultaneous_or_sequential(self):
+        with self.assertRaises(ValueError):
+            OpenCvCameraSet([0, 1, 2, 3], cv2_module=FakeCv2(), capture_mode="parallel")
+        with self.assertRaises(ValueError):
+            FakeCameraSet(capture_mode="parallel")
+
+    def test_status_reports_capture_mode_and_keep_open(self):
+        cams = OpenCvCameraSet(
+            [0, 1], cv2_module=FakeCv2(), capture_mode="sequential", sequential_keep_open=True
+        )
+        status = cams.status()
+        self.assertEqual(status["capture_mode"], "sequential")
+        self.assertIs(status["sequential_keep_open"], True)
+
+    def test_sequential_shoots_c1_to_c4_one_device_at_a_time(self):
+        cv2 = FakeCv2()
+        cv2.VideoCapture = _logged_opens(cv2)
+        cams = OpenCvCameraSet(
+            [0, 1, 2, 3],
+            cv2_module=cv2,
+            now_utc=_fixed_clock(),
+            capture_mode="sequential",
+            open_warmup_frames=0,
+            stale_flush_frames=0,
+        )
+        frames = cams.capture(Side.TOP)
+        self.assertEqual([f.camera_id for f in frames], list(CAMERA_IDS))
+        self.assertEqual([f.seq for f in frames], [0, 1, 2, 3])
+        self.assertEqual(
+            [f.data for f in frames], [b"PNG:img0", b"PNG:img1", b"PNG:img2", b"PNG:img3"]
+        )
+        self.assertEqual(
+            [f.timestamp_utc for f in frames],
+            [f"2026-10-23T08:30:0{i}Z" for i in range(4)],
+        )
+        expected = []
+        for i in range(4):
+            expected += [("open", i), ("grab", i), ("retrieve", i), ("release", i)]
+        self.assertEqual(_device_ops(cv2.log), expected)
+        self.assertEqual(_peak_open(cv2.log), 1)
+        self.assertFalse(cams.is_open)
+
+    def test_open_per_shot_with_default_warmup_and_flush_never_holds_two_devices(self):
+        cv2 = FakeCv2()
+        cv2.VideoCapture = _logged_opens(cv2)
+        cams = OpenCvCameraSet(
+            [0, 1, 2, 3], cv2_module=cv2, now_utc=_fixed_clock(), capture_mode="sequential"
+        )
+        frames = cams.capture(Side.BOTTOM)
+        self.assertEqual([f.camera_id for f in frames], list(CAMERA_IDS))
+        self.assertEqual([e[1] for e in cv2.log if e[0] == "open"], [0, 1, 2, 3])
+        self.assertEqual(_peak_open(cv2.log), 1)
+        self.assertEqual(sorted(e[1] for e in cv2.log if e[0] == "release"), [0, 1, 2, 3])
+
+    def test_keep_open_opens_all_but_never_grabs_two_before_retrieving_the_first(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet(
+            [0, 1, 2, 3],
+            cv2_module=cv2,
+            now_utc=_fixed_clock(),
+            capture_mode="sequential",
+            sequential_keep_open=True,
+            open_warmup_frames=0,
+        )
+        cams.open()
+        self.assertEqual(len(cv2.captures), 4)
+        cv2.log.clear()
+        frames = cams.capture(Side.TOP)
+        self.assertEqual([f.camera_id for f in frames], list(CAMERA_IDS))
+        self.assertEqual(len(cv2.captures), 4)  # nothing reopened
+        # Per camera: two stale-flush grabs, the real grab, then its retrieve.
+        expected = []
+        for i in range(4):
+            expected += [("grab", i), ("grab", i), ("grab", i), ("retrieve", i)]
+        self.assertEqual([e for e in cv2.log if e[0] in ("grab", "retrieve")], expected)
+        self.assertEqual([e for e in cv2.log if e[0] == "release"], [])
+        self.assertTrue(cams.is_open)
+
+    def test_failure_on_camera_3_releases_everything_and_next_capture_reopens(self):
+        for keep_open in (False, True):
+            with self.subTest(keep_open=keep_open):
+                cv2 = FakeCv2()
+                state = {"fail": True}
+
+                def make(cv2, index, state=state):
+                    cap = FakeCapture(cv2, index, cv2.log)
+                    if index == 2 and state["fail"]:
+                        cap.grab_ok = False
+                    return cap
+
+                cv2.VideoCapture = _logged_opens(cv2, make)
+                cams = OpenCvCameraSet(
+                    [0, 1, 2, 3],
+                    cv2_module=cv2,
+                    now_utc=_fixed_clock(),
+                    capture_mode="sequential",
+                    sequential_keep_open=keep_open,
+                    open_warmup_frames=0,
+                )
+                with self.assertRaises(CameraError) as ctx:
+                    cams.capture(Side.TOP)
+                self.assertIn("C3", str(ctx.exception))
+                self.assertFalse(cams.is_open)
+                released = sorted(e[1] for e in cv2.log if e[0] == "release")
+                # Open-per-shot never opened C4; keep-open had opened all four up front.
+                self.assertEqual(released, [0, 1, 2, 3] if keep_open else [0, 1, 2])
+                self.assertEqual(
+                    [e[1] for e in cv2.log if e[0] == "open"],
+                    [0, 1, 2, 3] if keep_open else [0, 1, 2],
+                )
+
+                state["fail"] = False
+                cv2.log.clear()
+                frames = cams.capture(Side.TOP)  # no cooldown for capture
+                self.assertEqual([f.camera_id for f in frames], list(CAMERA_IDS))
+                self.assertEqual([e[1] for e in cv2.log if e[0] == "open"], [0, 1, 2, 3])
+                self.assertEqual(_peak_open(cv2.log), 1 if not keep_open else 4)
+
+    def test_timing_attributes_are_set_in_both_modes(self):
+        for mode in ("simultaneous", "sequential"):
+            with self.subTest(mode=mode):
+                cams = OpenCvCameraSet(
+                    [0, 1, 2, 3],
+                    cv2_module=FakeCv2(),
+                    now_utc=_fixed_clock(),
+                    monotonic=_Ticker(),
+                    capture_mode=mode,
+                )
+                cams.capture(Side.TOP)
+                # Each camera's grab takes one tick; grab ends are 1, 3, 5, 7.
+                self.assertEqual(cams.last_capture_times_s, [1.0, 1.0, 1.0, 1.0])
+                self.assertEqual(cams.last_skew_s, 6.0)
+                self.assertEqual(cams.last_capture_total_s, 7.0)
+
+
+class SequentialPreviewTests(unittest.TestCase):
+    def test_round_robin_opens_one_device_at_a_time_and_serves_cached_frames_off_turn(self):
+        cv2 = FakeCv2()
+        cv2.VideoCapture = _logged_opens(cv2)
+        cams = OpenCvCameraSet(
+            [0, 1, 2, 3], cv2_module=cv2, now_utc=_fixed_clock(), capture_mode="sequential"
+        )
+        # Every call grabs the turn camera and caches it, whatever was requested.
+        results = [
+            cams.preview("C1"),  # turn C1: fresh
+            cams.preview("C2"),  # turn C2: fresh
+            cams.preview("C1"),  # turn C3: C1 from the cache
+            cams.preview("C3"),  # turn C4: C3 cached on its turn two calls ago
+            cams.preview("C3"),  # turn C1: C3 from the cache
+            cams.preview("C4"),  # turn C2: C4 cached on turn C4
+            cams.preview("C3"),  # turn C3: fresh
+        ]
+        self.assertEqual(
+            results,
+            [b"JPG:img0", b"JPG:img1", b"JPG:img0", b"JPG:img2", b"JPG:img2", b"JPG:img3", b"JPG:img2"],
+        )
+        self.assertEqual(_peak_open(cv2.log), 1)
+        self.assertFalse(cams.is_open)
+
+    def test_failed_open_waits_for_the_cooldown_for_that_camera_only(self):
+        cv2 = FakeCv2()
+
+        def make(cv2, index):
+            return _closed(cv2, index) if index == 1 else FakeCapture(cv2, index, cv2.log)
+
+        cv2.VideoCapture = _logged_opens(cv2, make)
+        clock = _Clock(100.0)
+        cams = OpenCvCameraSet(
+            [0, 1],
+            cv2_module=cv2,
+            monotonic=clock,
+            reopen_cooldown_s=5.0,
+            capture_mode="sequential",
+        )
+        self.assertEqual(cams.preview("C1"), b"JPG:img0")  # turn C1
+        self.assertIsNone(cams.preview("C2"))  # turn C2: the open fails
+        self.assertEqual(_opens_of(cv2.log, 1), 1)
+        self.assertIn("C2", cams.last_open_error)
+        self.assertEqual(cams.preview("C1"), b"JPG:img0")  # turn C1 still works
+
+        self.assertIsNone(cams.preview("C2"))  # turn C2 inside the cooldown: no open attempt
+        self.assertEqual(_opens_of(cv2.log, 1), 1)
+
+        clock.now = 105.0
+        cams.preview("C1")
+        self.assertIsNone(cams.preview("C2"))  # turn C2 after the cooldown: tried again
+        self.assertEqual(_opens_of(cv2.log, 1), 2)
+
+    def test_keep_open_preview_opens_one_device_per_turn_and_keeps_it(self):
+        cv2 = FakeCv2()
+        cams = OpenCvCameraSet(
+            [0, 1, 2, 3],
+            cv2_module=cv2,
+            now_utc=_fixed_clock(),
+            capture_mode="sequential",
+            sequential_keep_open=True,
+            open_warmup_frames=0,
+        )
+        cams.preview("C1")
+        self.assertEqual(len(cv2.captures), 1)
+        for cam in ("C2", "C3", "C4"):
+            cams.preview(cam)
+        self.assertEqual(len(cv2.captures), 4)
+        self.assertEqual([e for e in cv2.log if e[0] == "release"], [])
+        self.assertTrue(cams.is_open)
+        frames = cams.capture(Side.TOP)
+        self.assertEqual(len(frames), 4)
+        self.assertEqual(len(cv2.captures), 4)  # the capture reuses the open devices
+
+
+class FakeCaptureModeTests(unittest.TestCase):
+    def test_fake_records_the_order_of_camera_shots(self):
+        cams = FakeCameraSet(capture_mode="sequential", sequential_keep_open=True)
+        cams.capture(Side.TOP)
+        cams.capture(Side.BOTTOM)
+        self.assertEqual(
+            cams.capture_order,
+            [("TOP", c) for c in CAMERA_IDS] + [("BOTTOM", c) for c in CAMERA_IDS],
+        )
+        self.assertIsNone(cams.last_capture_total_s)
+        self.assertEqual(
+            cams.status(),
+            {
+                "open": True,
+                "last_error": None,
+                "consecutive_failures": 0,
+                "capture_mode": "sequential",
+                "sequential_keep_open": True,
+            },
+        )
 
 
 if __name__ == "__main__":

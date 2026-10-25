@@ -56,6 +56,8 @@ DEFAULT_MIN_FLIP_S = 2.0
 DEFAULT_CAMERA_WIDTH = 2560
 DEFAULT_CAMERA_HEIGHT = 1440
 DEFAULT_BAD_DISPOSITION = "quarantine"
+DEFAULT_CAPTURE_MODE = "simultaneous"
+_CAPTURE_MODES = ("simultaneous", "sequential")
 
 _PLACEHOLDER_RE = re.compile(r"^\[.*\]$")
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
@@ -203,8 +205,15 @@ def _validate_mes(raw: Any) -> dict:
 def _validate_cameras(raw: Any) -> dict:
     path = "cameras"
     cams = _obj(raw, path)
-    _check_keys(cams, ("kind", "devices", "camera_count", "camera_ids", "width", "height", "manual"),
+    _check_keys(cams, ("kind", "devices", "camera_count", "camera_ids", "width", "height", "manual",
+                       "capture_mode", "sequential_keep_open"),
                 path, required=("kind",))
+    capture_mode = cams.get("capture_mode", DEFAULT_CAPTURE_MODE)
+    if capture_mode not in _CAPTURE_MODES:
+        raise ConfigError("cameras.capture_mode must be 'simultaneous' or 'sequential'")
+    if capture_mode == "simultaneous" and "sequential_keep_open" in cams:
+        raise ConfigError("cameras.sequential_keep_open only applies when cameras.capture_mode "
+                          "is 'sequential'; remove it or set capture_mode to 'sequential'")
     kind = cams["kind"]
     if kind not in ("fake", "opencv"):
         raise ConfigError("cameras.kind must be 'fake' or 'opencv'")
@@ -241,7 +250,12 @@ def _validate_cameras(raw: Any) -> dict:
         "width": _int(cams.get("width", DEFAULT_CAMERA_WIDTH), "cameras.width", lo=1, hi=100000),
         "height": _int(cams.get("height", DEFAULT_CAMERA_HEIGHT), "cameras.height", lo=1, hi=100000),
         "manual": manual,
+        "capture_mode": capture_mode,
     }
+    if capture_mode == "sequential":
+        # Only written for sequential mode, so a validated config validates again to the same value.
+        out["sequential_keep_open"] = _bool(cams.get("sequential_keep_open", False),
+                                            "cameras.sequential_keep_open")
     if kind == "fake":
         out["camera_count"] = count  # kept so a validated config validates again to the same value
     return out
@@ -664,9 +678,16 @@ class StationApp:
         cams = cfg["cameras"]
         if cams["kind"] == "fake":
             return FakeCameraSet(camera_ids=cams["camera_ids"])
+        # The capture kwargs are passed only in sequential mode, so the default
+        # (simultaneous) construction is unchanged.
+        mode_kwargs: dict[str, Any] = {}
+        if cams.get("capture_mode") == "sequential":
+            mode_kwargs = {"capture_mode": "sequential",
+                           "sequential_keep_open": cams["sequential_keep_open"]}
         return OpenCvCameraSet(
             cams["devices"], width=cams["width"], height=cams["height"],
             manual_settings={k: v for k, v in cams["manual"].items() if v is not None},
+            **mode_kwargs,
         )
 
     @staticmethod

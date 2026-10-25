@@ -37,6 +37,7 @@
   "cameras": {
     "kind": "opencv",
     "devices": [0, 1, 2, 3],
+    "capture_mode": "simultaneous",
     "width": 2560,
     "height": 1440,
     "manual": {

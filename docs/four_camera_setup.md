@@ -2,8 +2,8 @@
 
 Use this when you have all four webcams. The one-camera test is in `poc_quickstart.md`.
 
-1. Plug each camera into its own USB port on the PC. Do not use a hub. Four 1080p cameras on
-   one USB controller can fail or drop frames.
+1. Plug each camera into its own USB port on the PC. Preferably use separate USB ports; if you
+   use a hub, see the hub section below.
 2. Find the camera indexes (PowerShell, from the vision-station folder):
    `py -m tools.capture --list-devices`. Then note which corner each index shows.
 3. Copy `config.example.json` to `config.json`. Set `cameras.devices` to the four indexes in
@@ -19,3 +19,22 @@ Use this when you have all four webcams. The one-camera test is in `poc_quicksta
    - press once with a part: four TOP pictures, then flip, then four BOTTOM pictures.
 7. Run 20 parts. Write down any dropped frame, long wait or error and send it back. These checks
    are the first test on real hardware.
+
+## If you must use a USB hub
+
+A USB hub usually cannot carry the streams of four cameras at the same time. Do not assume a
+hub works because the tiles show pictures: test it first.
+
+1. With the hub and all four cameras connected, run the hub test first, from the vision-station
+   folder (PowerShell): `py -m tools.hubtest --devices 0 1 2 3`. What the test checks and how to
+   read its result is in `docs/hub_feasibility.md`.
+2. Follow the test's recommendation. In `config.json`, inside `cameras`, set:
+   `"capture_mode": "sequential"`. If the test recommends it, also set
+   `"sequential_keep_open": true`. Leave both out to keep the default, `"simultaneous"`.
+3. With sequential capture, the station does this:
+   - the live view shows one camera at a time, in turn, so each tile refreshes more slowly;
+   - the four pictures of a side are taken one camera after another, so the operator waits
+     longer for each side;
+   - the part must stay still from the first picture to the last picture of a side. This is a
+     fixture requirement: check the part is clamped before you press.
+4. The longest wait the operator may accept for one side is [Quality to define].
