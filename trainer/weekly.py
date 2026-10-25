@@ -456,8 +456,12 @@ def _run_part(part_number: str, samples: list, ctx: _Context, result: dict) -> N
         args=args, now_iso=ctx.now_iso, counts=counts, evaluation=evaluation, runtime=ctx.runtime,
     )
     _register(ctx.ms, part_number, ctx.version, model, manifest, ctx.now_iso)
+    # Keys read by trainer.purge: only pictures fed to the builder this run are listed as trained.
     result.update(status="candidate", version=ctx.version, trained_until_utc=cutoff_iso,
-                  counts=counts, evaluation=evaluation)
+                  counts=counts, evaluation=evaluation,
+                  candidate_version=ctx.version, training_succeeded=True,
+                  trained_session_ids=sorted(s.session_id for s in new_train),
+                  holdout_session_ids=sorted(s.session_id for s in hold_all))
 
 
 def _process_part(part_number: str, samples: list, ctx: _Context) -> dict:

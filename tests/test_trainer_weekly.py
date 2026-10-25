@@ -135,6 +135,23 @@ class TestWeeklyRuns(WeeklyBase):
         self.assertEqual(part["evaluation"]["held_out_good"]["images_scored"], IMAGES_PER_PART)
         self.assertEqual(part["evaluation"]["t_img"], QUALITY)
         self.assertEqual(part["evaluation"]["held_out_good_parts_flagged"], QUALITY)
+        # keys that trainer.purge reads
+        self.assertEqual(part["candidate_version"], versions[0]["version"])
+        self.assertIs(part["training_succeeded"], True)
+        self.assertEqual(len(part["holdout_session_ids"]), 1)
+        self.assertEqual(len(part["trained_session_ids"]), 3)
+        self.assertFalse(set(part["trained_session_ids"]) & set(part["holdout_session_ids"]))
+
+    def test_weekly_report_is_accepted_by_purge_planning(self):
+        from trainer.purge import plan_purge
+        for day in (1, 2, 3, 5):
+            save_part(self.store, f"S-{day}", "PN-1", f"2026-10-0{day}T08:00:00Z")
+        code, _ = self.run_quiet(self.args("--holdout-fraction", "0.25", "--min-holdout", "1"))
+        self.assertEqual(code, 0)
+        report = next(self.reports.glob("weekly-*.json"))
+        plan = plan_purge(self.store_root, self.models, part_number="PN-1", report_path=report)
+        self.assertIsNone(plan.refusal)
+        self.assertEqual(len(plan.parts), 3)  # the 3 trained good parts; the held-out one is kept
 
     def test_incremental_update_uses_only_new_pictures(self):
         for day in (1, 2, 3):

@@ -12,6 +12,9 @@ Label policy, from part.json:
                              (a human decided)
   anything else              excluded (REVIEW never reaches final_verdict)
 
+Parts with a purged.json tombstone (pictures deleted by trainer/purge.py) are
+skipped with a note, not read as problems of the store.
+
 Problem lines are strings ``"<part folder>: <reason>"``. An unreadable part.json
 cannot be tied to a part number, so it is reported by every scan that reads it.
 
@@ -33,6 +36,7 @@ from typing import Iterable, Iterator, Optional, Sequence
 
 PART_JSON = "part.json"
 MANIFEST = "manifest.sha256"
+PURGED_FILE = "purged.json"  # tombstone written by trainer/purge.py after pictures were deleted
 STORE_DIR = "store"
 GOOD_POLICIES = ("strict", "include-overridden")
 SIDES = ("TOP", "BOTTOM")
@@ -342,6 +346,10 @@ def iter_parts(
             _note(problems, part_dir, reason)
             continue
         if not _passes(doc, part_number, since_day, until_day, full_station_only):
+            continue
+        if (part_dir / PURGED_FILE).is_file():
+            # Pictures were deleted on purpose after a verified training run (trainer purge).
+            _note(problems, part_dir, "skipped: pictures purged after training (see purged.json)")
             continue
         sample, reasons = _make_sample(part_dir, doc, verify)
         if sample is None:
