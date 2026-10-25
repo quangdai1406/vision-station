@@ -7,7 +7,7 @@
   "python": "[Engineer to define: python.exe that has torch with CUDA installed, or 'py' if that is the one]",
   "extractor": {
     "arch": "[Engineer to define: feature extractor architecture]",
-    "input_hw": "[Engineer to define: input height and width in pixels]",
+    "input_hw": ["[Engineer to define: height]", "[Engineer to define: width]"],
     "weights_path": "[Engineer to define: local path of the extractor weights file]",
     "device": "[Engineer to define: cuda or cpu]"
   },

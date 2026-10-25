@@ -82,9 +82,16 @@ try {
     $python  = Get-RequiredValue $cfg 'python'
 
     $extractor = Get-Section $cfg 'extractor'
+    # input_hw is a JSON list [height, width]; it must stay a list of two whole numbers.
+    $hwProp = $extractor.PSObject.Properties['input_hw']
+    $hwRaw = if ($hwProp) { @($hwProp.Value) } else { @() }
+    if ($hwRaw.Count -ne 2 -or ($hwRaw | Where-Object { $_ -isnot [int] -and $_ -isnot [long] })) {
+        throw "config: 'extractor.input_hw' must be a list of two whole numbers, for example [480, 640] (still a placeholder?)"
+    }
+    $inputHw = [int[]]@($hwRaw[0], $hwRaw[1])
     $extractorSettings = [ordered]@{
         arch         = Get-RequiredValue $extractor 'arch' 'extractor'
-        input_hw     = Get-RequiredValue $extractor 'input_hw' 'extractor'
+        input_hw     = $inputHw
         weights_path = Get-RequiredValue $extractor 'weights_path' 'extractor'
         device       = Get-RequiredValue $extractor 'device' 'extractor'
     }
@@ -95,13 +102,13 @@ try {
     if ($minGood -notmatch '^\d+$')    { throw "config: 'min_good' must be a whole number" }
     if ($minHoldout -notmatch '^\d+$') { throw "config: 'min_holdout' must be a whole number" }
 
-    # holdout_fraction: Quality owns it, no default. Must be a number strictly between 0 and 1.
+    # holdout_fraction: Quality owns it, no default. Must be a number from just above 0 up to 0.9.
     $holdoutRaw = Get-RequiredValue $cfg 'holdout_fraction'
     $holdoutValue = 0.0
     $holdoutOk = [double]::TryParse($holdoutRaw, [Globalization.NumberStyles]::Float,
         [Globalization.CultureInfo]::InvariantCulture, [ref]$holdoutValue)
-    if (-not $holdoutOk -or $holdoutValue -le 0 -or $holdoutValue -ge 1) {
-        throw "config: 'holdout_fraction' must be a number greater than 0 and less than 1"
+    if (-not $holdoutOk -or $holdoutValue -le 0 -or $holdoutValue -gt 0.9) {
+        throw "config: 'holdout_fraction' must be a number greater than 0 and at most 0.9"
     }
     $holdoutFraction = $holdoutValue.ToString([Globalization.CultureInfo]::InvariantCulture)
     Write-Host "  settings ok (values not printed here; see the config file)"

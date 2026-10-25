@@ -97,8 +97,7 @@ The scheduled task never promotes and never purges.
    **Paste the full output into the laptop's setup record and send it to the engineering
    lead.** Do not continue if it fails. 
 9. **Run the script once by hand.** Only after step 8 passes and `trainer.json` has no
-   placeholders. This runs the real trainer step, so it can write a candidate model. Until the
-   trainer command exists, the trainer step fails and that is expected. Read the log:
+   placeholders. This runs the real trainer step, so it can write a candidate model. Read the log:
 
    ```powershell
    .\scripts\windows\run_weekly_training.ps1 -Config "$env:USERPROFILE\VisionStation\trainer.json"
@@ -129,7 +128,7 @@ The scheduled task never promotes and never purges.
    OneDrive). Any other value is the trainer's own exit code.
 2. **Newest log.** Open the newest `weekly-*.log` in the logs folder. Check the start time,
    the evidence file count, the GPU line and the final `Trainer exit code: 0`.
-3. **Report.** Open the newest folder in `reports\`. Send it to Quality. Do not summarise it
+3. **Report.** Open the newest `weekly-YYYY-MM-DD.json` and `.txt` files in `reports\`. Send it to Quality. Do not summarise it
    as a pass or fail. The report is an input for Quality.
 4. **Candidate.** A new candidate is in `models\`. It is NOT used by any station until it is
    approved and promoted.
@@ -154,7 +153,7 @@ The scheduled task never promotes and never purges.
 - A candidate that Quality rejects is left in `models\` with its report. Mark it rejected in
   the report folder. Do not delete it.
 - To roll back an approved model, a named person re-points the stations to the previous
-  approved version with the promotion command (planned). Keep the previous approved model
+  approved version with `python -m trainer rollback`. Keep the previous approved model
   folder in `models\` until a newer one has run for a full week without a problem.
 - The scheduled task never changes which model the station uses, so disabling the task does
   not roll anything back. To stop weekly training: `.\scripts\windows\install_weekly_task.ps1 -Uninstall`.
@@ -192,7 +191,8 @@ runs by hand, after Quality agrees which evidence may go (retention rules: `[Qua
 
 ## 8. What is UNPROVEN
 
-- The trainer commands `weekly`, `promote`, `purge` and `selftest` do not exist yet.
+- The trainer commands exist and pass tests with fake extractors and fake images. They have never run on real pictures, torch or this laptop. The PowerShell scripts have never been run on Windows.
+- A held-out set is re-split over all good parts each week. A part the earlier model trained on but did not purge can become held-out, which makes the evaluation look better than it is. Treat the evaluation as a trend, not a proof, until this is fixed.
 - CUDA PyTorch on this laptop (i7 10th gen, 8 GB NVIDIA GPU): install, speed and memory.
 - Whether the batch and input size fit in 8 GB for the chosen extractor.
 - Task Scheduler wake and StartWhenAvailable behaviour on this laptop's power plan.
@@ -203,19 +203,14 @@ runs by hand, after Quality agrees which evidence may go (retention rules: `[Qua
 
 ## 9. Open decisions
 
-1. **Trainer commands.** Who builds `weekly`, `promote`, `purge` and `selftest`, and when.
-   The scripts call `weekly` with the arguments in `run_weekly_training.ps1`. The trainer side
-   must match.
-2. **Extractor config format.** The run script writes `extractor-config.json` with an
-   `extractor` section to the logs folder. The trainer must accept it. Confirm the format.
-3. **Account for the task.** Which Windows account runs the task, and who changes its
+1. **Account for the task.** Which Windows account runs the task, and who changes its
    password. A password change stops the task silently until the install script runs again.
-4. **Who approves and who promotes.** Named people for Quality approval and for the
+2. **Who approves and who promotes.** Named people for Quality approval and for the
    promotion command. Record the names here: `[Quality to define]`.
-5. **Retention.** How long evidence and candidate models are kept, and who approves a purge.
+3. **Retention.** How long evidence and candidate models are kept, and who approves a purge.
    `[Quality to define]`.
-6. **Minimum counts and holdout share.** `min_good`, `min_holdout` and `holdout_fraction`
+4. **Minimum counts and holdout share.** `min_good`, `min_holdout` and `holdout_fraction`
    (must be strictly between 0 and 1; no default). `[Quality to define]`.
-7. **Missed runs.** Whether a run that starts late (laptop woke at 10:00) is acceptable, or
+5. **Missed runs.** Whether a run that starts late (laptop woke at 10:00) is acceptable, or
    whether Quality needs the Monday report to say when the run actually started.
-8. **Second laptop or backup.** Whether a second machine is needed if this one is off.
+6. **Second laptop or backup.** Whether a second machine is needed if this one is off.

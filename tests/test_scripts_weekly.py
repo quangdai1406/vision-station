@@ -71,10 +71,37 @@ class ExampleConfigTest(unittest.TestCase):
 
     def test_every_setting_is_a_bracketed_placeholder(self) -> None:
         values = [self.cfg[k] for k in ("store", "models", "reports", "logs", "python")]
-        values += list(self.cfg["extractor"].values())
+        for value in self.cfg["extractor"].values():
+            values += value if isinstance(value, list) else [value]
         for value in values:
             with self.subTest(value=value):
                 self.assertRegex(value, r"^\[.*\]$")
+
+
+class ExtractorContractTest(unittest.TestCase):
+    """The JSON the .ps1 writes for the trainer must pass trainer.weekly._load_config."""
+
+    def test_filled_example_is_accepted_by_the_trainer(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from trainer.weekly import _load_config
+
+        cfg = json.loads(_read(EXAMPLE_JSON))["extractor"]
+        # what run_weekly_training.ps1 writes: arch, input_hw as [h, w] ints, weights_path, device
+        filled = {"arch": "resnet18", "input_hw": [480, 640], "weights_path": "weights.pth", "device": "cuda"}
+        self.assertEqual(set(filled), set(cfg))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "extractor-config.json"
+            path.write_text(json.dumps(filled), encoding="utf-8")
+            loaded = _load_config(str(path))
+        self.assertEqual(loaded["input_hw"], (480, 640))
+
+    def test_script_keeps_input_hw_a_list_of_ints(self) -> None:
+        text = _read(RUN_PS1)
+        self.assertIn("[int[]]", text)
+        self.assertNotIn("Get-RequiredValue $extractor 'input_hw'", text)
 
 
 class SafetyRulesTest(unittest.TestCase):
