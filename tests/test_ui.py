@@ -137,6 +137,12 @@ class FakeSession:
         self._call("current_part")
         return dict(self.current)
 
+    def label_part(self, by, verdict, criterion_id=None, part_id=None):
+        self._call("label_part", by=by, verdict=verdict, criterion_id=criterion_id,
+                   part_id=part_id)
+        return {"session_id": "S-9", "verdict": verdict.value, "criterion_id": criterion_id,
+                "changed": False}
+
 
 class PartsError(Exception):
     """Stand-in for the MES client's error. The UI matches it by class name only."""
@@ -880,6 +886,61 @@ class PartsPageTests(UiTestCase):
             proc = subprocess.run(["node", "--check", path], capture_output=True, text=True,
                                   timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+class LabelActionTests(UiTestCase):
+    def test_every_logged_in_role_can_label_and_by_is_the_login(self):
+        for user, pw in ((OP_USER, OP_PW), (SUP_USER, SUP_PW), (ADM_USER, ADM_PW)):
+            with self.subTest(user=user):
+                token = self.login(user, pw)
+                reply = self.call("POST", "/api/label",
+                                  {"verdict": "BAD", "criterion_id": "CR-1", "part_id": "P-7",
+                                   "by": "mallory"}, token=token)
+                self.assertEqual(reply.status, 200, reply.body)
+                self.assertEqual(set(self.js(reply)),
+                                 {"session_id", "verdict", "criterion_id", "changed"})
+        calls = [kw for name, kw in self.session.calls if name == "label_part"]
+        self.assertEqual([c["by"] for c in calls], [OP_USER, SUP_USER, ADM_USER])
+        self.assertEqual(calls[0]["verdict"], Verdict.BAD)
+        self.assertEqual(calls[0]["criterion_id"], "CR-1")
+        self.assertEqual(calls[0]["part_id"], "P-7")
+        self.assertNotIn("resolve_review", self.session.names())
+
+    def test_label_needs_login(self):
+        self.assertEqual(self.call("POST", "/api/label", {"verdict": "GOOD"}).status, 401)
+        self.assertNotIn("label_part", self.session.names())
+
+    def test_role_without_label_action_gets_403(self):
+        token = self.login(OP_USER, OP_PW)
+        with mock.patch.dict(station_auth._POLICY,
+                             {"operator": frozenset({"press", "ack", "select_part"})}):
+            reply = self.call("POST", "/api/label", {"verdict": "GOOD"}, token=token)
+        self.assertEqual(reply.status, 403)
+        self.assertNotIn("label_part", self.session.names())
+
+    def test_bad_label_input_is_400(self):
+        token = self.login(SUP_USER, SUP_PW)
+        cases = [{"verdict": "REVIEW"}, {}, {"verdict": "GOOD", "criterion_id": 5},
+                 {"verdict": "BAD", "criterion_id": "x" * 65}, {"verdict": "GOOD", "part_id": ""},
+                 {"verdict": "GOOD", "part_id": "p" * 101}]
+        for body in cases:
+            with self.subTest(body=body):
+                self.assertEqual(self.call("POST", "/api/label", body, token=token).status, 400)
+        self.assertNotIn("label_part", self.session.names())
+
+    def test_refusal_from_the_station_is_400(self):
+        self.session.errors["label_part"] = ValueError(
+            "criterion_id must be one of the configured mes.criteria_ids")
+        token = self.login(OP_USER, OP_PW)
+        reply = self.call("POST", "/api/label", {"verdict": "BAD", "criterion_id": "CR-9"},
+                          token=token)
+        self.assertEqual(reply.status, 400)
+
+    def test_page_has_label_controls(self):
+        page = self.call("GET", "/").body.decode("utf-8")
+        self.assertIn('data-action="label"', page)
+        self.assertIn('"/api/label"', page)
+        self.assertIn('id="criterion"', page)
 
 
 if __name__ == "__main__":

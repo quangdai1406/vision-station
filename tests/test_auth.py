@@ -93,11 +93,13 @@ class RolePolicyTests(unittest.TestCase):
     def test_policy_table(self):
         table = {
             "operator": {"press": True, "ack": True, "resolve": False,
-                         "override": False, "clear_fault": False, "select_part": True},
+                         "override": False, "clear_fault": False, "select_part": True,
+                         "label": True},
             "supervisor": {"press": True, "ack": True, "resolve": True,
-                           "override": True, "clear_fault": True, "select_part": True},
+                           "override": True, "clear_fault": True, "select_part": True,
+                           "label": True},
             "admin": {a: True for a in ("press", "ack", "resolve", "override", "clear_fault",
-                                        "select_part")},
+                                        "select_part", "label")},
         }
         for role, row in table.items():
             for action, expected in row.items():
@@ -108,7 +110,8 @@ class RolePolicyTests(unittest.TestCase):
         self.assertFalse(role_allows("visitor", "press"))
         self.assertFalse(role_allows("admin", "delete_everything"))
         self.assertEqual(set(ACTIONS),
-                         {"press", "ack", "resolve", "override", "clear_fault", "select_part"})
+                         {"press", "ack", "resolve", "override", "clear_fault", "select_part",
+                          "label"})
 
 
 class UserStoreTests(unittest.TestCase):

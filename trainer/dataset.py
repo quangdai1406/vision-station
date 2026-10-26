@@ -12,6 +12,10 @@ Label policy, from part.json:
                              (a human decided)
   anything else              excluded (REVIEW never reaches final_verdict)
 
+Collected parts (disposition 'collected', saved in collect mode, final REVIEW) use the
+operator label instead: label GOOD -> good, label BAD -> bad, no label -> excluded.
+The strict GOOD rule above is not used for them.
+
 Parts with a purged.json tombstone (pictures deleted by trainer/purge.py) are
 skipped with a note, not read as problems of the store.
 
@@ -90,6 +94,8 @@ class PartSample:
     camera_count: int
     images: tuple  # tuple of ImageRef
     part_dir: pathlib.Path
+    disposition: Optional[str] = None  # 'collected' for a collect-mode part
+    operator_label: Optional[dict] = None  # {'verdict': 'GOOD'|'BAD', ...} or None
 
 
 # ----------------------------------------------------------------- helpers
@@ -172,6 +178,12 @@ def _check_doc(doc: dict) -> Optional[str]:
     label = doc.get("defect_label")
     if label is not None and not isinstance(label, str):
         return "bad defect_label"
+    # Optional: parts saved before operator labels existed have no key at all.
+    operator_label = doc.get("operator_label")
+    if operator_label is not None and (
+        not isinstance(operator_label, dict) or operator_label.get("verdict") not in ("GOOD", "BAD")
+    ):
+        return "bad operator_label"
     return None
 
 
@@ -300,6 +312,8 @@ def _make_sample(part_dir: pathlib.Path, doc: dict, verify: bool) -> tuple[Optio
         camera_count=doc["camera_count"],
         images=tuple(refs),
         part_dir=part_dir,
+        disposition=doc.get("disposition"),
+        operator_label=doc.get("operator_label"),
     )
     return sample, []
 
@@ -386,6 +400,14 @@ def list_part_numbers(
 def classify(sample: PartSample, good_policy: str = "strict") -> str:
     """Return 'good', 'bad' or 'excluded' for one part under the label policy."""
     policy = _check_policy(good_policy)
+    if sample.disposition == "collected":  # station.storage.COLLECTED; this module imports nothing from station
+        label = sample.operator_label
+        verdict = label.get("verdict") if isinstance(label, dict) else None
+        if verdict == "GOOD":
+            return "good"
+        if verdict == "BAD":
+            return "bad"
+        return "excluded"
     if sample.final_verdict == "BAD":
         return "bad"
     if sample.final_verdict == "GOOD":

@@ -552,6 +552,46 @@ class CaptureModeConfigTests(TmpCase):
             self.assertNotIn("sequential_keep_open", example["cameras"], name)
 
 
+class KeepOpenConfigTests(TmpCase):
+    def _opencv(self, **cams) -> dict:
+        data = base_config(self.tmp)
+        data["cameras"] = {"kind": "opencv", "devices": [0, 2, 4, 6], **cams}
+        return data
+
+    def test_default_has_no_session_keys(self) -> None:
+        cams = validate_config(self._opencv())["cameras"]
+        self.assertNotIn("session_mode", cams)
+        self.assertNotIn("capture", cams)
+
+    def test_keep_open_defaults_and_round_trip(self) -> None:
+        cfg = validate_config(self._opencv(session_mode="keep_open"))
+        self.assertEqual(cfg["cameras"]["capture"], {"mjpg": False, "threaded": False, "flush_frames": 2})
+        self.assertEqual(validate_config(cfg), cfg)
+        cfg = validate_config(self._opencv(session_mode="keep_open",
+                                           capture={"mjpg": True, "threaded": True, "flush_frames": 1}))
+        self.assertEqual(cfg["cameras"]["capture"], {"mjpg": True, "threaded": True, "flush_frames": 1})
+
+    def test_bad_values_rejected(self) -> None:
+        for cams in ({"session_mode": "always"}, {"capture": {"mjpg": True}},
+                     {"session_mode": "keep_open", "capture_mode": "sequential"},
+                     {"session_mode": "keep_open", "capture": {"mjpg": "yes"}},
+                     {"session_mode": "keep_open", "capture": {"flush_frames": -1}},
+                     {"session_mode": "keep_open", "capture": {"speed": 1}}):
+            with self.assertRaises(ConfigError, msg=str(cams)):
+                validate_config(self._opencv(**cams))
+
+    def test_kwargs_reach_the_camera_set_only_when_enabled(self) -> None:
+        with mock.patch("station.app.OpenCvCameraSet") as ocs:
+            StationApp._make_cameras(validate_config(self._opencv()))
+            self.assertNotIn("session_mode", ocs.call_args.kwargs)
+            self.assertNotIn("mjpg", ocs.call_args.kwargs)
+            StationApp._make_cameras(validate_config(self._opencv(
+                session_mode="keep_open", capture={"mjpg": True, "threaded": True, "flush_frames": 1})))
+            kw = ocs.call_args.kwargs
+            self.assertEqual((kw["session_mode"], kw["mjpg"], kw["threaded"], kw["stale_flush_frames"]),
+                             ("keep_open", True, True, 1))
+
+
 class RecordingCameraFactory:
     """Stands in for OpenCvCameraSet: records the devices and the capture-mode kwargs it is built with."""
 

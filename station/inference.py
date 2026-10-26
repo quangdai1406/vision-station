@@ -111,6 +111,21 @@ class MarkerModel:
         )
 
 
+class CollectModel:
+    """No-verdict model for collect mode: every image gets a neutral score of 0.0.
+
+    It makes no judgement. The session in collect mode does not fuse the
+    results, so the score is never a verdict. It is stored as 0.0 only because
+    ImageResult needs a number.
+    """
+
+    def __init__(self, version: str) -> None:
+        self.version = version
+
+    def predict(self, frame: Frame) -> ImageResult:
+        return ImageResult(camera_id=frame.camera_id, side=frame.side, score=0.0)
+
+
 def _import_onnxruntime() -> Any:
     try:
         import onnxruntime  # noqa: PLC0415 - imported lazily on purpose
