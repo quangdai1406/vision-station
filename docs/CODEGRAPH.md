@@ -10,7 +10,7 @@ python3 .claude/skills/code-graph/scripts/gen_codegraph_doc.py [--check]
 
 Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` tests need numpy, no camera or network). Station core is standard library only; `tools/` imports numpy/opencv lazily.
 
-37 code files, 37 test files, 183 import edges.
+38 code files, 38 test files, 185 import edges.
 
 ## Modules
 
@@ -37,13 +37,14 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `station/teach.py` | 179 | 2 | 2 | `python -m station teach`: learn the golden model from GOOD parts on the real cameras. |
 | `station/ui.py` | 1491 | 2 | 7 | HTTP server for the inspection station: a JSON API plus one HTML page. |
 | `station/users_cli.py` | 131 | 2 | 2 | `python -m station users add <username> <role>`: create or update a station login. |
-| `tools/__init__.py` | 6 | 7 | 6 | Repeatability and threshold-selection tools. See FORMAT.md. |
+| `tools/__init__.py` | 6 | 8 | 7 | Repeatability and threshold-selection tools. See FORMAT.md. |
 | `tools/analysis.py` | 263 | 3 | 3 | Numpy-only image repeatability metrics. Shapes and return keys: see tools/FORMAT.md. |
 | `tools/capture.py` | 1062 | 2 | 2 | Real-webcam capture for the repeatability study. Run on the user's Windows PC. |
 | `tools/capture_speed.py` | 145 | 1 | 1 | Timing probe for the keep-open camera session: N rounds of one picture per camera. |
 | `tools/criteria.py` | 465 | 3 | 3 | MES inspection criteria for a part -> station config pieces and a sample-collection checklist. |
 | `tools/export_evidence.py` | 407 | 1 | 1 | Export saved evidence from the Pi station to a destination folder. |
 | `tools/hubtest.py` | 717 | 1 | 1 | USB hub feasibility test for several webcams. Run on the user's Windows PC. |
+| `tools/liveview.py` | 198 | 1 | 1 | Live view of the 4 station cameras in a browser, for aiming and lighting. |
 | `tools/report.py` | 949 | 2 | 2 | Plain-language repeatability report for capture session folders. |
 | `tools/thresholds.py` | 724 | 2 | 2 | Candidate thresholds (t_low, t_img) from labelled model scores. |
 | `trainer/__init__.py` | 6 | 0 | 0 | Weekly trainer: reads the stations' saved evidence and builds per-part datasets. |
@@ -95,6 +96,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 - `tools/criteria.py` -> (no internal imports)
 - `tools/export_evidence.py` -> (no internal imports)
 - `tools/hubtest.py` -> `station/cameras.py`, `tools/__init__.py`
+- `tools/liveview.py` -> `tools/__init__.py`
 - `tools/report.py` -> `tools/__init__.py`, `tools/analysis.py`
 - `tools/thresholds.py` -> (no internal imports)
 - `trainer/__init__.py` -> (no internal imports)
@@ -136,6 +138,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 - `tests/test_tools_criteria.py` -> `tools/criteria.py`
 - `tests/test_tools_dryrun.py` -> `tools/capture.py`, `tools/criteria.py`, `tools/report.py`, `tools/thresholds.py`
 - `tests/test_tools_export_evidence.py` -> `station/contracts.py`, `station/storage.py`, `tools/export_evidence.py`
+- `tests/test_tools_liveview.py` -> `tools/liveview.py`
 - `tests/test_tools_report.py` -> `tools/__init__.py`, `tools/analysis.py`, `tools/report.py`
 - `tests/test_tools_thresholds.py` -> `tools/thresholds.py`
 - `tests/test_trainer_dataset.py` -> `station/contracts.py`, `station/storage.py`, `trainer/__main__.py`, `trainer/dataset.py`
@@ -151,7 +154,7 @@ None.
 
 ## External packages (code files importing each)
 
-`__future__` (31), `typing` (31), `json` (23), `sys` (17), `argparse` (15), `pathlib` (15), `dataclasses` (14), `datetime` (12), `os` (12), `time` (11), `numpy` (9), `re` (9), `cv2` (7), `hashlib` (7), `tempfile` (6), `math` (5), `threading` (5), `collections` (4), `urllib` (4), `contextlib` (3), `csv` (3), `http` (3), `importlib` (3), `io` (3), `shutil` (3), `base64` (2), `enum` (2), `sqlite3` (2), `statistics` (2), `torch` (2), `unicodedata` (2), `uuid` (2), `zipfile` (2), `getpass` (1), `hmac` (1), `mimetypes` (1), `onnxruntime` (1), `platform` (1), `random` (1), `secrets` (1), `torchvision` (1), `traceback` (1)
+`__future__` (31), `typing` (31), `json` (23), `sys` (17), `argparse` (16), `pathlib` (15), `dataclasses` (14), `os` (13), `datetime` (12), `time` (12), `numpy` (9), `re` (9), `cv2` (8), `hashlib` (7), `tempfile` (6), `threading` (6), `math` (5), `collections` (4), `http` (4), `urllib` (4), `contextlib` (3), `csv` (3), `importlib` (3), `io` (3), `shutil` (3), `base64` (2), `enum` (2), `sqlite3` (2), `statistics` (2), `torch` (2), `unicodedata` (2), `uuid` (2), `zipfile` (2), `getpass` (1), `hmac` (1), `mimetypes` (1), `onnxruntime` (1), `platform` (1), `random` (1), `secrets` (1), `signal` (1), `torchvision` (1), `traceback` (1)
 
 ## What the graph cannot see
 

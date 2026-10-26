@@ -17,9 +17,10 @@ here invents a threshold or a sample count.
 - The test used ONE toy car in ONE position for all 20 parts. It proves capture, saving and speed. It says
   nothing about GOOD versus BAD.
 - Thresholds in the throwaway test config (0.3 and 0.6) are placeholders with no quality meaning.
-- Live view helper (not in the repo): `/home/quangdai1406/vision-liveview/liveview.py`, serves a 2x2 live
-  view with a centre cross and a brightness readout at http://127.0.0.1:8090/. Stop the station first;
-  only one program can hold the cameras.
+- Live view helper: `python -m tools.liveview` (needs opencv), serves a 2x2 live view with a centre cross
+  and a brightness readout at http://127.0.0.1:8090/. Localhost only unless `--host` is given. Stop the
+  station first; only one program can hold the cameras. The red colour in its brightness line uses rough
+  aid values, not Quality limits.
 - Evidence copy on the Pi: `~/Pictures/vision-station-collect-test-26_1026/` and pictures in
   `~/Pictures/vision-liveview/`.
 
