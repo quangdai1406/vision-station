@@ -1,5 +1,7 @@
 import contextlib
+import dataclasses
 import io
+import json
 import pathlib
 import tempfile
 import unittest
@@ -9,13 +11,14 @@ from station.contracts import (
     Defect,
     Frame,
     ImageResult,
+    OperatorLabel,
     Override,
     PartRecord,
     Side,
     Thresholds,
     Verdict,
 )
-from station.storage import Store
+from station.storage import COLLECTED, Store
 from trainer.__main__ import main
 from trainer.dataset import (
     Dataset,
@@ -432,6 +435,71 @@ class TestInventoryCli(EvidenceFixture):
     def test_no_command_exit_2(self):
         code, _out, _err = self.run_cli([])
         self.assertEqual(code, 2)
+
+
+class CollectedLabelDatasetTests(unittest.TestCase):
+    """Collected parts (final REVIEW) are labelled by the operator; other parts keep the strict rule."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name)
+        store = Store(self.root)
+        when = "2026-10-26T08:00:00Z"
+
+        def collected(session, part, label=None):
+            rec = make_record(session, part, "PN-1", when, Verdict.REVIEW, machine=Verdict.REVIEW)
+            return dataclasses.replace(rec, disposition=COLLECTED, operator_label=label)
+
+        store.save_part(collected("S-c0", "P-c0"))  # unlabelled
+        store.save_part(collected("S-c1", "P-c1", OperatorLabel(Verdict.GOOD, "qa-1", when)))
+        store.save_part(collected("S-c2", "P-c2", OperatorLabel(
+            Verdict.BAD, "qa-1", when, criterion_id="CR-1")))
+        store.save_part(make_record("S-g1", "P-g1", "PN-1", when, Verdict.GOOD))
+        store.save_part(make_record("S-b1", "P-b1", "PN-1", when, Verdict.BAD, bad=("C1", Side.TOP)))
+        self.samples = {s.part_id: s for s in iter_parts(self.root, problems=None)}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def part_json(self, part_id):
+        return next((self.root / "store").rglob(f"{part_id}/part.json"))
+
+    def test_labels_decide_collected_parts(self):
+        for policy in ("strict", "include-overridden"):
+            with self.subTest(policy=policy):
+                self.assertEqual(classify(self.samples["P-c0"], policy), "excluded")
+                self.assertEqual(classify(self.samples["P-c1"], policy), "good")
+                self.assertEqual(classify(self.samples["P-c2"], policy), "bad")
+
+    def test_non_collected_parts_keep_the_strict_rule(self):
+        self.assertEqual(classify(self.samples["P-g1"]), "good")
+        self.assertEqual(classify(self.samples["P-b1"]), "bad")
+        self.assertEqual(classify(self.samples["P-g1"], "include-overridden"), "good")
+
+    def test_unknown_policy_still_rejected_for_collected(self):
+        with self.assertRaises(ValueError):
+            classify(self.samples["P-c1"], "loose")
+
+    def test_part_json_without_the_field_loads_as_before(self):
+        path = self.part_json("P-g1")
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        del doc["operator_label"]
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        problems = []
+        parts = {s.part_id: s for s in iter_parts(self.root, problems=problems)}
+        self.assertEqual(problems, [])
+        self.assertIsNone(parts["P-g1"].operator_label)
+        self.assertEqual(classify(parts["P-g1"]), "good")
+
+    def test_malformed_operator_label_is_a_problem(self):
+        path = self.part_json("P-c1")
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc["operator_label"] = {"verdict": "MAYBE"}
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        problems = []
+        ids = [s.part_id for s in iter_parts(self.root, problems=problems)]
+        self.assertNotIn("P-c1", ids)
+        self.assertTrue(any("bad operator_label" in p for p in problems), problems)
 
 
 if __name__ == "__main__":

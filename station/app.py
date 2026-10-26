@@ -25,27 +25,30 @@ from dataclasses import replace
 from typing import Any, Callable, Mapping, Optional
 
 from station.auth import SessionManager, UserStore, load_users
-from station.cameras import FakeCameraSet, OpenCvCameraSet, make_blur_check, utc_now_iso
+from station.cameras import (STALE_FLUSH_FRAMES, FakeCameraSet, OpenCvCameraSet, make_blur_check,
+                             utc_now_iso)
 from station.contracts import (
     CAMERA_IDS,
     Frame,
     InvalidTransition,
+    OperatorLabel,
     PartRecord,
     State,
     StationError,
     Thresholds,
+    Verdict,
     camera_ids_for,
     images_for,
     is_full_station,
 )
-from station.inference import MarkerModel
+from station.inference import CollectModel, MarkerModel
 from station.mes_client import MesClient, MesConfig, build_request
 from station.modelstore import ModelError, ModelStore, load_runtime_model, register_loader
 from station.outbox import Outbox
 from station.outputs import ConsoleOutputs, SerialRelayOutputs
 from station.parts import MesPartsClient, PartsError, build_part_config
 from station.session import StationSession
-from station.storage import Store
+from station.storage import COLLECTED, Store, check_criterion_id
 from station.ui import make_server
 
 DEFAULT_UI_PORT = 8000
@@ -206,7 +209,7 @@ def _validate_cameras(raw: Any) -> dict:
     path = "cameras"
     cams = _obj(raw, path)
     _check_keys(cams, ("kind", "devices", "camera_count", "camera_ids", "width", "height", "manual",
-                       "capture_mode", "sequential_keep_open"),
+                       "capture_mode", "sequential_keep_open", "session_mode", "capture"),
                 path, required=("kind",))
     capture_mode = cams.get("capture_mode", DEFAULT_CAPTURE_MODE)
     if capture_mode not in _CAPTURE_MODES:
@@ -214,6 +217,14 @@ def _validate_cameras(raw: Any) -> dict:
     if capture_mode == "simultaneous" and "sequential_keep_open" in cams:
         raise ConfigError("cameras.sequential_keep_open only applies when cameras.capture_mode "
                           "is 'sequential'; remove it or set capture_mode to 'sequential'")
+    session_mode = cams.get("session_mode", "default")
+    if session_mode not in ("default", "keep_open"):
+        raise ConfigError("cameras.session_mode must be 'default' or 'keep_open'")
+    if session_mode == "default" and "capture" in cams:
+        raise ConfigError("cameras.capture only applies when cameras.session_mode is "
+                          "'keep_open'; remove it or set session_mode to 'keep_open'")
+    if session_mode == "keep_open" and capture_mode != "simultaneous":
+        raise ConfigError("cameras.session_mode 'keep_open' needs cameras.capture_mode 'simultaneous'")
     kind = cams["kind"]
     if kind not in ("fake", "opencv"):
         raise ConfigError("cameras.kind must be 'fake' or 'opencv'")
@@ -256,6 +267,17 @@ def _validate_cameras(raw: Any) -> dict:
         # Only written for sequential mode, so a validated config validates again to the same value.
         out["sequential_keep_open"] = _bool(cams.get("sequential_keep_open", False),
                                             "cameras.sequential_keep_open")
+    if session_mode == "keep_open":
+        # Only written for keep_open, so the default config validates to the same value as before.
+        cap_raw = _obj(cams.get("capture", {}), "cameras.capture")
+        _check_keys(cap_raw, ("mjpg", "threaded", "flush_frames"), "cameras.capture")
+        out["session_mode"] = "keep_open"
+        out["capture"] = {
+            "mjpg": _bool(cap_raw.get("mjpg", False), "cameras.capture.mjpg"),
+            "threaded": _bool(cap_raw.get("threaded", False), "cameras.capture.threaded"),
+            "flush_frames": _int(cap_raw.get("flush_frames", STALE_FLUSH_FRAMES),
+                                 "cameras.capture.flush_frames", lo=0, hi=100),
+        }
     if kind == "fake":
         out["camera_count"] = count  # kept so a validated config validates again to the same value
     return out
@@ -291,8 +313,10 @@ def _validate_model(raw: Any) -> dict:
     model = _obj(raw, path)
     _check_keys(model, ("kind", "path", "version", "extractor"), path, required=("kind", "version"))
     kind = model["kind"]
-    if kind not in ("marker", "onnx", "golden"):
-        raise ConfigError("model.kind must be 'marker', 'onnx' or 'golden'")
+    if kind not in ("marker", "onnx", "golden", "collect"):
+        raise ConfigError("model.kind must be 'marker', 'onnx', 'golden' or 'collect'")
+    if kind == "collect" and model.get("path") is not None:
+        raise ConfigError("model.path is not used when model.kind is 'collect': remove it")
     model_path = model.get("path")
     if kind in ("onnx", "golden") and (not isinstance(model_path, str) or not model_path):
         raise ConfigError(f"model.path is required when model.kind is '{kind}'")
@@ -399,6 +423,8 @@ def validate_config(data: Any) -> dict:
     out["mes"] = _validate_mes(cfg["mes"])
     out["cameras"] = _validate_cameras(cfg["cameras"])
     out["model"] = _validate_model(cfg["model"])
+    if out["model"]["kind"] == "collect" and parts["mode"] != "fixed":
+        raise ConfigError("model.kind 'collect' needs parts.mode 'fixed': collect mode has no approved model per part")
     out["outputs"] = _validate_outputs(cfg["outputs"])
     out["flip_timeout_s"] = _number(cfg.get("flip_timeout_s", DEFAULT_FLIP_TIMEOUT_S),
                                     "flip_timeout_s", positive=True)
@@ -554,6 +580,12 @@ class _LockedSession:
         with self._lock:
             self._session.override(by=by, new_verdict=new_verdict, reason=reason)
 
+    def label_part(self, by: str, verdict, criterion_id: Optional[str] = None,
+                   part_id: Optional[str] = None) -> dict:
+        # Stored parts only: the store locks itself, so the session lock is not needed.
+        return self._need_app().label_part(by=by, verdict=verdict, criterion_id=criterion_id,
+                                           part_id=part_id)
+
     def tick(self) -> bool:
         with self._lock:
             return self._session.tick()
@@ -644,6 +676,7 @@ class StationApp:
         self._ui_thread: Optional[threading.Thread] = None
         self._sync_thread: Optional[threading.Thread] = None
         self.sync_interval_s = cfg["mes"]["sync_interval_s"]
+        self._collect_only = cfg["model"]["kind"] == "collect"
 
         if demo and self._parts_mode == "mes":
             raise ConfigError("the demo station uses the demo model: set parts.mode to 'fixed' for --demo")
@@ -684,6 +717,10 @@ class StationApp:
         if cams.get("capture_mode") == "sequential":
             mode_kwargs = {"capture_mode": "sequential",
                            "sequential_keep_open": cams["sequential_keep_open"]}
+        if cams.get("session_mode") == "keep_open":
+            cap = cams["capture"]
+            mode_kwargs.update(session_mode="keep_open", mjpg=cap["mjpg"], threaded=cap["threaded"],
+                               stale_flush_frames=cap["flush_frames"])
         return OpenCvCameraSet(
             cams["devices"], width=cams["width"], height=cams["height"],
             manual_settings={k: v for k, v in cams["manual"].items() if v is not None},
@@ -697,6 +734,8 @@ class StationApp:
             return MarkerModel(version=model["version"])
         if model["kind"] == "golden":
             return _load_golden_model(model)
+        if model["kind"] == "collect":
+            return CollectModel(version=model["version"])
         raise StationError(
             "model.kind 'onnx' is not wired yet: the ONNX pre- and postprocessing are not written "
             "(see README, 'Not done'). Use model.kind 'marker' with --demo, or inject a model."
@@ -722,7 +761,7 @@ class StationApp:
         self._partial_blocked = self.partial and not allow_partial
         if token is None:
             token = os.environ.get(mes["token_env"], "")
-        self.mes_enabled = bool(token) and not demo and not self._partial_blocked
+        self.mes_enabled = bool(token) and not demo and not self._partial_blocked and not self._collect_only
         self._mes_cfg = MesConfig(
             base_url=mes["base_url"],
             token=token or "",
@@ -735,6 +774,10 @@ class StationApp:
         # Part search needs the token too, whatever demo or partial rules say about posting.
         self._parts_client = (MesPartsClient(mes["base_url"], token)
                               if self._parts_mode == "mes" and token else None)
+        if self._collect_only:
+            self.store.append_event("mes_disabled", {
+                "reason": "collect mode: parts are saved with no verdict and are not sent to MES",
+            })
         if demo:
             self.store.append_event("mes_disabled", {"reason": "demo mode: parts are not sent to MES"})
         else:
@@ -775,6 +818,7 @@ class StationApp:
             on_complete=self._enqueue,
             initial_counters=self.store.counters(),
             camera_ids=camera_ids,
+            collect_only=self._collect_only,
         )
 
         try:
@@ -804,6 +848,8 @@ class StationApp:
         """on_complete hook: queue the saved part for MES. Never raises."""
         if self._demo:
             return  # demo parts must never reach the outbox, which a later real run would send
+        if record.disposition == COLLECTED:
+            return  # collected parts have no verdict and are never posted to the MES
         if self._partial_blocked:
             return  # a partial station posts only when mes.allow_partial_cameras is true
         try:
@@ -956,6 +1002,41 @@ class StationApp:
                                     {"part_number": pn, "model_version": info.version, "by": by.strip()})
             return {"part_number": pn, "model_version": info.version, "can_inspect": True,
                     "warnings": warnings}
+
+    def label_part(self, by: str, verdict: Any, criterion_id: Optional[str] = None,
+                   part_id: Optional[str] = None) -> dict:
+        """Label a collected part GOOD or BAD (BAD may name a criterion). Never changes its verdict.
+
+        With part_id, that collected part; otherwise the last collected part. A criterion id must be
+        in mes.criteria_ids when that list is configured; otherwise any short printable name is allowed.
+        """
+        new_verdict = Verdict(verdict)
+        if new_verdict not in (Verdict.GOOD, Verdict.BAD):
+            raise ValueError("verdict must be GOOD or BAD")
+        if not isinstance(by, str) or not by.strip():
+            raise ValueError("by is required")
+        criterion = None
+        if criterion_id is not None:
+            if new_verdict is Verdict.GOOD:
+                raise ValueError("a GOOD label takes no criterion_id")
+            criterion = check_criterion_id(criterion_id)
+            mes_cfg = getattr(self, "_mes_cfg", None)
+            allowed = list(mes_cfg.criteria_ids) if mes_cfg is not None else []
+            if allowed and criterion not in allowed:
+                raise ValueError("criterion_id must be one of the configured mes.criteria_ids")
+        if part_id is not None:
+            session_id = self.store.collected_session_id_for_part(str(part_id))
+            if session_id is None:
+                raise ValueError("no collected part with that part_id")
+        else:
+            session_id = self.store.last_collected_session_id()
+            if session_id is None:
+                raise ValueError("there is no collected part to label")
+        label = OperatorLabel(verdict=new_verdict, labelled_by=by.strip(),
+                              labelled_at=self._now_utc(), criterion_id=criterion)
+        previous = self.store.set_operator_label(session_id, label)
+        return {"session_id": session_id, "verdict": new_verdict.value, "criterion_id": criterion,
+                "changed": previous is not None}
 
     def _block_part(self, part_number: str, reason: str, warnings: list[str]) -> dict:
         self.session.clear_part()

@@ -77,6 +77,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
+from station.storage import COLLECTED
 from station.contracts import (
     CAMERA_IDS,
     IMAGES_PER_PART,
@@ -95,6 +96,9 @@ from station.contracts import (
     Thresholds,
     Verdict,
 )
+
+
+COLLECTED_LABEL = "COLLECTED"  # what the UI shows for a collected part: saved, not judged
 
 
 @dataclass(frozen=True)
@@ -177,8 +181,11 @@ class StationSession:
         on_complete: Optional[Callable[[PartRecord], None]] = None,
         initial_counters: Optional[dict[str, int]] = None,
         camera_ids: Sequence[str] = CAMERA_IDS,
+        collect_only: bool = False,
     ) -> None:
         self._camera_ids = _validate_camera_ids(camera_ids)
+        # Collect mode: images are captured and saved, but nothing is fused or judged.
+        self._collect_only = bool(collect_only)
         self._expected_images = images_for(self._camera_ids)
         self._cameras = cameras
         self._model = model
@@ -393,9 +400,9 @@ class StationSession:
 
         Keys: state, counters {total, good, bad}, part_id, machine_verdict,
         final_verdict (set only once the part is saved), verdict (what the big
-        indicator shows: REVIEW in SUPERVISOR_REVIEW, else final_verdict, else
-        machine_verdict; GOOD is never shown before it is saved; None when no
-        part), fault, results (one per captured image, so far), images
+        indicator shows: REVIEW in SUPERVISOR_REVIEW, 'COLLECTED' for a collected
+        part (collect mode), else final_verdict, else machine_verdict; GOOD is
+        never shown before it is saved; None when no part), fault, results (one per captured image, so far), images
         (one metadata entry per captured frame, up to expected_images, with score
         and defects merged in from the matching result; 'b64' only when
         include_images), partial_station (bool) and camera_ids (list of str).
@@ -510,6 +517,8 @@ class StationSession:
         return {"partial_station": self.is_partial, "camera_ids": list(self._camera_ids)}
 
     def _display_verdict(self) -> Optional[str]:
+        if self._disposition == COLLECTED:
+            return COLLECTED_LABEL
         if self.state is State.SUPERVISOR_REVIEW:
             return Verdict.REVIEW.value
         if self._final is not None:
@@ -568,6 +577,9 @@ class StationSession:
 
     def _fuse_and_route(self) -> None:
         results = self._all_results()
+        if self._collect_only:
+            self._route_collected(results)
+            return
         try:
             if len(results) != self._expected_images:
                 raise StationError(f"need {self._expected_images} results to fuse, have {len(results)}")
@@ -597,6 +609,22 @@ class StationSession:
         else:
             self.state = State.SUPERVISOR_REVIEW  # set before the light: resolve_review must work
             self._light("show_review")
+
+    def _route_collected(self, results: list[ImageResult]) -> None:
+        """Collect mode: save the part with no verdict. Never green, never a model GOOD or BAD.
+
+        The part is stored with final verdict REVIEW and disposition 'collected', which
+        storage accepts only for this disposition. The outputs are cleared, not lit.
+        """
+        if len(results) != self._expected_images:
+            self._fail(StationError(f"need {self._expected_images} results, have {len(results)}"),
+                       stage="collect", return_state=State.WAIT_FLIP)
+            return
+        self._machine = Verdict.REVIEW  # neutral: no model judgement was made
+        self._log("collected", {"part_id": self._part_id, "images": len(results),
+                                **self._station_fields()},
+                  session_id=self._session_id)
+        self._finish(Verdict.REVIEW, override=None, disposition=COLLECTED, lights=("clear",))
 
     def _light(self, name: str) -> None:
         """Call one OutputDriver method for a state already set. A failure is logged, never raised."""
@@ -636,7 +664,8 @@ class StationSession:
         self._override = p.override
         self._disposition = p.disposition
         self.counters["total"] += 1
-        self.counters["good" if p.final is Verdict.GOOD else "bad"] += 1
+        if p.disposition != COLLECTED:  # collected parts are counted in total only
+            self.counters["good" if p.final is Verdict.GOOD else "bad"] += 1
         self.state = State.IDLE
         # Every light is attempted even if an earlier one raises (e.g. alarm_off
         # still runs when show_bad raises). A light failure never undoes the save.

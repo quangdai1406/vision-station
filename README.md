@@ -41,7 +41,7 @@ value. The station refuses to start while a placeholder is left, and names it.
 | `mes.default_criterion_id` | Used for a defect class that has no mapping. `null` means such a part is not posted (the error is logged). |
 | `mes.sync_interval_s`, `mes.default_bad_disposition` | Outbox drain period (default 5 s); `quarantine` or `released` (default `quarantine`). |
 | `cameras` | `kind` `fake` or `opencv`, `devices` (4 indexes for C1..C4), `width`, `height`, `manual` (focus, exposure, white_balance; `null` = auto). |
-| `model` | `kind` `marker` or `onnx`, `path`, `version` (sent to the MES as `modelVersion`). |
+| `model` | `kind` `marker`, `onnx`, `golden` or `collect`, `path`, `version` (sent to the MES as `modelVersion`). |
 | `outputs` | `kind` `console` or `serial_relay` (with `port`, optional `channel_map`). |
 | `flip_timeout_s` | Seconds the station waits for the flip press before voiding a part (default 60). |
 | `frame_ok.min_variance` | Optional sharpness gate; a blurred frame is retaken (up to 2 times). |
@@ -60,6 +60,16 @@ Ctrl-C stops the station cleanly.
 
 Normal mode is the same without `--demo`, with the real cameras, model and
 outputs from the config.
+
+### Collect mode (no verdict)
+
+Set `"model": {"kind": "collect", "version": "..."}` with `"parts": {"mode": "fixed"}`
+to run the real cameras and save evidence without any model verdict. Each part
+is saved as usual (8 images, `part.json`, `manifest.sha256`) with final verdict
+`REVIEW` and `disposition` `collected`. The screen shows `COLLECTED (not judged)`,
+no light is lit green or red, the counters count the part in total only, and
+nothing is queued for the MES. The per-image `score` in `part.json` is a
+placeholder `0.0` and must not be read as a result.
 
 ## Create users
 

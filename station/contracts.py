@@ -112,6 +112,20 @@ class Override:
     by: str
 
 
+@dataclass(frozen=True)
+class OperatorLabel:
+    """A human label on a collected part (collect mode), so it can be used for training.
+
+    Never changes the part's final_verdict or counters; it is metadata on the saved part.
+    criterion_id is only meaningful for BAD and is None for GOOD.
+    """
+
+    verdict: Verdict  # GOOD or BAD only
+    labelled_by: str
+    labelled_at: str  # ISO 8601 UTC
+    criterion_id: Optional[str] = None
+
+
 @dataclass
 class PartRecord:
     """One finished part: what storage writes and the MES client posts."""
@@ -133,6 +147,7 @@ class PartRecord:
     final_verdict: Verdict  # GOOD or BAD (REVIEW is resolved before posting)
     override: Optional[Override] = None
     disposition: Optional[str] = None  # "quarantine" | "released" | None
+    operator_label: Optional[OperatorLabel] = None  # collected parts only; None until labelled
 
 
 class StationError(Exception):

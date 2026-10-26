@@ -15,7 +15,7 @@ import sys
 import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Optional
 
 from station.auth import ACTIONS, SessionManager, UserStore, role_allows
 from station.contracts import InvalidTransition, Verdict
@@ -28,9 +28,12 @@ PART_SEARCH_MAX_CHARS = 100
 PART_SEARCH_LIMIT_DEFAULT = 20
 PART_SEARCH_LIMIT_MAX = 50
 MAX_PART_NUMBER_CHARS = 100
+MAX_CRITERION_CHARS = 64  # longer than any MES criterion id or class name we accept
+MAX_PART_ID_CHARS = 100
 # Only these keys leave the server, so no cost or planning data reaches the browser.
 _PART_SEARCH_KEYS = ("part_number", "description", "part_type", "lifecycle")
 _PART_KEYS = ("part_number", "model_version", "can_inspect", "reason", "parts_mode", "warnings")
+_LABEL_KEYS = ("session_id", "verdict", "criterion_id", "changed")
 
 _ACTION_PATHS = {
     "/api/press": "press",
@@ -38,6 +41,7 @@ _ACTION_PATHS = {
     "/api/resolve": "resolve",
     "/api/override": "override",
     "/api/clear-fault": "clear_fault",
+    "/api/label": "label",
 }
 
 _CSP = (
@@ -92,6 +96,24 @@ def _parse_reason(data: dict) -> str:
     if len(reason) > MAX_REASON_CHARS:
         raise _HttpError(400, "reason is too long")
     return reason
+
+
+def _parse_criterion(data: dict) -> Optional[str]:
+    raw = data.get("criterion_id")
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or len(raw) > MAX_CRITERION_CHARS:
+        raise _HttpError(400, f"criterion_id must be a string up to {MAX_CRITERION_CHARS} characters")
+    return raw
+
+
+def _parse_part_id(data: dict) -> Optional[str]:
+    raw = data.get("part_id")
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip() or len(raw) > MAX_PART_ID_CHARS:
+        raise _HttpError(400, f"part_id must be a string up to {MAX_PART_ID_CHARS} characters")
+    return raw.strip()
 
 
 def _pick(row: dict, keys: tuple) -> dict:
@@ -278,6 +300,13 @@ class _Handler(BaseHTTPRequestHandler):
             verdict = _parse_verdict(data)
             reason = _parse_reason(data)
             station.override(by=username, new_verdict=verdict, reason=reason)
+        elif action == "label":
+            verdict = _parse_verdict(data)
+            criterion = _parse_criterion(data)
+            part_id = _parse_part_id(data)
+            result = station.label_part(by=username, verdict=verdict, criterion_id=criterion,
+                                        part_id=part_id)
+            return self._send_json(200, _pick(result, _LABEL_KEYS))
         self._send_json(200, {"ok": True})
 
     # ----- helpers -------------------------------------------------------
@@ -418,6 +447,7 @@ main { padding: 16px; max-width: 980px; margin: 0 auto; }
 .v-BAD { background: var(--bad); }
 .v-REVIEW { background: var(--review); color: #1b1d21; }
 .v-NONE { background: var(--none); }
+.v-COLLECTED { background: var(--none); }
 .counters { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; text-align: center; }
 .counters span { display: block; font-size: 14px; color: var(--muted); }
 .counters b { display: block; font-size: 28px; }
@@ -523,6 +553,12 @@ label { display: block; font-size: 14px; color: var(--muted); }
       <button data-action="resolve" data-verdict="BAD">Resolve REVIEW: BAD</button>
       <button data-action="override" data-verdict="GOOD">Override BAD to GOOD</button>
     </div>
+    <div class="card">
+      <label for="criterion">Collected part: criterion for a BAD label (optional)</label>
+      <input id="criterion" maxlength="64" autocomplete="off">
+      <button data-action="label" data-verdict="GOOD">Label collected part GOOD</button>
+      <button data-action="label" data-verdict="BAD">Label collected part BAD</button>
+    </div>
   </section>
   <p id="error" class="error" role="alert"></p>
 </main>
@@ -541,7 +577,7 @@ label { display: block; font-size: 14px; color: var(--muted); }
   var PLACEHOLDER_H = 240;
   var PATHS = {
     press: "/api/press", ack: "/api/ack", clear_fault: "/api/clear-fault",
-    resolve: "/api/resolve", override: "/api/override"
+    resolve: "/api/resolve", override: "/api/override", label: "/api/label"
   };
   var MSG_CAPTURING = "Capturing... keep the part still.";
   var MSG_WAIT_CAPTURE = "Wait: the picture is being taken.";
@@ -555,7 +591,7 @@ label { display: block; font-size: 14px; color: var(--muted); }
     login: $("login-box"), app: $("app"), form: $("login-form"), who: $("who"),
     logout: $("logout"), error: $("error"), state: $("state"), verdict: $("verdict"),
     total: $("c-total"), good: $("c-good"), bad: $("c-bad"), tiles: $("tiles"),
-    reason: $("reason"), poc: $("poc"), prompt: $("prompt"),
+    reason: $("reason"), criterion: $("criterion"), poc: $("poc"), prompt: $("prompt"),
     pressStatus: $("press-status"), liveGrid: $("live-grid"),
     partPanel: $("part-panel"), partLine: $("part-line"), partBlock: $("part-block"),
     partForm: $("part-search-form"), partQ: $("part-q"), partSearch: $("part-search"),
@@ -898,9 +934,11 @@ label { display: block; font-size: 14px; color: var(--muted); }
     renderCamera(s);
     refreshPress();
 
-    var verdict = (s.verdict === "GOOD" || s.verdict === "BAD" || s.verdict === "REVIEW") ? s.verdict : "NONE";
+    var verdict = (s.verdict === "GOOD" || s.verdict === "BAD" || s.verdict === "REVIEW"
+      || s.verdict === "COLLECTED") ? s.verdict : "NONE";
     el.verdict.className = "verdict v-" + verdict;
-    el.verdict.textContent = verdict === "NONE" ? "-" : verdict;
+    // A collected part is saved for evidence only: shown as COLLECTED, never as a judgement.
+    el.verdict.textContent = verdict === "NONE" ? "-" : (verdict === "COLLECTED" ? "COLLECTED (not judged)" : verdict);
 
     // The fault text comes from the station; textContent keeps it inert.
     el.state.textContent = s.fault
@@ -1240,6 +1278,11 @@ label { display: block; font-size: 14px; color: var(--muted); }
       var reason = el.reason.value.trim();
       if (!reason) { setError("Enter a reason before resolving or overriding."); return; }
       body = { verdict: btn.getAttribute("data-verdict"), reason: reason };
+    }
+    if (action === "label") {
+      body = { verdict: btn.getAttribute("data-verdict") };
+      var criterion = el.criterion.value.trim();
+      if (body.verdict === "BAD" && criterion) { body.criterion_id = criterion; }
     }
     setError("");
     request("POST", PATHS[action], body).then(function () {

@@ -22,11 +22,12 @@ import sqlite3
 import tempfile
 import threading
 from datetime import datetime, timezone
-from typing import Iterator
+from typing import Iterator, Optional
 
 from station.contracts import (
     CAMERA_IDS,
     IMAGES_PER_PART,
+    OperatorLabel,
     PartRecord,
     Side,
     Verdict,
@@ -34,6 +35,9 @@ from station.contracts import (
 
 PART_JSON = "part.json"
 MANIFEST = "manifest.sha256"
+COLLECTED = "collected"  # disposition of a part saved in collect mode: images kept, no verdict
+OPERATOR_LABEL_EVENT = "operator_label"  # event kind for every set or change of a label
+MAX_CRITERION_CHARS = 64
 _META_FILES = frozenset({PART_JSON, MANIFEST})
 _TMP_PREFIX = ".tmp-"
 _BAD_PATH_CHARS = frozenset("/\\\x00")
@@ -111,6 +115,66 @@ def _sha256_file(path: pathlib.Path) -> str:
 
 def _dump_json(doc: dict) -> bytes:
     return (json.dumps(doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def check_criterion_id(value: object) -> str:
+    """A MES criterion id or a free class name: non-empty, short, printable. Returns it stripped."""
+    if not isinstance(value, str):
+        raise ValueError("criterion_id must be a string")
+    text = value.strip()
+    if not text:
+        raise ValueError("criterion_id must not be empty")
+    if len(text) > MAX_CRITERION_CHARS:
+        raise ValueError(f"criterion_id is longer than {MAX_CRITERION_CHARS} characters")
+    if not text.isprintable():
+        raise ValueError("criterion_id must not contain control characters")
+    return text
+
+
+def check_label(label: OperatorLabel) -> None:
+    """Validate an operator label. Raises ValueError; never changes the label."""
+    if not isinstance(label, OperatorLabel):
+        raise ValueError("operator_label must be an OperatorLabel")
+    verdict = Verdict(label.verdict)
+    if verdict not in (Verdict.GOOD, Verdict.BAD):
+        raise ValueError("operator label verdict must be GOOD or BAD")
+    if not isinstance(label.labelled_by, str) or not label.labelled_by.strip():
+        raise ValueError("labelled_by is required")
+    if not isinstance(label.labelled_at, str):
+        raise ValueError("labelled_at must be an ISO 8601 string")
+    _parse_utc(label.labelled_at)
+    if label.criterion_id is not None:
+        if verdict is Verdict.GOOD:
+            raise ValueError("a GOOD label takes no criterion_id")
+        check_criterion_id(label.criterion_id)
+
+
+def _label_doc(label: Optional[OperatorLabel]) -> Optional[dict]:
+    """The part.json form of a validated label (None stays None)."""
+    if label is None:
+        return None
+    criterion = None if label.criterion_id is None else label.criterion_id.strip()
+    return {
+        "verdict": Verdict(label.verdict).value,
+        "criterion_id": criterion,
+        "labelled_by": label.labelled_by.strip(),
+        "labelled_at": label.labelled_at,
+    }
+
+
+def _replace_file(path: pathlib.Path, data: bytes) -> None:
+    """Atomically replace one file: write a temp file beside it, fsync, then os.replace."""
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_TMP_PREFIX}label-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
 
 def _insert_rows(conn: sqlite3.Connection, doc: dict, path: str) -> None:
@@ -215,8 +279,14 @@ class Store:
         by_key = {(r.camera_id, Side(r.side).value): r for r in results}
         if set(by_key) != set(keys) or len(by_key) != expected:
             raise ValueError("results must match frames one-to-one")
-        if Verdict(record.final_verdict) is Verdict.REVIEW:
+        if Verdict(record.final_verdict) is Verdict.REVIEW and record.disposition != COLLECTED:
+            # A collected part (collect mode) is saved with no judgement: REVIEW is its
+            # final verdict and it is never counted as GOOD or BAD.
             raise ValueError("final_verdict must be GOOD or BAD (REVIEW is resolved first)")
+        if record.operator_label is not None:
+            if record.disposition != COLLECTED:
+                raise ValueError("only a collected part can carry an operator label")
+            check_label(record.operator_label)
         if not record.session_id:
             raise ValueError("session_id is required")
         part_id = _component(record.part_id, "part_id")
@@ -332,6 +402,7 @@ class Store:
                 "by": record.override.by,
             },
             "disposition": record.disposition,
+            "operator_label": _label_doc(record.operator_label),
             "camera_count": camera_count,
             "partial_station": camera_count < len(CAMERA_IDS),
             "images": images,
@@ -460,3 +531,60 @@ class Store:
             }
             for r in rows
         ]
+
+    # ------------------------------------------------------- operator labels
+    def last_collected_session_id(self) -> Optional[str]:
+        """Session id of the newest collected part. REVIEW is stored only for collected parts."""
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT session_id FROM parts WHERE final_verdict = ? ORDER BY id DESC LIMIT 1",
+                (Verdict.REVIEW.value,),
+            ).fetchone()
+        return row[0] if row else None
+
+    def collected_session_id_for_part(self, part_id: str) -> Optional[str]:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT session_id FROM parts WHERE part_id = ? AND final_verdict = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (part_id, Verdict.REVIEW.value),
+            ).fetchone()
+        return row[0] if row else None
+
+    def set_operator_label(self, session_id: str, label: OperatorLabel) -> Optional[dict]:
+        """Set or change the operator label of one collected part. Returns the previous label.
+
+        Atomic: only part.json is replaced (temp file + os.replace). Images and
+        manifest.sha256 are never touched. Every set or change is logged as an
+        'operator_label' event; if that log write fails, part.json is restored.
+        """
+        check_label(label)
+        with self._lock:
+            part_dir = self._known_path(session_id)
+            if part_dir is None:
+                raise ValueError("no saved part for this session")
+            part_json = part_dir / PART_JSON
+            try:
+                raw = part_json.read_bytes()
+                doc = json.loads(raw.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                raise ValueError(f"part.json is unreadable: {part_dir}") from exc
+            if not isinstance(doc, dict) or doc.get("session_id") != session_id:
+                raise ValueError("part.json does not belong to this session")
+            if doc.get("disposition") != COLLECTED:
+                raise ValueError("only a collected part can be labelled")
+            previous = doc.get("operator_label")
+            new_label = _label_doc(label)
+            doc["operator_label"] = new_label
+            _replace_file(part_json, _dump_json(doc))
+            try:
+                self.append_event(
+                    OPERATOR_LABEL_EVENT,
+                    {"part_id": doc.get("part_id"), "previous": previous, "label": new_label},
+                    session_id=session_id,
+                )
+            except BaseException:
+                _replace_file(part_json, raw)  # the change is not logged, so it is not kept
+                raise
+        return previous
+

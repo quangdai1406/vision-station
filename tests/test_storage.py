@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from station.contracts import (
     CAMERA_IDS,
@@ -15,9 +16,10 @@ from station.contracts import (
     PartRecord,
     Side,
     Thresholds,
+    OperatorLabel,
     Verdict,
 )
-from station.storage import Store
+from station.storage import COLLECTED, OPERATOR_LABEL_EVENT, Store, check_criterion_id
 
 STARTED = "2026-10-23T08:30:12Z"
 
@@ -339,6 +341,147 @@ class TestEventsAndQueries(StoreTestCase):
             set(recent[0]),
             {"session_id", "part_id", "final_verdict", "started_utc", "path"},
         )
+
+
+TS_LABEL = "2026-10-26T09:00:00Z"
+
+
+class TestOperatorLabel(StoreTestCase):
+    def save_collected(self, session="S-c1", part="P-c1"):
+        return self.store.save_part(
+            make_record(session, part, final=Verdict.REVIEW, disposition=COLLECTED))
+
+    @staticmethod
+    def part_json(part_dir):
+        return json.loads((part_dir / "part.json").read_text(encoding="utf-8"))
+
+    @staticmethod
+    def image_bytes(part_dir):
+        return {p.name: p.read_bytes() for p in sorted(part_dir.glob("*.png"))}
+
+    def label_events(self):
+        conn = self.db()
+        try:
+            return conn.execute(
+                "SELECT session_id, payload_json FROM events WHERE kind = ? ORDER BY id",
+                (OPERATOR_LABEL_EVENT,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def test_record_default_has_no_label_and_new_part_json_has_null(self):
+        self.assertIsNone(make_record().operator_label)
+        part_dir = self.save_collected()
+        self.assertIsNone(self.part_json(part_dir)["operator_label"])
+        self.assertEqual(self.store.verify_part(part_dir), [])
+
+    def test_good_label_written_images_and_manifest_untouched(self):
+        part_dir = self.save_collected()
+        images = self.image_bytes(part_dir)
+        manifest = (part_dir / "manifest.sha256").read_bytes()
+        previous = self.store.set_operator_label(
+            "S-c1", OperatorLabel(Verdict.GOOD, "qa-1", TS_LABEL))
+        self.assertIsNone(previous)
+        self.assertEqual(self.part_json(part_dir)["operator_label"], {
+            "verdict": "GOOD", "criterion_id": None,
+            "labelled_by": "qa-1", "labelled_at": TS_LABEL})
+        self.assertEqual(self.image_bytes(part_dir), images)
+        self.assertEqual((part_dir / "manifest.sha256").read_bytes(), manifest)
+        self.assertEqual(self.store.verify_part(part_dir), [])
+        self.assertEqual(len(self.label_events()), 1)
+        self.assertEqual(self.store.recent_parts(1)[0]["final_verdict"], "REVIEW")
+        self.assertEqual(self.store.counters(), {"total": 1, "good": 0, "bad": 0})
+
+    def test_bad_label_with_criterion_then_relabel_each_change_logged(self):
+        part_dir = self.save_collected()
+        self.store.set_operator_label(
+            "S-c1", OperatorLabel(Verdict.BAD, "qa-1", TS_LABEL, criterion_id="CR-1"))
+        previous = self.store.set_operator_label(
+            "S-c1", OperatorLabel(Verdict.GOOD, "qa-2", TS_LABEL))
+        self.assertEqual(previous["verdict"], "BAD")
+        self.assertEqual(self.part_json(part_dir)["operator_label"]["verdict"], "GOOD")
+        events = self.label_events()
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[1][0], "S-c1")
+        second = json.loads(events[1][1])
+        self.assertEqual(second["previous"]["criterion_id"], "CR-1")
+        self.assertEqual(second["label"]["labelled_by"], "qa-2")
+        self.assertEqual(self.store.verify_part(part_dir), [])
+
+    def test_non_collected_part_cannot_be_labelled(self):
+        part_dir = self.store.save_part(make_record("S-g1", "P-g1", final=Verdict.GOOD))
+        before = (part_dir / "part.json").read_bytes()
+        with self.assertRaises(ValueError):
+            self.store.set_operator_label("S-g1", OperatorLabel(Verdict.GOOD, "qa-1", TS_LABEL))
+        self.assertEqual((part_dir / "part.json").read_bytes(), before)
+        self.assertEqual(self.label_events(), [])
+
+    def test_unknown_session_refused(self):
+        with self.assertRaises(ValueError):
+            self.store.set_operator_label("S-none", OperatorLabel(Verdict.GOOD, "qa-1", TS_LABEL))
+
+    def test_label_on_a_non_collected_record_refused_at_save(self):
+        with self.assertRaises(ValueError):
+            self.store.save_part(make_record(
+                "S-g2", "P-g2", final=Verdict.GOOD,
+                operator_label=OperatorLabel(Verdict.GOOD, "qa-1", TS_LABEL)))
+        self.assertEqual(self.store.counters()["total"], 0)
+
+    def test_invalid_labels_refused_and_part_json_unchanged(self):
+        part_dir = self.save_collected()
+        before = (part_dir / "part.json").read_bytes()
+        invalid = [
+            OperatorLabel(Verdict.REVIEW, "qa-1", TS_LABEL),
+            OperatorLabel(Verdict.GOOD, "qa-1", TS_LABEL, criterion_id="CR-1"),
+            OperatorLabel(Verdict.BAD, "qa-1", TS_LABEL, criterion_id=""),
+            OperatorLabel(Verdict.BAD, "qa-1", TS_LABEL, criterion_id="x" * 65),
+            OperatorLabel(Verdict.BAD, "qa-1", TS_LABEL, criterion_id="CR\n1"),
+            OperatorLabel(Verdict.BAD, "  ", TS_LABEL),
+            OperatorLabel(Verdict.GOOD, "qa-1", "yesterday"),
+        ]
+        for label in invalid:
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    self.store.set_operator_label("S-c1", label)
+        self.assertEqual((part_dir / "part.json").read_bytes(), before)
+        self.assertEqual(self.label_events(), [])
+
+    def test_criterion_id_rules(self):
+        self.assertEqual(check_criterion_id("  CR-1 "), "CR-1")
+        self.assertEqual(check_criterion_id("Scratch on flange"), "Scratch on flange")
+        for bad in ("", "   ", "a\tb", "a\x00b", "x" * 65, 7):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    check_criterion_id(bad)
+
+    def test_failed_event_write_restores_part_json(self):
+        part_dir = self.save_collected()
+        before = (part_dir / "part.json").read_bytes()
+        with mock.patch.object(self.store, "append_event", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.store.set_operator_label("S-c1", OperatorLabel(Verdict.GOOD, "qa-1", TS_LABEL))
+        self.assertEqual((part_dir / "part.json").read_bytes(), before)
+        self.assertEqual([p.name for p in part_dir.iterdir() if p.name.startswith(".tmp-")], [])
+
+    def test_part_json_without_the_field_still_loads_and_takes_a_label(self):
+        part_dir = self.save_collected()
+        doc = self.part_json(part_dir)
+        del doc["operator_label"]  # what a part.json saved before this field looks like
+        (part_dir / "part.json").write_text(json.dumps(doc), encoding="utf-8")
+        self.assertEqual(self.store.verify_part(part_dir), [])
+        previous = self.store.set_operator_label(
+            "S-c1", OperatorLabel(Verdict.BAD, "qa-1", TS_LABEL, criterion_id="CR-1"))
+        self.assertIsNone(previous)
+        self.assertEqual(self.store.verify_part(part_dir), [])
+
+    def test_collected_lookups(self):
+        self.assertIsNone(self.store.last_collected_session_id())
+        self.save_collected("S-c1", "P-c1")
+        self.save_collected("S-c2", "P-c2")
+        self.store.save_part(make_record("S-g4", "P-g4", final=Verdict.GOOD))
+        self.assertEqual(self.store.last_collected_session_id(), "S-c2")
+        self.assertEqual(self.store.collected_session_id_for_part("P-c1"), "S-c1")
+        self.assertIsNone(self.store.collected_session_id_for_part("P-g4"))
 
 
 if __name__ == "__main__":
