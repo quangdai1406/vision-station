@@ -121,6 +121,9 @@ BAD; never invent thresholds or counts (write `[Quality to define]`); no secrets
 | 1.3c | Unplug/replug a camera during a run | station names the camera and recovers | user unplugs, Claude watches | TODO |
 | 0.5 | Install node (`! sudo apt install -y nodejs`), run the 2 skipped UI tests | tests not skipped | user installs | DONE: node v24.19 via pip (no sudo) in ~/.venvs/node; both page-script node checks pass |
 | 0.6 | Office checklist for tomorrow (MES token, part search, laptop setup, transfer) | file docs/office_checklist.md | Claude | DONE: docs/office_checklist.md |
+| 0.7 | Live camera view for aiming and lighting | 2x2 live page, centre cross, brightness readout; tests pass | Claude | DONE: tools/liveview.py (`python -m tools.liveview`), 5 tests, full suite 1169 OK. Run on the real cameras 2026-10-26 |
+| 0.8 | Push local main to GitHub | `git status` shows main level with origin/main | user logs in, Claude pushes | DONE: origin/main at 51b89d2 (11 commits sent). gh 2.103.3 installed in ~/bin without sudo, login stored in the keyring |
+| 0.9 | Plan for the office day | file docs/26_1026_PLAN_office_day.md | Claude | DONE |
 
 | Date | Step | Note |
 |---|---|---|
@@ -130,3 +133,8 @@ BAD; never invent thresholds or counts (write `[Quality to define]`); no secrets
 | 2026-10-26 | 1.3b | Round 3 PASS. Real cameras 0,2,4,6, collect mode, 25 parts: 8 PNGs + part.json + manifest each, no failed press, outbox 0 rows. Seconds mean/max: top 0.192/0.271, bottom 0.199/0.237. Picture mean brightness 35-40 of 255, uneven. |
 | 2026-10-26 | 0.5 | node installed without sudo (pip nodejs-wheel-binaries). To use it: PATH=/home/quangdai1406/.venvs/node/lib/python3.13/site-packages/nodejs_wheel/bin:$PATH. |
 | 2026-10-26 | 1.3b | Rerun PASS (Sonnet checker). Light fixed (mean 124-129, no overexposure); object in frame on all 4 cameras after three aim rounds. 20 parts, 160 files verify, all presses accepted incl. back-to-back (about 2.0 s), 0 faults, outbox 0. Evidence copied to ~/Pictures/vision-station-collect-test-26_1026/. Live view helper: tools/liveview.py (python -m tools.liveview). Next: docs/26_1026_PLAN_office_day.md. |
+| 2026-10-26 | 0.2 | Camera aim and light, evening. Four aim rounds with measurements after each: mean brightness 85-133, unevenness 19-129, car cut off or at the edge until round 4. Round 4 (last): means 119/125/133/124, unevenness 94/32/58/96, nearly-black share 1-9 percent (shadowed box wall), car fully in frame on all 4. No evenness limit applied: `[Quality to define]`. Mount and exposure NOT locked yet (`cameras.manual` unset). 0.2 stays TODO until the repeatability study (10 presses) is run. |
+| 2026-10-26 | 0.7 | Live view built by Claude, tested by a Haiku worker, checked by Sonnet. Bugs found and fixed: page failed on a literal percent sign; Ctrl-C hung with a browser tab open; SIGINT ignored in background launches. Moved into the repo as tools/liveview.py with lazy opencv import and 5 tests. |
+| 2026-10-26 | 1.3b | Evidence of the 20-part rerun kept at ~/Pictures/vision-station-collect-test-26_1026/ (143 MB, 20 manifests re-verified after copy, 0 failures). Password files not copied. |
+| 2026-10-26 | 0.8 | Code graph rebuilt (76 files) and docs/CODEGRAPH.md regenerated. Commits 1f3e89f (plan, 1.3b done) and 51b89d2 (liveview). First push failed: no GitHub login on the Pi. gh downloaded to ~/bin with a verified checksum; user completed the login in a terminal; push succeeded. |
+| 2026-10-26 | - | Run totals this evening (multi-agent runner): 3 rounds, 5 Haiku workers, 3 Sonnet checker calls. Next: docs/26_1026_PLAN_office_day.md (network and MES token, real parts, Quality counts, laptop setup). |
