@@ -19,10 +19,10 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `station/__init__.py` | 1 | 0 | 0 |  |
 | `station/__main__.py` | 95 | 2 | 2 | Entry point. |
 | `station/anomaly.py` | 841 | 5 | 11 | PatchCore-style anomaly detection trained on GOOD parts only. |
-| `station/app.py` | 1131 | 8 | 6 | Wire the station together: config, build, run, and MES sync. |
-| `station/auth.py` | 179 | 9 | 8 | Password hashing, user store, role policy and in-memory session tokens. |
+| `station/app.py` | 1275 | 8 | 6 | Wire the station together: config, build, run, and MES sync. |
+| `station/auth.py` | 182 | 9 | 8 | Password hashing, user store, role policy and in-memory session tokens. |
 | `station/cameras.py` | 1013 | 12 | 9 | Camera sources for the inspection station. |
-| `station/contracts.py` | 185 | 40 | 29 | Shared types and interfaces for the camera inspection station. |
+| `station/contracts.py` | 202 | 40 | 29 | Shared types and interfaces for the camera inspection station. |
 | `station/features_torch.py` | 324 | 4 | 11 | PyTorch feature extractor and cdist backend for the PatchCore anomaly model. |
 | `station/fusion.py` | 87 | 2 | 8 | Per-image classification and per-part fusion. |
 | `station/golden.py` | 416 | 9 | 13 | Compare-with-a-good-part model for the one-camera proof of concept. |
@@ -33,9 +33,9 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `station/outputs.py` | 122 | 8 | 7 | Output drivers for lights and the alarm (implements contracts.OutputDriver). |
 | `station/parts.py` | 281 | 3 | 7 | Client for the MES part search and per-part inspection criteria. |
 | `station/session.py` | 765 | 3 | 7 | One inspection session: from the first press of a part to a completed record. |
-| `station/storage.py` | 591 | 9 | 12 | Storage for finished inspection parts and the append-only event log. |
+| `station/storage.py` | 691 | 9 | 12 | Storage for finished inspection parts and the append-only event log. |
 | `station/teach.py` | 179 | 2 | 2 | `python -m station teach`: learn the golden model from GOOD parts on the real cameras. |
-| `station/ui.py` | 1348 | 2 | 7 | HTTP server for the inspection station: a JSON API plus one HTML page. |
+| `station/ui.py` | 1491 | 2 | 7 | HTTP server for the inspection station: a JSON API plus one HTML page. |
 | `station/users_cli.py` | 131 | 2 | 2 | `python -m station users add <username> <role>`: create or update a station login. |
 | `tools/__init__.py` | 6 | 7 | 6 | Repeatability and threshold-selection tools. See FORMAT.md. |
 | `tools/analysis.py` | 263 | 3 | 3 | Numpy-only image repeatability metrics. Shapes and return keys: see tools/FORMAT.md. |
@@ -48,7 +48,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `tools/thresholds.py` | 724 | 2 | 2 | Candidate thresholds (t_low, t_img) from labelled model scores. |
 | `trainer/__init__.py` | 6 | 0 | 0 | Weekly trainer: reads the stations' saved evidence and builds per-part datasets. |
 | `trainer/__main__.py` | 161 | 2 | 2 | Command line for the weekly trainer: ``python3 -m trainer <command> ...``. |
-| `trainer/dataset.py` | 560 | 5 | 4 | Dataset reader for the weekly trainer. |
+| `trainer/dataset.py` | 565 | 5 | 4 | Dataset reader for the weekly trainer. |
 | `trainer/promote.py` | 242 | 1 | 1 | Human-approved promotion and rollback of part models: ``python3 -m trainer promote/rollback/versions``. |
 | `trainer/purge.py` | 538 | 2 | 2 | Delete the pictures of GOOD parts that a verified training run already used. |
 | `trainer/selftest.py` | 239 | 1 | 1 | ``python3 -m trainer selftest [--extractor-config FILE]``: first run of the torch feature extractor. |

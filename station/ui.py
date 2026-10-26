@@ -33,7 +33,12 @@ MAX_PART_ID_CHARS = 100
 # Only these keys leave the server, so no cost or planning data reaches the browser.
 _PART_SEARCH_KEYS = ("part_number", "description", "part_type", "lifecycle")
 _PART_KEYS = ("part_number", "model_version", "can_inspect", "reason", "parts_mode", "warnings")
-_LABEL_KEYS = ("session_id", "verdict", "criterion_id", "changed")
+_LABEL_KEYS = ("session_id", "verdict", "criterion_id", "status", "changed")
+_LABEL_STATUS_KEYS = ("session_id", "part_id", "part_number", "label_status", "verdict",
+                      "criterion_id", "reject_reason")
+_PENDING_LABEL_KEYS = ("session_id", "part_id", "part_number", "verdict", "criterion_id",
+                       "proposed_by", "proposed_at")
+MAX_REJECT_REASON_CHARS = 200  # keep in step with station.storage.MAX_REJECT_REASON_CHARS
 
 _ACTION_PATHS = {
     "/api/press": "press",
@@ -41,7 +46,7 @@ _ACTION_PATHS = {
     "/api/resolve": "resolve",
     "/api/override": "override",
     "/api/clear-fault": "clear_fault",
-    "/api/label": "label",
+    "/api/label": "label_propose",
 }
 
 _CSP = (
@@ -105,6 +110,16 @@ def _parse_criterion(data: dict) -> Optional[str]:
     if not isinstance(raw, str) or len(raw) > MAX_CRITERION_CHARS:
         raise _HttpError(400, f"criterion_id must be a string up to {MAX_CRITERION_CHARS} characters")
     return raw
+
+
+def _parse_reject_reason(data: dict) -> str:
+    raw = data.get("reason")
+    if not isinstance(raw, str) or not raw.strip():
+        raise _HttpError(400, "reason is required")
+    reason = raw.strip()
+    if len(reason) > MAX_REJECT_REASON_CHARS:
+        raise _HttpError(400, f"reason must be up to {MAX_REJECT_REASON_CHARS} characters")
+    return reason
 
 
 def _parse_part_id(data: dict) -> Optional[str]:
@@ -177,6 +192,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._parts_search(urllib.parse.parse_qs(query))
         if path == "/api/part":
             return self._part_get()
+        if path == "/api/label/last":
+            return self._label_last()
+        if path == "/api/label/pending":
+            return self._label_pending()
         raise _HttpError(404, "not found")
 
     def _post(self) -> None:
@@ -187,6 +206,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._logout()
         if path == "/api/part/select":
             return self._part_select()
+        if path in ("/api/label/approve", "/api/label/reject"):
+            return self._label_review(path.rsplit("/", 1)[1])
         action = _ACTION_PATHS.get(path)
         if action is None:
             raise _HttpError(404, "not found")
@@ -300,7 +321,7 @@ class _Handler(BaseHTTPRequestHandler):
             verdict = _parse_verdict(data)
             reason = _parse_reason(data)
             station.override(by=username, new_verdict=verdict, reason=reason)
-        elif action == "label":
+        elif action == "label_propose":
             verdict = _parse_verdict(data)
             criterion = _parse_criterion(data)
             part_id = _parse_part_id(data)
@@ -308,6 +329,36 @@ class _Handler(BaseHTTPRequestHandler):
                                         part_id=part_id)
             return self._send_json(200, _pick(result, _LABEL_KEYS))
         self._send_json(200, {"ok": True})
+
+    def _label_review(self, decision: str) -> None:
+        """Admin only. approve: make the pending proposal official, or set an official label when
+        'verdict' is sent. reject: reject the pending proposal with a reason."""
+        _, username, _role = self._require("label_approve")
+        data = self._read_json()
+        part_id = _parse_part_id(data)
+        station = self.station
+        if decision == "reject":
+            result = station.reject_label(by=username, reason=_parse_reject_reason(data),
+                                          part_id=part_id)
+        elif "verdict" in data:
+            result = station.set_official_label(by=username, verdict=_parse_verdict(data),
+                                                criterion_id=_parse_criterion(data), part_id=part_id)
+        else:
+            result = station.approve_label(by=username, part_id=part_id)
+        self._send_json(200, _pick(result, _LABEL_KEYS))
+
+    def _label_last(self) -> None:
+        self._require()
+        row = _call_parts(self.station.last_label_status)
+        self._send_json(200, {"last": _pick(row, _LABEL_STATUS_KEYS) if isinstance(row, dict) else None})
+
+    def _label_pending(self) -> None:
+        self._require("label_approve")
+        rows = _call_parts(self.station.pending_labels)
+        if not isinstance(rows, list):
+            raise RuntimeError("pending_labels() must return a list")
+        self._send_json(200, {"pending": [_pick(r, _PENDING_LABEL_KEYS) for r in rows
+                                          if isinstance(r, dict)]})
 
     # ----- helpers -------------------------------------------------------
 
@@ -554,10 +605,18 @@ label { display: block; font-size: 14px; color: var(--muted); }
       <button data-action="override" data-verdict="GOOD">Override BAD to GOOD</button>
     </div>
     <div class="card">
-      <label for="criterion">Collected part: criterion for a BAD label (optional)</label>
+      <label for="criterion">Collected part: criterion for a BAD proposal (optional)</label>
       <input id="criterion" maxlength="64" autocomplete="off">
-      <button data-action="label" data-verdict="GOOD">Label collected part GOOD</button>
-      <button data-action="label" data-verdict="BAD">Label collected part BAD</button>
+      <button data-action="label_propose" data-verdict="GOOD">Propose GOOD for collected part</button>
+      <button data-action="label_propose" data-verdict="BAD">Propose BAD for collected part</button>
+      <p id="label-status" class="part-note muted" role="status"></p>
+      <div id="label-review" hidden>
+        <h3>Pending label proposals (admin)</h3>
+        <p class="muted hint">Only an admin makes a label official. Rejecting needs a short reason.</p>
+        <label for="reject-reason">Reject reason (required to reject)</label>
+        <input id="reject-reason" maxlength="200" autocomplete="off">
+        <ul id="label-pending" class="part-results"></ul>
+      </div>
     </div>
   </section>
   <p id="error" class="error" role="alert"></p>
@@ -577,8 +636,9 @@ label { display: block; font-size: 14px; color: var(--muted); }
   var PLACEHOLDER_H = 240;
   var PATHS = {
     press: "/api/press", ack: "/api/ack", clear_fault: "/api/clear-fault",
-    resolve: "/api/resolve", override: "/api/override", label: "/api/label"
+    resolve: "/api/resolve", override: "/api/override", label_propose: "/api/label"
   };
+  var LABEL_MS = 3000;
   var MSG_CAPTURING = "Capturing... keep the part still.";
   var MSG_WAIT_CAPTURE = "Wait: the picture is being taken.";
   var MSG_FLIP_FIRST = "Press ignored: flip the part first, then press Enter.";
@@ -923,6 +983,7 @@ label { display: block; font-size: 14px; color: var(--muted); }
 
     // A state that differs from the one seen at press time ends the capture lockout.
     pressAllowed = !!allowed.press;
+    labelIsAdmin = !!allowed.label_approve;
     if (captureLocked && s.state !== lockFromState) { unlockPress(); }
     curState = s.state;
     curFault = !!s.fault;
@@ -968,6 +1029,73 @@ label { display: block; font-size: 14px; color: var(--muted); }
       t.update(findImage(images, t), fresh);
     });
     syncLive();
+    maybeRefreshLabels(false);
+  }
+
+  // ----- collected-part labels ---------------------------------------------
+  // Shown as text only (textContent), so station data cannot inject markup.
+  var labelIsAdmin = false;
+  var labelFetchAt = 0;
+
+  function labelText(last) {
+    if (!last) { return "No collected part yet."; }
+    var head = "Last collected part" + (last.part_number ? " (" + last.part_number + ")" : "") + ": ";
+    var crit = last.criterion_id ? " [" + last.criterion_id + "]" : "";
+    if (last.label_status === "proposed") {
+      return head + "PROPOSED " + last.verdict + crit + ", waiting for admin approval.";
+    }
+    if (last.label_status === "official") {
+      return head + "OFFICIAL " + last.verdict + crit + ".";
+    }
+    if (last.label_status === "rejected") {
+      return head + "REJECTED" + (last.reject_reason ? ": " + last.reject_reason : "") + ".";
+    }
+    return head + "not labelled yet.";
+  }
+
+  function renderPending(rows) {
+    var list = $("label-pending");
+    while (list.firstChild) { list.removeChild(list.firstChild); }
+    if (!rows.length) {
+      var none = document.createElement("li");
+      none.textContent = "No proposals waiting.";
+      list.appendChild(none);
+      return;
+    }
+    rows.forEach(function (row) {
+      var li = document.createElement("li");
+      var txt = "Part " + (row.part_number || "?") + " (" + (row.part_id || "?") + "): proposed "
+        + row.verdict + (row.criterion_id ? " [" + row.criterion_id + "]" : "")
+        + " by " + (row.proposed_by || "?") + " ";
+      li.appendChild(document.createTextNode(txt));
+      [["Approve", "approve"], ["Reject", "reject"]].forEach(function (pair) {
+        var b = document.createElement("button");
+        b.type = "button";
+        b.textContent = pair[0];
+        b.setAttribute("data-action", "label_approve");
+        b.setAttribute("data-decision", pair[1]);
+        if (row.part_id) { b.setAttribute("data-part-id", String(row.part_id)); }
+        li.appendChild(b);
+      });
+      list.appendChild(li);
+    });
+  }
+
+  // Polled at most every LABEL_MS, and right after a label action.
+  function maybeRefreshLabels(force) {
+    var now = Date.now();
+    if (!force && now - labelFetchAt < LABEL_MS) { return; }
+    labelFetchAt = now;
+    el.labelReview = el.labelReview || $("label-review");
+    el.labelReview.hidden = !labelIsAdmin;
+    request("GET", "/api/label/last").then(function (d) {
+      $("label-status").textContent = labelText(d.last);
+    }, function () {});
+    if (labelIsAdmin) {
+      request("GET", "/api/label/pending").then(function (d) {
+        renderPending(Array.isArray(d.pending) ? d.pending : []);
+      }, function () {});
+    }
   }
 
   function findImage(images, t) {
@@ -1000,6 +1128,7 @@ label { display: block; font-size: 14px; color: var(--muted); }
 
   function showLogin() {
     gen += 1;
+    labelFetchAt = 0;
     stopPolling();
     liveStop();
     unlockPress();
@@ -1279,14 +1408,28 @@ label { display: block; font-size: 14px; color: var(--muted); }
       if (!reason) { setError("Enter a reason before resolving or overriding."); return; }
       body = { verdict: btn.getAttribute("data-verdict"), reason: reason };
     }
-    if (action === "label") {
+    var path = PATHS[action];
+    if (action === "label_propose") {
       body = { verdict: btn.getAttribute("data-verdict") };
       var criterion = el.criterion.value.trim();
       if (body.verdict === "BAD" && criterion) { body.criterion_id = criterion; }
     }
+    if (action === "label_approve") {
+      // Admin only: approve or reject the pending proposal of one collected part.
+      var partId = btn.getAttribute("data-part-id");
+      if (partId) { body.part_id = partId; }
+      path = btn.getAttribute("data-decision") === "reject" ? "/api/label/reject" : "/api/label/approve";
+      if (path === "/api/label/reject") {
+        var why = $("reject-reason").value.trim();
+        if (!why) { setError("Enter a reject reason first."); return; }
+        body.reason = why;
+      }
+    }
     setError("");
-    request("POST", PATHS[action], body).then(function () {
+    request("POST", path, body).then(function () {
       if (action === "resolve" || action === "override") { el.reason.value = ""; }
+      if (action === "label_approve") { $("reject-reason").value = ""; }
+      if (action === "label_propose" || action === "label_approve") { maybeRefreshLabels(true); }
       schedule(0);
     }, function (err) {
       if (err.status === 401) { showLogin(); return; }

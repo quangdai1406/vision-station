@@ -29,6 +29,9 @@ from station.cameras import (STALE_FLUSH_FRAMES, FakeCameraSet, OpenCvCameraSet,
                              utc_now_iso)
 from station.contracts import (
     CAMERA_IDS,
+    LABEL_OFFICIAL,
+    LABEL_PROPOSED,
+    LABEL_REJECTED,
     Frame,
     InvalidTransition,
     OperatorLabel,
@@ -48,7 +51,8 @@ from station.outbox import Outbox
 from station.outputs import ConsoleOutputs, SerialRelayOutputs
 from station.parts import MesPartsClient, PartsError, build_part_config
 from station.session import StationSession
-from station.storage import COLLECTED, Store, check_criterion_id
+from station.storage import (COLLECTED, Store, check_criterion_id, check_reject_reason,
+                             label_status)
 from station.ui import make_server
 
 DEFAULT_UI_PORT = 8000
@@ -524,6 +528,17 @@ class _PartIdFactory:
 
 # ----------------------------------------------------------- session wrapper
 
+def _need_name(by: Any) -> None:
+    if not isinstance(by, str) or not by.strip():
+        raise ValueError("by is required")
+
+
+def _label_result(session_id: str, label: OperatorLabel, previous: Optional[dict]) -> dict:
+    return {"session_id": session_id, "verdict": Verdict(label.verdict).value,
+            "criterion_id": label.criterion_id, "status": label.status,
+            "changed": previous is not None}
+
+
 class _LockedSession:
     """Serialises every UI call into the session.
 
@@ -585,6 +600,23 @@ class _LockedSession:
         # Stored parts only: the store locks itself, so the session lock is not needed.
         return self._need_app().label_part(by=by, verdict=verdict, criterion_id=criterion_id,
                                            part_id=part_id)
+
+    def approve_label(self, by: str, part_id: Optional[str] = None) -> dict:
+        return self._need_app().approve_label(by=by, part_id=part_id)
+
+    def reject_label(self, by: str, reason: str, part_id: Optional[str] = None) -> dict:
+        return self._need_app().reject_label(by=by, reason=reason, part_id=part_id)
+
+    def set_official_label(self, by: str, verdict, criterion_id: Optional[str] = None,
+                           part_id: Optional[str] = None) -> dict:
+        return self._need_app().set_official_label(by=by, verdict=verdict,
+                                                   criterion_id=criterion_id, part_id=part_id)
+
+    def last_label_status(self) -> Optional[dict]:
+        return self._need_app().last_label_status()
+
+    def pending_labels(self) -> list:
+        return self._need_app().pending_labels()
 
     def tick(self) -> bool:
         with self._lock:
@@ -671,6 +703,7 @@ class StationApp:
         self._stop_event = threading.Event()
         self._sync_lock = threading.Lock()
         self._session_lock = threading.RLock()
+        self._label_lock = threading.Lock()  # one label write at a time: check, then write
         self._started = False
         self._closed = False
         self._ui_thread: Optional[threading.Thread] = None
@@ -1003,27 +1036,13 @@ class StationApp:
             return {"part_number": pn, "model_version": info.version, "can_inspect": True,
                     "warnings": warnings}
 
-    def label_part(self, by: str, verdict: Any, criterion_id: Optional[str] = None,
-                   part_id: Optional[str] = None) -> dict:
-        """Label a collected part GOOD or BAD (BAD may name a criterion). Never changes its verdict.
+    # ------------------------------------------------------------ labels
+    # Two-step approval. Operators PROPOSE (status 'proposed'); only an admin APPROVES, REJECTS or
+    # SETS the official label. Only an 'official' label is used for training. Nothing here changes
+    # the part's verdict, counters, images, manifest or the MES outbox.
 
-        With part_id, that collected part; otherwise the last collected part. A criterion id must be
-        in mes.criteria_ids when that list is configured; otherwise any short printable name is allowed.
-        """
-        new_verdict = Verdict(verdict)
-        if new_verdict not in (Verdict.GOOD, Verdict.BAD):
-            raise ValueError("verdict must be GOOD or BAD")
-        if not isinstance(by, str) or not by.strip():
-            raise ValueError("by is required")
-        criterion = None
-        if criterion_id is not None:
-            if new_verdict is Verdict.GOOD:
-                raise ValueError("a GOOD label takes no criterion_id")
-            criterion = check_criterion_id(criterion_id)
-            mes_cfg = getattr(self, "_mes_cfg", None)
-            allowed = list(mes_cfg.criteria_ids) if mes_cfg is not None else []
-            if allowed and criterion not in allowed:
-                raise ValueError("criterion_id must be one of the configured mes.criteria_ids")
+    def _label_target(self, part_id: Optional[str]) -> tuple[str, dict]:
+        """(session_id, part.json) of the named collected part, else of the last collected part."""
         if part_id is not None:
             session_id = self.store.collected_session_id_for_part(str(part_id))
             if session_id is None:
@@ -1032,11 +1051,136 @@ class StationApp:
             session_id = self.store.last_collected_session_id()
             if session_id is None:
                 raise ValueError("there is no collected part to label")
-        label = OperatorLabel(verdict=new_verdict, labelled_by=by.strip(),
-                              labelled_at=self._now_utc(), criterion_id=criterion)
-        previous = self.store.set_operator_label(session_id, label)
+        return session_id, self.store.collected_part_doc(session_id)
+
+    def _allowed_criteria(self, part_number: Any) -> set[str]:
+        """Configured mes.criteria_ids plus the part's own MES criteria (parts mode). May be empty."""
+        allowed: set[str] = set()
+        mes_cfg = getattr(self, "_mes_cfg", None)
+        if mes_cfg is not None:
+            allowed.update(mes_cfg.criteria_ids)
+        if self._parts_mode == "mes" and part_number:
+            part = self._part_configs.get(str(part_number))
+            if part is not None:
+                allowed.update(part["criteria_ids"])
+        return allowed
+
+    def _check_label_criterion(self, verdict: Verdict, criterion_id: Optional[str],
+                               part_number: Any) -> Optional[str]:
+        if criterion_id is None:
+            return None
+        if verdict is Verdict.GOOD:
+            raise ValueError("a GOOD label takes no criterion_id")
+        criterion = check_criterion_id(criterion_id)
+        allowed = self._allowed_criteria(part_number)
+        # Neither list available (fixed mode, no criteria_ids): any valid free name, as before.
+        if allowed and criterion not in allowed:
+            raise ValueError("criterion_id must be one of the configured mes.criteria_ids "
+                             "or this part's MES criteria")
+        return criterion
+
+    def _write_label(self, session_id: str, label: OperatorLabel, action: str) -> Optional[dict]:
+        return self.store.set_operator_label(session_id, label, action=action)
+
+    def label_part(self, by: str, verdict: Any, criterion_id: Optional[str] = None,
+                   part_id: Optional[str] = None) -> dict:
+        """PROPOSE a label for a collected part (operator, supervisor or admin). Status 'proposed'.
+
+        A new proposal replaces an earlier proposal or rejection. An official label cannot be
+        proposed over: only an admin changes it (set_official_label).
+        """
+        new_verdict = Verdict(verdict)
+        if new_verdict not in (Verdict.GOOD, Verdict.BAD):
+            raise ValueError("verdict must be GOOD or BAD")
+        if not isinstance(by, str) or not by.strip():
+            raise ValueError("by is required")
+        with self._label_lock:
+            session_id, doc = self._label_target(part_id)
+            criterion = self._check_label_criterion(new_verdict, criterion_id, doc.get("part_number"))
+            if label_status(doc.get("operator_label")) == LABEL_OFFICIAL:
+                raise ValueError("this part has an official label: only an admin can change it")
+            now = self._now_utc()
+            label = OperatorLabel(verdict=new_verdict, labelled_by=by.strip(), labelled_at=now,
+                                  criterion_id=criterion, status=LABEL_PROPOSED,
+                                  proposed_by=by.strip(), proposed_at=now)
+            previous = self._write_label(session_id, label, "propose")
         return {"session_id": session_id, "verdict": new_verdict.value, "criterion_id": criterion,
-                "changed": previous is not None}
+                "status": LABEL_PROPOSED, "changed": previous is not None}
+
+    def approve_label(self, by: str, part_id: Optional[str] = None) -> dict:
+        """ADMIN: make the pending proposal of a collected part OFFICIAL."""
+        _need_name(by)
+        with self._label_lock:
+            session_id, doc = self._label_target(part_id)
+            current = doc.get("operator_label")
+            if label_status(current) != LABEL_PROPOSED:
+                raise ValueError("there is no pending proposal on this part to approve")
+            now = self._now_utc()
+            label = OperatorLabel(verdict=Verdict(current["verdict"]), labelled_by=by.strip(),
+                                  labelled_at=now, criterion_id=current.get("criterion_id"),
+                                  status=LABEL_OFFICIAL, proposed_by=current["proposed_by"],
+                                  proposed_at=current["proposed_at"], approved_by=by.strip(),
+                                  approved_at=now)
+            previous = self._write_label(session_id, label, "approve")
+        return _label_result(session_id, label, previous)
+
+    def reject_label(self, by: str, reason: str, part_id: Optional[str] = None) -> dict:
+        """ADMIN: reject the pending proposal of a collected part, with a short reason."""
+        _need_name(by)
+        reject_reason = check_reject_reason(reason)
+        with self._label_lock:
+            session_id, doc = self._label_target(part_id)
+            current = doc.get("operator_label")
+            if label_status(current) != LABEL_PROPOSED:
+                raise ValueError("there is no pending proposal on this part to reject")
+            now = self._now_utc()
+            label = OperatorLabel(verdict=Verdict(current["verdict"]), labelled_by=by.strip(),
+                                  labelled_at=now, criterion_id=current.get("criterion_id"),
+                                  status=LABEL_REJECTED, proposed_by=current["proposed_by"],
+                                  proposed_at=current["proposed_at"], approved_by=by.strip(),
+                                  approved_at=now, reject_reason=reject_reason)
+            previous = self._write_label(session_id, label, "reject")
+        return _label_result(session_id, label, previous)
+
+    def set_official_label(self, by: str, verdict: Any, criterion_id: Optional[str] = None,
+                           part_id: Optional[str] = None) -> dict:
+        """ADMIN: set the OFFICIAL label of a collected part directly (replaces any earlier label)."""
+        _need_name(by)
+        new_verdict = Verdict(verdict)
+        if new_verdict not in (Verdict.GOOD, Verdict.BAD):
+            raise ValueError("verdict must be GOOD or BAD")
+        with self._label_lock:
+            session_id, doc = self._label_target(part_id)
+            criterion = self._check_label_criterion(new_verdict, criterion_id, doc.get("part_number"))
+            now = self._now_utc()
+            label = OperatorLabel(verdict=new_verdict, labelled_by=by.strip(), labelled_at=now,
+                                  criterion_id=criterion, status=LABEL_OFFICIAL,
+                                  approved_by=by.strip(), approved_at=now)
+            previous = self._write_label(session_id, label, "set_official")
+        return _label_result(session_id, label, previous)
+
+    def last_label_status(self) -> Optional[dict]:
+        """The last collected part and its label (any status), or None if there is none."""
+        session_id = self.store.last_collected_session_id()
+        if session_id is None:
+            return None
+        doc = self.store.collected_part_doc(session_id)
+        label = doc.get("operator_label")
+        return {"session_id": session_id, "part_id": doc.get("part_id"),
+                "part_number": doc.get("part_number"),
+                "label_status": label_status(label) if label is not None else None,
+                "verdict": label.get("verdict") if label is not None else None,
+                "criterion_id": label.get("criterion_id") if label is not None else None,
+                "reject_reason": label.get("reject_reason") if label is not None else None}
+
+    def pending_labels(self) -> list[dict]:
+        """Collected parts with a proposal waiting for an admin, oldest first."""
+        rows = self.store.collected_labels(status=LABEL_PROPOSED)
+        return [{"session_id": r["session_id"], "part_id": r["part_id"],
+                 "part_number": r["part_number"], "verdict": r["operator_label"]["verdict"],
+                 "criterion_id": r["operator_label"].get("criterion_id"),
+                 "proposed_by": r["operator_label"].get("proposed_by"),
+                 "proposed_at": r["operator_label"].get("proposed_at")} for r in rows]
 
     def _block_part(self, part_number: str, reason: str, warnings: list[str]) -> dict:
         self.session.clear_part()

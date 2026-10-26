@@ -112,18 +112,35 @@ class Override:
     by: str
 
 
+LABEL_PROPOSED = "proposed"  # an operator proposed it; never used for training
+LABEL_OFFICIAL = "official"  # approved by an admin (or set by one); the only label training uses
+LABEL_REJECTED = "rejected"  # an admin rejected the proposal, with a reason; never used for training
+LABEL_STATUSES = (LABEL_PROPOSED, LABEL_OFFICIAL, LABEL_REJECTED)
+
+
 @dataclass(frozen=True)
 class OperatorLabel:
     """A human label on a collected part (collect mode), so it can be used for training.
 
     Never changes the part's final_verdict or counters; it is metadata on the saved part.
     criterion_id is only meaningful for BAD and is None for GOOD.
+
+    Two-step approval: an operator proposes (status 'proposed'); only an admin makes it
+    'official' or 'rejected'. labelled_by/labelled_at are who wrote this record last.
+    proposed_* is the proposer; approved_* is the admin who approved, rejected or set it.
+    A label saved before the status field existed has no status and counts as 'official'.
     """
 
     verdict: Verdict  # GOOD or BAD only
     labelled_by: str
     labelled_at: str  # ISO 8601 UTC
     criterion_id: Optional[str] = None
+    status: str = LABEL_OFFICIAL  # 'proposed' | 'official' | 'rejected'
+    proposed_by: Optional[str] = None
+    proposed_at: Optional[str] = None
+    approved_by: Optional[str] = None
+    approved_at: Optional[str] = None
+    reject_reason: Optional[str] = None
 
 
 @dataclass

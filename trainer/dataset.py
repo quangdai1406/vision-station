@@ -182,6 +182,7 @@ def _check_doc(doc: dict) -> Optional[str]:
     operator_label = doc.get("operator_label")
     if operator_label is not None and (
         not isinstance(operator_label, dict) or operator_label.get("verdict") not in ("GOOD", "BAD")
+        or operator_label.get("status", "official") not in ("proposed", "official", "rejected")
     ):
         return "bad operator_label"
     return None
@@ -402,7 +403,11 @@ def classify(sample: PartSample, good_policy: str = "strict") -> str:
     policy = _check_policy(good_policy)
     if sample.disposition == "collected":  # station.storage.COLLECTED; this module imports nothing from station
         label = sample.operator_label
-        verdict = label.get("verdict") if isinstance(label, dict) else None
+        # Only an admin-approved label trains. A label with no status key is official (older parts).
+        # 'proposed' and 'rejected' labels, and any other status, are excluded.
+        if not isinstance(label, dict) or label.get("status", "official") != "official":
+            return "excluded"
+        verdict = label.get("verdict")
         if verdict == "GOOD":
             return "good"
         if verdict == "BAD":

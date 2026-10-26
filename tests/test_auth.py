@@ -94,12 +94,12 @@ class RolePolicyTests(unittest.TestCase):
         table = {
             "operator": {"press": True, "ack": True, "resolve": False,
                          "override": False, "clear_fault": False, "select_part": True,
-                         "label": True},
+                         "label_propose": True, "label_approve": False},
             "supervisor": {"press": True, "ack": True, "resolve": True,
                            "override": True, "clear_fault": True, "select_part": True,
-                           "label": True},
+                           "label_propose": True, "label_approve": False},
             "admin": {a: True for a in ("press", "ack", "resolve", "override", "clear_fault",
-                                        "select_part", "label")},
+                                        "select_part", "label_propose", "label_approve")},
         }
         for role, row in table.items():
             for action, expected in row.items():
@@ -111,7 +111,8 @@ class RolePolicyTests(unittest.TestCase):
         self.assertFalse(role_allows("admin", "delete_everything"))
         self.assertEqual(set(ACTIONS),
                          {"press", "ack", "resolve", "override", "clear_fault", "select_part",
-                          "label"})
+                          "label_propose", "label_approve"})
+        self.assertFalse(role_allows("operator", "label"))  # the old single 'label' action is gone
 
 
 class UserStoreTests(unittest.TestCase):

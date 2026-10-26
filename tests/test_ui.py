@@ -49,6 +49,12 @@ class FakeSession:
         self.preview_bytes = JPEG_BYTES
         # Part picker: when set, these keys are merged into snapshot() (parts_mode 'mes').
         self.parts_snapshot = None
+        self.last_label = {"session_id": "S-9", "part_id": "P-7", "part_number": "AISI-100",
+                           "label_status": "proposed", "verdict": "BAD",
+                           "criterion_id": "CR-1", "reject_reason": None}
+        self.pending = [{"session_id": "S-9", "part_id": "P-7", "part_number": "AISI-100",
+                         "verdict": "BAD", "criterion_id": "CR-1", "proposed_by": OP_USER,
+                         "proposed_at": "2026-10-26T08:00:00Z", "operator_label_secret": "x"}]
         self.parts = [{"part_number": "AISI-100", "description": "Liner LH", "part_type": "FG",
                        "lifecycle": "ACTIVE", "unit_cost": 12.5, "bom": ["x"],
                        "planning": {"wo": 3}}]
@@ -141,7 +147,31 @@ class FakeSession:
         self._call("label_part", by=by, verdict=verdict, criterion_id=criterion_id,
                    part_id=part_id)
         return {"session_id": "S-9", "verdict": verdict.value, "criterion_id": criterion_id,
-                "changed": False}
+                "status": "proposed", "changed": False}
+
+    def approve_label(self, by, part_id=None):
+        self._call("approve_label", by=by, part_id=part_id)
+        return {"session_id": "S-9", "verdict": "BAD", "criterion_id": "CR-1",
+                "status": "official", "changed": True}
+
+    def reject_label(self, by, reason, part_id=None):
+        self._call("reject_label", by=by, reason=reason, part_id=part_id)
+        return {"session_id": "S-9", "verdict": "BAD", "criterion_id": None,
+                "status": "rejected", "changed": True}
+
+    def set_official_label(self, by, verdict, criterion_id=None, part_id=None):
+        self._call("set_official_label", by=by, verdict=verdict, criterion_id=criterion_id,
+                   part_id=part_id)
+        return {"session_id": "S-9", "verdict": verdict.value, "criterion_id": criterion_id,
+                "status": "official", "changed": True}
+
+    def last_label_status(self):
+        self._call("last_label_status")
+        return dict(self.last_label) if self.last_label is not None else None
+
+    def pending_labels(self):
+        self._call("pending_labels")
+        return list(self.pending)
 
 
 class PartsError(Exception):
@@ -889,7 +919,7 @@ class PartsPageTests(UiTestCase):
 
 
 class LabelActionTests(UiTestCase):
-    def test_every_logged_in_role_can_label_and_by_is_the_login(self):
+    def test_every_logged_in_role_can_propose_and_by_is_the_login(self):
         for user, pw in ((OP_USER, OP_PW), (SUP_USER, SUP_PW), (ADM_USER, ADM_PW)):
             with self.subTest(user=user):
                 token = self.login(user, pw)
@@ -898,19 +928,20 @@ class LabelActionTests(UiTestCase):
                                    "by": "mallory"}, token=token)
                 self.assertEqual(reply.status, 200, reply.body)
                 self.assertEqual(set(self.js(reply)),
-                                 {"session_id", "verdict", "criterion_id", "changed"})
+                                 {"session_id", "verdict", "criterion_id", "status", "changed"})
         calls = [kw for name, kw in self.session.calls if name == "label_part"]
         self.assertEqual([c["by"] for c in calls], [OP_USER, SUP_USER, ADM_USER])
         self.assertEqual(calls[0]["verdict"], Verdict.BAD)
         self.assertEqual(calls[0]["criterion_id"], "CR-1")
         self.assertEqual(calls[0]["part_id"], "P-7")
+        self.assertNotIn("approve_label", self.session.names())
         self.assertNotIn("resolve_review", self.session.names())
 
     def test_label_needs_login(self):
         self.assertEqual(self.call("POST", "/api/label", {"verdict": "GOOD"}).status, 401)
         self.assertNotIn("label_part", self.session.names())
 
-    def test_role_without_label_action_gets_403(self):
+    def test_role_without_label_propose_gets_403(self):
         token = self.login(OP_USER, OP_PW)
         with mock.patch.dict(station_auth._POLICY,
                              {"operator": frozenset({"press", "ack", "select_part"})}):
@@ -936,11 +967,69 @@ class LabelActionTests(UiTestCase):
                           token=token)
         self.assertEqual(reply.status, 400)
 
+    def test_approve_and_reject_are_admin_only(self):
+        for user, pw in ((OP_USER, OP_PW), (SUP_USER, SUP_PW)):
+            token = self.login(user, pw)
+            for path, body in (("/api/label/approve", {"part_id": "P-7"}),
+                               ("/api/label/reject", {"part_id": "P-7", "reason": "blur"})):
+                with self.subTest(user=user, path=path):
+                    self.assertEqual(self.call("POST", path, body, token=token).status, 403)
+            self.assertEqual(self.call("GET", "/api/label/pending", token=token).status, 403)
+        self.assertEqual({"approve_label", "reject_label"} & set(self.session.names()), set())
+
+    def test_admin_approves_or_sets_official(self):
+        token = self.login(ADM_USER, ADM_PW)
+        reply = self.call("POST", "/api/label/approve", {"part_id": "P-7", "by": "x"}, token=token)
+        self.assertEqual(reply.status, 200, reply.body)
+        self.assertEqual(self.js(reply)["status"], "official")
+        approve = [kw for name, kw in self.session.calls if name == "approve_label"]
+        self.assertEqual(approve, [{"by": ADM_USER, "part_id": "P-7"}])
+        reply = self.call("POST", "/api/label/approve",
+                          {"verdict": "GOOD", "part_id": "P-7"}, token=token)
+        self.assertEqual(reply.status, 200, reply.body)
+        direct = [kw for name, kw in self.session.calls if name == "set_official_label"]
+        self.assertEqual(direct[0]["verdict"], Verdict.GOOD)
+        self.assertEqual(direct[0]["by"], ADM_USER)
+        self.assertEqual(self.call("POST", "/api/label/approve", {"verdict": "REVIEW"},
+                                   token=token).status, 400)
+
+    def test_admin_rejects_with_a_reason(self):
+        token = self.login(ADM_USER, ADM_PW)
+        reply = self.call("POST", "/api/label/reject", {"part_id": "P-7", "reason": " blurred "},
+                          token=token)
+        self.assertEqual(reply.status, 200, reply.body)
+        rejects = [kw for name, kw in self.session.calls if name == "reject_label"]
+        self.assertEqual(rejects, [{"by": ADM_USER, "reason": "blurred", "part_id": "P-7"}])
+        for body in ({"part_id": "P-7"}, {"reason": "   "}, {"reason": "x" * 201}):
+            with self.subTest(body=body):
+                self.assertEqual(self.call("POST", "/api/label/reject", body, token=token).status, 400)
+
+    def test_pending_list_is_admin_only_and_returns_safe_keys(self):
+        token = self.login(ADM_USER, ADM_PW)
+        reply = self.call("GET", "/api/label/pending", token=token)
+        self.assertEqual(reply.status, 200)
+        rows = self.js(reply)["pending"]
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("operator_label_secret", rows[0])
+        self.assertEqual(rows[0]["part_id"], "P-7")
+
+    def test_last_label_status_for_any_role(self):
+        token = self.login(OP_USER, OP_PW)
+        reply = self.call("GET", "/api/label/last", token=token)
+        self.assertEqual(reply.status, 200)
+        self.assertEqual(self.js(reply)["last"]["label_status"], "proposed")
+        self.session.last_label = None
+        self.assertIsNone(self.js(self.call("GET", "/api/label/last", token=token))["last"])
+        self.assertEqual(self.call("GET", "/api/label/last").status, 401)
+
     def test_page_has_label_controls(self):
         page = self.call("GET", "/").body.decode("utf-8")
-        self.assertIn('data-action="label"', page)
+        self.assertIn('data-action="label_propose"', page)
         self.assertIn('"/api/label"', page)
+        self.assertIn('"/api/label/approve"', page)
         self.assertIn('id="criterion"', page)
+        self.assertIn('id="label-pending"', page)
+        self.assertIn('id="reject-reason"', page)
 
 
 if __name__ == "__main__":

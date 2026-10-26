@@ -28,13 +28,16 @@ _MAX_P = 4
 _MIN_DIGEST_BYTES = 16
 _MAX_DIGEST_BYTES = 64
 
-ACTIONS = ("press", "ack", "resolve", "override", "clear_fault", "select_part", "label")
+# label_propose: anyone who inspects may propose a label (it is not official until an admin approves).
+# label_approve: admin only; approves, rejects or sets an official label.
+ACTIONS = ("press", "ack", "resolve", "override", "clear_fault", "select_part",
+           "label_propose", "label_approve")
 ROLES = ("operator", "supervisor", "admin")
 
 _POLICY: dict[str, frozenset[str]] = {
-    "operator": frozenset({"press", "ack", "select_part", "label"}),
+    "operator": frozenset({"press", "ack", "select_part", "label_propose"}),
     "supervisor": frozenset({"press", "ack", "resolve", "override", "clear_fault", "select_part",
-                             "label"}),
+                             "label_propose"}),
     "admin": frozenset(ACTIONS),
 }
 

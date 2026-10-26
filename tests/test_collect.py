@@ -246,6 +246,92 @@ class CollectAppTests(unittest.TestCase):
         self.assertEqual(result["criterion_id"], "Scratch")
 
 
+class TwoStepLabelAppTests(unittest.TestCase):
+    """Two-step approval through StationApp: operators propose, only an admin makes it official."""
+
+    setUp = CollectAppTests.setUp
+    _restore_env = CollectAppTests._restore_env
+    _collected_app = CollectAppTests._collected_app
+
+    def label_docs(self, app):
+        part = app.store.recent_parts(1)[0]
+        with open(os.path.join(part["path"], "part.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_propose_then_admin_approves_and_it_is_logged(self) -> None:
+        app = self._collected_app()
+        result = app.label_part(by="op1", verdict=Verdict.BAD, criterion_id="CR-1")
+        self.assertEqual(result["status"], "proposed")
+        doc = self.label_docs(app)
+        self.assertEqual(doc["operator_label"]["status"], "proposed")
+        self.assertEqual(doc["operator_label"]["proposed_by"], "op1")
+        self.assertEqual(app.pending_labels()[0]["criterion_id"], "CR-1")
+        self.assertEqual(app.last_label_status()["label_status"], "proposed")
+        approved = app.approve_label(by="admin1")
+        self.assertEqual(approved["status"], "official")
+        doc = self.label_docs(app)["operator_label"]
+        self.assertEqual((doc["status"], doc["approved_by"], doc["proposed_by"]),
+                         ("official", "admin1", "op1"))
+        self.assertEqual(app.pending_labels(), [])
+        self.assertEqual(app.session.counters, {"total": 1, "good": 0, "bad": 0})
+        self.assertEqual(app.store.recent_parts(1)[0]["final_verdict"], "REVIEW")
+        self.assertEqual(app.outbox.pending_count(), 0)
+        self.assertEqual(_event_kinds(app).count("operator_label"), 2)
+
+    def test_official_label_only_admin_can_change(self) -> None:
+        app = self._collected_app()
+        app.label_part(by="op1", verdict=Verdict.BAD, criterion_id="CR-1")
+        app.approve_label(by="admin1")
+        with self.assertRaises(ValueError):
+            app.label_part(by="op1", verdict=Verdict.GOOD)
+        changed = app.set_official_label(by="admin1", verdict=Verdict.GOOD)
+        self.assertTrue(changed["changed"])
+        doc = self.label_docs(app)["operator_label"]
+        self.assertEqual((doc["verdict"], doc["status"], doc["approved_by"]),
+                         ("GOOD", "official", "admin1"))
+
+    def test_reject_needs_pending_proposal_and_a_reason(self) -> None:
+        app = self._collected_app()
+        with self.assertRaises(ValueError):
+            app.reject_label(by="admin1", reason="nope")
+        with self.assertRaises(ValueError):
+            app.approve_label(by="admin1")
+        app.label_part(by="op1", verdict=Verdict.BAD, criterion_id="CR-1")
+        with self.assertRaises(ValueError):
+            app.reject_label(by="admin1", reason="   ")
+        with self.assertRaises(ValueError):
+            app.reject_label(by="admin1", reason="x" * 201)
+        rejected = app.reject_label(by="admin1", reason="blurred")
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(app.last_label_status()["reject_reason"], "blurred")
+        self.assertEqual(app.pending_labels(), [])
+        again = app.label_part(by="op2", verdict=Verdict.GOOD)  # a new proposal replaces the rejection
+        self.assertEqual(again["status"], "proposed")
+        self.assertTrue(again["changed"])
+
+    def test_criterion_checked_against_configured_and_part_lists(self) -> None:
+        app = self._collected_app()
+        app._parts_mode = "mes"
+        app._part_configs["PN-100"] = {"criteria_ids": ["CR-7"], "class_to_criterion": {}}
+        try:
+            self.assertEqual(app.label_part(by="op1", verdict=Verdict.BAD,
+                                            criterion_id="CR-7")["criterion_id"], "CR-7")
+            self.assertEqual(app.label_part(by="op1", verdict=Verdict.BAD,
+                                            criterion_id="CR-1")["criterion_id"], "CR-1")
+            with self.assertRaises(ValueError):
+                app.label_part(by="op1", verdict=Verdict.BAD, criterion_id="CR-9")
+        finally:
+            app._part_configs.pop("PN-100", None)
+
+    def test_fixed_mode_without_criteria_accepts_a_free_name(self) -> None:
+        app = self._collected_app()
+        app._mes_cfg = replace(app._mes_cfg, criteria_ids=[])
+        result = app.label_part(by="op1", verdict=Verdict.BAD, criterion_id="Scratch on flange")
+        self.assertEqual(result["criterion_id"], "Scratch on flange")
+        with self.assertRaises(ValueError):
+            app.label_part(by="op1", verdict=Verdict.BAD, criterion_id="bad\tname")
+
+
 class CollectConfigTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="collect-config-")
