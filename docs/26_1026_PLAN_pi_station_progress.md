@@ -110,3 +110,19 @@ BAD; never invent thresholds or counts (write `[Quality to define]`); no secrets
 - 3.2 promote, 3.4 thresholds (needs labelled scores), 3.5 Quality approval; 3.3/2.4 only if defect names are wanted (D-A).
 - 4.x shadow run, live run, failure tests (unplug/replug), weekly cycle.
 - Small open items: confirm operators may label BAD; per-part MES criteria are not used by the label check; run the page JS where node exists.
+
+## Round 3 steps (added 2026-10-26)
+
+| # | Step | Verify | Owner | Status |
+|---|---|---|---|---|
+| 0.1b | Commit and merge into local main (not pushed) | full suite OK on merged main; CODEGRAPH current | Claude | DONE (merge d5d5fa0, 1144 tests) |
+| 1.4b | Two-step labels: operator PROPOSES, admin makes OFFICIAL; trainer uses official only; check criterion against configured list AND the part's own MES criteria (branch feature/two-step-labels) | tests + checker | Claude (Haiku worker) | DOING |
+| 1.3b | Real-camera collect test with the test object: 20 parts, picture quality, back-to-back presses | report + saved evidence in scratch | Claude (Haiku worker) | DOING |
+| 1.3c | Unplug/replug a camera during a run | station names the camera and recovers | user unplugs, Claude watches | TODO |
+| 0.5 | Install node (`! sudo apt install -y nodejs`), run the 2 skipped UI tests | tests not skipped | user installs | TODO |
+| 0.6 | Office checklist for tomorrow (MES token, part search, laptop setup, transfer) | file docs/office_checklist.md | Claude | TODO |
+
+| Date | Step | Note |
+|---|---|---|
+| 2026-10-26 | 0.1b | Committed in 4 commits and merged into local main (merge d5d5fa0). Not pushed; main is 5 commits ahead of origin/main. Git identity is not set on the Pi; commits used -c user.name/user.email. |
+| 2026-10-26 | 1.4b | User approved extending OperatorLabel in contracts.py and asked for Haiku workers. |
