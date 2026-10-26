@@ -1397,5 +1397,117 @@ class SequentialOpenPerShotTests(unittest.TestCase):
                     OpenCvCameraSet([0], cv2_module=FakeCv2(), capture_mode="sequential", **kwargs)
 
 
+class Mjpg4Cv2(FakeCv2):
+    CAP_PROP_FOURCC = 6
+
+    @staticmethod
+    def VideoWriter_fourcc(*chars):
+        return "".join(chars)
+
+
+class KeepOpenSessionTests(unittest.TestCase):
+    """Opt-in keep-open session: MJPG, threaded grab, per-camera failure."""
+
+    def _set(self, cv2=None, **kw):
+        return OpenCvCameraSet([0, 2, 4, 6], cv2_module=cv2 or Mjpg4Cv2(), **kw)
+
+    def test_default_never_requests_mjpg_and_is_not_keep_open(self):
+        cv2 = Mjpg4Cv2()
+        cams = self._set(cv2)
+        cams.open()
+        for cap in cv2.captures:
+            self.assertNotIn(Mjpg4Cv2.CAP_PROP_FOURCC, cap.props)
+        cams.capture(Side.TOP)
+        self.assertEqual(cams.last_failed_cameras, [])
+        self.assertIsNone(cams.last_worker_times_s)
+        self.assertEqual(len(cv2.captures), 4)
+
+    def test_default_failure_still_drops_every_device(self):
+        cv2 = Mjpg4Cv2()
+        cams = self._set(cv2)
+        cams.open()
+        cv2.captures[1].grab_ok = False
+        with self.assertRaises(CameraError):
+            cams.capture(Side.TOP)
+        self.assertFalse(cams.is_open)
+
+    def test_options_need_keep_open(self):
+        with self.assertRaises(ValueError):
+            self._set(mjpg=True)
+        with self.assertRaises(ValueError):
+            self._set(threaded=True)
+        with self.assertRaises(ValueError):
+            self._set(session_mode="bogus")
+        with self.assertRaises(ValueError):
+            self._set(session_mode="keep_open", capture_mode="sequential")
+
+    def test_mjpg_requested_before_width_and_height_only_when_enabled(self):
+        cv2 = Mjpg4Cv2()
+        self._set(cv2, session_mode="keep_open", mjpg=True).open()
+        self.assertEqual(len(cv2.captures), 4)
+        for cap in cv2.captures:
+            self.assertEqual(cap.props[Mjpg4Cv2.CAP_PROP_FOURCC], "MJPG")
+            sets = [e[2] for e in cv2.log if e[0] == "set" and e[1] == cap.index]
+            self.assertLess(sets.index(Mjpg4Cv2.CAP_PROP_FOURCC),
+                            sets.index(Mjpg4Cv2.CAP_PROP_FRAME_WIDTH))
+        cv2b = Mjpg4Cv2()
+        self._set(cv2b, session_mode="keep_open", mjpg=False).open()
+        for cap in cv2b.captures:
+            self.assertNotIn(Mjpg4Cv2.CAP_PROP_FOURCC, cap.props)
+
+    def test_threaded_capture_flushes_configured_frames_and_returns_four_frames(self):
+        cv2 = Mjpg4Cv2()
+        cams = self._set(cv2, session_mode="keep_open", threaded=True, stale_flush_frames=1)
+        frames = cams.capture(Side.TOP)
+        self.assertEqual([f.camera_id for f in frames], list(CAMERA_IDS))
+        self.assertTrue(all(f.ext == "png" for f in frames))
+        warm = 5
+        for cap in cv2.captures:
+            grabs = [e for e in cv2.log if e == ("grab", cap.index)]
+            self.assertEqual(len(grabs), warm + 1 + 1)  # warm-up, 1 flush, 1 real
+        self.assertEqual(len(cams.last_worker_times_s), 4)
+        self.assertEqual(len(cams.last_capture_times_s), 4)
+        cams.capture(Side.BOTTOM)
+        self.assertEqual(len(cv2.captures), 4)  # kept open, not reopened
+
+    def test_failing_camera_is_named_and_others_keep_working(self):
+        cv2 = Mjpg4Cv2()
+        cams = self._set(cv2, session_mode="keep_open", threaded=True, stale_flush_frames=0)
+        cams.capture(Side.TOP)
+        cv2.captures[2].grab_ok = False
+        with self.assertRaisesRegex(CameraError, "C3: grab failed") as ctx:
+            cams.capture(Side.TOP)
+        self.assertNotIn("C1", str(ctx.exception))
+        self.assertEqual(cams.last_failed_cameras, ["C3"])
+        # Every other camera was still grabbed this round, and none was released.
+        released = [e[1] for e in cv2.log if e[0] == "release"]
+        self.assertEqual(released, [4])
+        self.assertTrue(cams.is_open)
+        # The next capture reopens only the failed camera.
+        frames = cams.capture(Side.TOP)
+        self.assertEqual(len(frames), 4)
+        self.assertEqual(len(cv2.captures), 5)
+        self.assertEqual(cams.last_failed_cameras, [])
+
+    def test_camera_that_will_not_open_is_reported_and_others_stay_open(self):
+        cv2 = Mjpg4Cv2()
+        real = cv2.VideoCapture
+
+        def vc(index):
+            cap = real(index)
+            cap.opened = index != 4
+            return cap
+
+        cv2.VideoCapture = vc
+        cams = self._set(cv2, session_mode="keep_open", threaded=True)
+        with self.assertRaisesRegex(CameraError, "C3"):
+            cams.capture(Side.TOP)
+        self.assertEqual(cams.last_failed_cameras, ["C3"])
+        self.assertTrue(cams.is_open)
+        self.assertEqual(cams.preview("C3"), None)
+        self.assertIsNotNone(cams.preview("C1"))
+        cams.release()  # None entries must not break release
+
+
 if __name__ == "__main__":
     unittest.main()

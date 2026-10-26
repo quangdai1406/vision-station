@@ -57,6 +57,10 @@ PREVIEW_SEQ_MIN_INTERVAL_S = 1.0
 # old a shown picture may be; not a quality limit).
 PREVIEW_CACHE_MAX_AGE_S = 10.0
 
+# Opt-in "keep_open" session mode (simultaneous capture only). The default keeps
+# today's behaviour. See OpenCvCameraSet.
+SESSION_MODES = ("default", "keep_open")
+
 _MANUAL_KEYS = ("focus", "exposure", "white_balance")
 
 
@@ -200,6 +204,15 @@ class OpenCvCameraSet:
     it, at most once per preview_seq_min_interval_s; other calls get the cached
     JPEG (kept preview_cache_max_age_s at most).
 
+    session_mode "keep_open" (opt-in, simultaneous mode only; default "default" is
+    unchanged): open() opens all cameras at once, one thread each, and a camera
+    that fails to open or to deliver a frame is reported by name in the CameraError
+    (and in last_failed_cameras) while the others stay open; only the failed
+    camera is released and reopened by the next capture(). mjpg=True requests MJPG
+    before width and height. threaded=True flushes, grabs and retrieves in one
+    thread per camera; PNG encoding is unchanged. The flush count is
+    stale_flush_frames. mjpg and threaded need keep_open.
+
     last_skew_s is max-min of the per-camera grab end times (in sequential mode
     it is large by design). last_capture_total_s runs from the start of the first
     grab to the end of the last grab. last_capture_times_s lists each camera's
@@ -235,6 +248,9 @@ class OpenCvCameraSet:
         sequential_keep_open: bool = False,
         preview_seq_min_interval_s: float = PREVIEW_SEQ_MIN_INTERVAL_S,
         preview_cache_max_age_s: float = PREVIEW_CACHE_MAX_AGE_S,
+        session_mode: str = "default",
+        mjpg: bool = False,
+        threaded: bool = False,
     ) -> None:
         indexes = list(device_indexes)
         if not 1 <= len(indexes) <= len(CAMERA_IDS):
@@ -246,6 +262,19 @@ class OpenCvCameraSet:
         if unknown:
             raise ValueError(f"unknown manual setting(s): {sorted(unknown)}")
         self._capture_mode = _check_capture_mode(capture_mode)
+        if session_mode not in SESSION_MODES:
+            raise ValueError(f"session_mode must be one of {SESSION_MODES}, got {session_mode!r}")
+        if session_mode == "keep_open" and self._capture_mode != "simultaneous":
+            raise ValueError("session_mode 'keep_open' needs capture_mode 'simultaneous'")
+        if (mjpg or threaded) and session_mode != "keep_open":
+            raise ValueError("mjpg and threaded need session_mode 'keep_open'")
+        self._session_keep_open = session_mode == "keep_open"
+        self._mjpg = bool(mjpg)
+        self._threaded = bool(threaded)
+        # Keep-open session: cameras that failed in the last open or capture, and the
+        # per-camera timings of the last threaded capture (None until one succeeds).
+        self.last_failed_cameras: list[str] = []
+        self.last_worker_times_s: Optional[list[float]] = None
         self._sequential_keep_open = bool(sequential_keep_open)
         self._indexes = indexes
         self._camera_ids: tuple[str, ...] = camera_ids_for(len(indexes))
@@ -324,6 +353,9 @@ class OpenCvCameraSet:
             if self._seq_keep:
                 self._open_seq_devices()
             return
+        if self._session_keep_open:
+            self._open_keep_open_devices()
+            return
         if self._caps is not None:
             return
         cv2 = self._cv2
@@ -345,6 +377,42 @@ class OpenCvCameraSet:
         self._last_open_error = None
         self._failed_open_at = None
         self._consecutive_failures = 0
+
+    def _open_keep_open_devices(self) -> None:
+        """Keep-open session: open every camera not open yet, in parallel threads.
+
+        _caps holds None for a camera that is not open. A partial failure is kept
+        (the good cameras stay open) and recorded in last_failed_cameras and
+        last_open_error; open() raises only when no camera is open at all.
+        """
+        caps: list[Any] = list(self._caps) if self._caps is not None else [None] * len(self._indexes)
+        errors: dict[str, str] = {}
+
+        def work(i: int) -> None:
+            cam = self._camera_ids[i]
+            try:
+                caps[i] = self._open_for_shot(cam, self._indexes[i])
+            except BaseException as exc:
+                errors[cam] = str(exc) or type(exc).__name__
+
+        todo = [i for i, cap in enumerate(caps) if cap is None]
+        threads = [threading.Thread(target=work, args=(i,)) for i in todo]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self._caps = caps
+        self.last_failed_cameras = [c for c in self._camera_ids if c in errors]
+        if errors:
+            self._last_open_error = "; ".join(errors[c] for c in self.last_failed_cameras)
+            self._failed_open_at = self._monotonic()
+            if all(cap is None for cap in caps):
+                self._caps = None
+                raise CameraError(self._last_open_error)
+        else:
+            self._last_open_error = None
+            self._failed_open_at = None
+            self._consecutive_failures = 0
 
     def _open_seq_devices(self) -> None:
         """Sequential keep-open: open every device not open yet (lock held by the caller)."""
@@ -384,6 +452,9 @@ class OpenCvCameraSet:
         try:
             if not cap.isOpened():
                 raise CameraError(f"{cam}: could not open device {index}")
+            if self._mjpg:
+                # Before width and height: the driver picks the size within this format.
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
             cap.set(cv2.CAP_PROP_AUTOFOCUS, AUTOFOCUS_OFF)
@@ -422,7 +493,9 @@ class OpenCvCameraSet:
                 return self._capture_locked(side)
             except CameraError:
                 # Do not retry a dead handle: the next capture() or preview() reopens.
-                self._drop_devices_locked()
+                # A keep-open session already released just the failed cameras.
+                if not self._session_keep_open:
+                    self._drop_devices_locked()
                 raise
 
     def preview(
@@ -466,6 +539,8 @@ class OpenCvCameraSet:
             if caps is None:
                 return None
             cap = caps[self._camera_ids.index(camera_id)]
+            if cap is None:  # keep-open session: this camera is not open
+                return None
             image = self._read_preview_locked(cap)
             if image is None:
                 return None
@@ -567,6 +642,8 @@ class OpenCvCameraSet:
         if self._capture_mode == "sequential":
             return self._capture_sequential_locked(side)
         side = Side(side)
+        if self._session_keep_open:
+            return self._capture_keep_open_locked(side)
         if self._caps is None:
             self.open()
         caps = self._caps
@@ -622,6 +699,79 @@ class OpenCvCameraSet:
                 f"expected {len(self._camera_ids)} frames, got {len(frames)}"
             )
         return frames
+
+    def _capture_keep_open_locked(self, side: Side) -> Sequence[Frame]:
+        """Keep-open session capture (lock held): one thread per camera.
+
+        Cameras that are not open are reopened first (in parallel). Each worker
+        flushes stale_flush_frames, grabs, retrieves and PNG-encodes its camera.
+        If threaded is off the workers run one after another. Every camera is
+        tried; the ones that fail are released (the others stay open) and named in
+        one CameraError. capture() must not drop the healthy cameras, see capture().
+        """
+        if self._caps is None or any(cap is None for cap in self._caps):
+            self._open_keep_open_devices()
+        caps = self._caps
+        assert caps is not None
+        n = len(self._camera_ids)
+        results: list[Any] = [None] * n
+        errors: dict[str, str] = {}
+
+        def work(i: int) -> None:
+            cam, cap = self._camera_ids[i], caps[i]
+            t0 = self._monotonic()
+            try:
+                if cap is None:
+                    raise CameraError(f"{cam}: not open: {self._last_open_error}")
+                for _ in range(self._stale_flush_frames):
+                    try:
+                        cap.grab()
+                    except Exception:
+                        pass
+                start = self._monotonic()
+                try:
+                    ok = cap.grab()
+                except Exception as exc:
+                    raise CameraError(f"{cam}: grab failed: {exc}") from exc
+                if not ok:
+                    raise CameraError(f"{cam}: grab failed")
+                end = self._monotonic()
+                stamp = self._now_utc()
+                data = self._encode_png(cam, self._retrieve_image(cam, cap))
+                results[i] = (start, end, stamp, data, self._monotonic() - t0)
+            except Exception as exc:
+                errors[cam] = str(exc) or type(exc).__name__
+
+        if self._threaded:
+            threads = [threading.Thread(target=work, args=(i,)) for i in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        else:
+            for i in range(n):
+                work(i)
+
+        failed = [c for c in self._camera_ids if c in errors]
+        self.last_failed_cameras = failed
+        if failed:
+            for i, cam in enumerate(self._camera_ids):
+                if cam in errors and caps[i] is not None:
+                    _release_quietly([caps[i]])
+                    caps[i] = None
+            self._last_open_error = "; ".join(errors[c] for c in failed)
+            raise CameraError("; ".join(errors[c] for c in failed))
+        starts = [r[0] for r in results]
+        ends = [r[1] for r in results]
+        self.last_skew_s = max(ends) - min(ends)
+        self.last_capture_total_s = max(ends) - min(starts)
+        self.last_capture_times_s = [e - s for s, e in zip(starts, ends)]
+        self.last_worker_times_s = [r[4] for r in results]
+        self._last_open_error = None
+        return [
+            Frame(camera_id=cam, side=side, seq=seq, timestamp_utc=r[2], data=r[3], ext="png")
+            for seq, (cam, r) in enumerate(zip(self._camera_ids, results))
+        ]
 
     def _capture_sequential_locked(self, side: Side) -> Sequence[Frame]:
         """One camera at a time, C1..C4 (lock held by the caller).
@@ -798,6 +948,8 @@ class OpenCvCameraSet:
             self._seq_devices = {}
             self._consecutive_failures = 0
             for cam, cap in list(zip(self._camera_ids, caps)) + seq:
+                if cap is None:
+                    continue
                 try:
                     cap.release()
                 except Exception as exc:
