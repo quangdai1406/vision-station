@@ -491,6 +491,36 @@ class CollectedLabelDatasetTests(unittest.TestCase):
         self.assertIsNone(parts["P-g1"].operator_label)
         self.assertEqual(classify(parts["P-g1"]), "good")
 
+    def test_only_official_labels_train(self):
+        """Proposed and rejected labels stay out; a label with no status key is official."""
+        for session, part, status in (("S-p1", "P-p1", "proposed"), ("S-r1", "P-r1", "rejected")):
+            store = Store(self.root)
+            label = {"verdict": "BAD", "criterion_id": "CR-1", "labelled_by": "op-1",
+                     "labelled_at": "2026-10-26T08:00:00Z", "status": status}
+            rec = make_record(session, part, "PN-1", "2026-10-26T08:00:00Z", Verdict.REVIEW,
+                              machine=Verdict.REVIEW)
+            store.save_part(dataclasses.replace(rec, disposition=COLLECTED, operator_label=None))
+            path = self.part_json(part)
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            doc["operator_label"] = label
+            path.write_text(json.dumps(doc), encoding="utf-8")
+        problems = []
+        parts = {s.part_id: s for s in iter_parts(self.root, problems=problems)}
+        self.assertEqual(problems, [])
+        self.assertEqual(classify(parts["P-p1"]), "excluded")
+        self.assertEqual(classify(parts["P-r1"]), "excluded")
+        self.assertEqual(classify(self.samples["P-c1"]), "good")  # no status key -> official
+
+    def test_unknown_status_is_a_problem(self):
+        path = self.part_json("P-c1")
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc["operator_label"]["status"] = "maybe"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        problems = []
+        ids = [s.part_id for s in iter_parts(self.root, problems=problems)]
+        self.assertNotIn("P-c1", ids)
+        self.assertTrue(any("bad operator_label" in p for p in problems), problems)
+
     def test_malformed_operator_label_is_a_problem(self):
         path = self.part_json("P-c1")
         doc = json.loads(path.read_text(encoding="utf-8"))

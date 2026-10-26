@@ -27,6 +27,10 @@ from typing import Iterator, Optional
 from station.contracts import (
     CAMERA_IDS,
     IMAGES_PER_PART,
+    LABEL_OFFICIAL,
+    LABEL_PROPOSED,
+    LABEL_REJECTED,
+    LABEL_STATUSES,
     OperatorLabel,
     PartRecord,
     Side,
@@ -38,6 +42,8 @@ MANIFEST = "manifest.sha256"
 COLLECTED = "collected"  # disposition of a part saved in collect mode: images kept, no verdict
 OPERATOR_LABEL_EVENT = "operator_label"  # event kind for every set or change of a label
 MAX_CRITERION_CHARS = 64
+MAX_REJECT_REASON_CHARS = 200
+LABEL_ACTIONS = ("propose", "approve", "reject", "set_official")  # the 'action' in each label event
 _META_FILES = frozenset({PART_JSON, MANIFEST})
 _TMP_PREFIX = ".tmp-"
 _BAD_PATH_CHARS = frozenset("/\\\x00")
@@ -131,6 +137,28 @@ def check_criterion_id(value: object) -> str:
     return text
 
 
+def _check_who_when(by: object, at: object, what: str) -> None:
+    if not isinstance(by, str) or not by.strip():
+        raise ValueError(f"{what}_by is required")
+    if not isinstance(at, str):
+        raise ValueError(f"{what}_at must be an ISO 8601 string")
+    _parse_utc(at)
+
+
+def check_reject_reason(value: object) -> str:
+    """A short printable reason for rejecting a proposal. Returns it stripped."""
+    if not isinstance(value, str):
+        raise ValueError("reject_reason must be a string")
+    text = value.strip()
+    if not text:
+        raise ValueError("reject_reason is required")
+    if len(text) > MAX_REJECT_REASON_CHARS:
+        raise ValueError(f"reject_reason is longer than {MAX_REJECT_REASON_CHARS} characters")
+    if not text.isprintable():
+        raise ValueError("reject_reason must not contain control characters")
+    return text
+
+
 def check_label(label: OperatorLabel) -> None:
     """Validate an operator label. Raises ValueError; never changes the label."""
     if not isinstance(label, OperatorLabel):
@@ -138,15 +166,40 @@ def check_label(label: OperatorLabel) -> None:
     verdict = Verdict(label.verdict)
     if verdict not in (Verdict.GOOD, Verdict.BAD):
         raise ValueError("operator label verdict must be GOOD or BAD")
-    if not isinstance(label.labelled_by, str) or not label.labelled_by.strip():
-        raise ValueError("labelled_by is required")
-    if not isinstance(label.labelled_at, str):
-        raise ValueError("labelled_at must be an ISO 8601 string")
-    _parse_utc(label.labelled_at)
+    _check_who_when(label.labelled_by, label.labelled_at, "labelled")
     if label.criterion_id is not None:
         if verdict is Verdict.GOOD:
             raise ValueError("a GOOD label takes no criterion_id")
         check_criterion_id(label.criterion_id)
+    if label.status not in LABEL_STATUSES:
+        raise ValueError("label status must be proposed, official or rejected")
+    if label.status == LABEL_PROPOSED:
+        _check_who_when(label.proposed_by, label.proposed_at, "proposed")
+        if label.approved_by is not None or label.approved_at is not None or label.reject_reason is not None:
+            raise ValueError("a proposed label has no approval or reject reason")
+        return
+    if label.status == LABEL_OFFICIAL:
+        if label.reject_reason is not None:
+            raise ValueError("an official label has no reject reason")
+        if (label.proposed_by is None) != (label.proposed_at is None):
+            raise ValueError("proposed_by and proposed_at go together")
+        if label.proposed_by is not None:
+            _check_who_when(label.proposed_by, label.proposed_at, "proposed")
+        if (label.approved_by is None) != (label.approved_at is None):
+            raise ValueError("approved_by and approved_at go together")
+        if label.approved_by is not None:
+            _check_who_when(label.approved_by, label.approved_at, "approved")
+        return
+    # rejected: an admin rejected the proposal, with a reason
+    _check_who_when(label.approved_by, label.approved_at, "approved")
+    check_reject_reason(label.reject_reason)
+
+
+def label_status(label: Optional[dict]) -> Optional[str]:
+    """Status of a part.json operator_label dict. A label with no status key is 'official'."""
+    if not isinstance(label, dict):
+        return None
+    return label.get("status", LABEL_OFFICIAL)
 
 
 def _label_doc(label: Optional[OperatorLabel]) -> Optional[dict]:
@@ -154,11 +207,21 @@ def _label_doc(label: Optional[OperatorLabel]) -> Optional[dict]:
     if label is None:
         return None
     criterion = None if label.criterion_id is None else label.criterion_id.strip()
+
+    def text(value: Optional[str]) -> Optional[str]:
+        return None if value is None else value.strip()
+
     return {
         "verdict": Verdict(label.verdict).value,
         "criterion_id": criterion,
         "labelled_by": label.labelled_by.strip(),
         "labelled_at": label.labelled_at,
+        "status": label.status,
+        "proposed_by": text(label.proposed_by),
+        "proposed_at": label.proposed_at,
+        "approved_by": text(label.approved_by),
+        "approved_at": label.approved_at,
+        "reject_reason": text(label.reject_reason),
     }
 
 
@@ -551,36 +614,73 @@ class Store:
             ).fetchone()
         return row[0] if row else None
 
-    def set_operator_label(self, session_id: str, label: OperatorLabel) -> Optional[dict]:
-        """Set or change the operator label of one collected part. Returns the previous label.
+    def _collected_doc_locked(self, session_id: str) -> tuple[pathlib.Path, bytes, dict]:
+        """(part dir, raw part.json bytes, parsed doc) of a collected part. Caller holds the lock."""
+        part_dir = self._known_path(session_id)
+        if part_dir is None:
+            raise ValueError("no saved part for this session")
+        try:
+            raw = (part_dir / PART_JSON).read_bytes()
+            doc = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise ValueError(f"part.json is unreadable: {part_dir}") from exc
+        if not isinstance(doc, dict) or doc.get("session_id") != session_id:
+            raise ValueError("part.json does not belong to this session")
+        if doc.get("disposition") != COLLECTED:
+            raise ValueError("only a collected part can be labelled")
+        return part_dir, raw, doc
+
+    def collected_part_doc(self, session_id: str) -> dict:
+        """The part.json of a collected part (read only). Raises ValueError otherwise."""
+        with self._lock:
+            return json.loads(json.dumps(self._collected_doc_locked(session_id)[2]))
+
+    def collected_labels(self, status: Optional[str] = None) -> list[dict]:
+        """Collected parts that carry a label (with that status, if given), oldest first."""
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT session_id, path FROM parts WHERE final_verdict = ? ORDER BY id",
+                (Verdict.REVIEW.value,),
+            ).fetchall()
+        out: list[dict] = []
+        for session_id, path in rows:
+            try:
+                doc = json.loads((pathlib.Path(path) / PART_JSON).read_bytes().decode("utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError):
+                continue
+            if not isinstance(doc, dict) or doc.get("disposition") != COLLECTED:
+                continue
+            label = doc.get("operator_label")
+            if label is None or (status is not None and label_status(label) != status):
+                continue
+            out.append({"session_id": session_id, "part_id": doc.get("part_id"),
+                        "part_number": doc.get("part_number"), "operator_label": label})
+        return out
+
+    def set_operator_label(self, session_id: str, label: OperatorLabel,
+                           action: str = "set_official") -> Optional[dict]:
+        """Write one label on a collected part. Returns the previous label (or None).
 
         Atomic: only part.json is replaced (temp file + os.replace). Images and
-        manifest.sha256 are never touched. Every set or change is logged as an
-        'operator_label' event; if that log write fails, part.json is restored.
+        manifest.sha256 are never touched. Every write is logged as an 'operator_label'
+        event with its action (propose, approve, reject, set_official); if that log write
+        fails, part.json is restored.
         """
         check_label(label)
+        if action not in LABEL_ACTIONS:
+            raise ValueError(f"unknown label action {action!r}")
         with self._lock:
-            part_dir = self._known_path(session_id)
-            if part_dir is None:
-                raise ValueError("no saved part for this session")
-            part_json = part_dir / PART_JSON
-            try:
-                raw = part_json.read_bytes()
-                doc = json.loads(raw.decode("utf-8"))
-            except (OSError, UnicodeDecodeError, ValueError) as exc:
-                raise ValueError(f"part.json is unreadable: {part_dir}") from exc
-            if not isinstance(doc, dict) or doc.get("session_id") != session_id:
-                raise ValueError("part.json does not belong to this session")
-            if doc.get("disposition") != COLLECTED:
-                raise ValueError("only a collected part can be labelled")
+            part_dir, raw, doc = self._collected_doc_locked(session_id)
             previous = doc.get("operator_label")
             new_label = _label_doc(label)
             doc["operator_label"] = new_label
+            part_json = part_dir / PART_JSON
             _replace_file(part_json, _dump_json(doc))
             try:
                 self.append_event(
                     OPERATOR_LABEL_EVENT,
-                    {"part_id": doc.get("part_id"), "previous": previous, "label": new_label},
+                    {"part_id": doc.get("part_id"), "action": action,
+                     "previous": previous, "label": new_label},
                     session_id=session_id,
                 )
             except BaseException:
