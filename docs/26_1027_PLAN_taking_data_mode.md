@@ -175,6 +175,7 @@ Still open:
 | 2026-10-27 | 5 | DONE (checker PASS): `tools/export_evidence.py` also verifies (station.scanstore.verify_scan) and copies `scans/`, manifest last, never deletes, dry-run, report key `scans`. Not run on a real share; SharePoint postponed. |
 | 2026-10-27 | 6 | DONE (checker PASS): `trainer/scans.py`, `weekly --scans-too [--holdout-toys A,B,C]`: official GOOD scans join the per-(camera, side) banks, split whole toys only; BAD scans read for evaluation only. Fake extractor tests only: no real torch run on scans yet. |
 | 2026-10-28 | 4 | DONE (checker PASS): `station/ui.py` Taking-data endpoints (/api/scan/start, press, done-side, mark, finish, cancel, clear-fault, reset, state, step-picture) gated by the `scan` action (operator 403), label status from the login (supervisor proposed, admin official; forged client fields ignored), page panel with per-camera "defect visible" checkboxes on BAD scans, `ScanSession.step_picture`, `_LockedScan.step_picture` and `scan=self.scan` in `app.py`. Real-app HTTP regression tests. Full suite 1366 OK, 0 skips. NOT run in a real browser yet. |
+| 2026-10-28 | smoke | DONE (checker PASS): SMOKE TEST, not Quality. 9 synthetic scans from ONE toy car (8 GOOD official, TOP 2 / BOTTOM 3 steps, 1 BAD with a painted black rectangle) in scratch; `trainer weekly --scans-too --holdout-toys toy7,toy8` with the REAL resnet18 extractor on the Pi: 10 min 08 s, candidate built, nothing promoted; train toys 1-6, held-out 7 and 8, no toy on both sides; held-out GOOD 40 pictures min/median/max 0.3558/0.4245/0.5; BAD defect-visible pictures 1.0, not-visible 0.361-0.480. Export of the 9 scans: copied 9, identical, verify clean. |
 
 ## Open list (parked for the owner, from the overnight checker)
 
@@ -186,4 +187,17 @@ Still open:
 - Step 4: after a page reload the checkboxes show unticked although the server holds the marks; only the last step's pictures can be re-marked on screen (the server accepts a mark on any picture until Finish). Tick from the snapshot marks or keep all steps' pictures: decide.
 - Step 4: a scan press while IDLE returns 200 {accepted:false}, unlike other refusals (cosmetic).
 - Step 4: the page has only been covered by `node --check` and server-side tests. Run it once in a real browser on the Pi at home (supervisor login, GOOD and BAD scan).
+- Evaluation: scores are clipped to 1.0 (`anomaly.py` `_clip01`), so every BAD picture at or above the reference reads exactly 1.0 and the size of the gap is hidden. Recommended (checker): add unclipped raw ratio and a count of saturated pictures to the weekly evaluation JSON (additive, evaluation only, no `contracts.py` change; needs a raw-score accessor in `station/anomaly.py`), plus a docs note meanwhile. Needs the owner's decision.
+- Evaluation: held-out GOOD max is exactly 0.5 for both toys (likely `norm_ref` normalisation); one-line check once raw values are reported.
+
+## Handover note (end of the overnight run, 2026-10-28)
+
+State: plan steps 1 to 6 are DONE and committed locally (not pushed): scan store, ScanSession, auth + app wiring, UI screen and endpoints, scan export, trainer with `--scans-too`. Full suite 1366 OK, 0 skipped (node on PATH). `contracts.py` was never touched. The running collect station and `~/vision-home` were not touched. A real-extractor smoke test on synthetic scans passed.
+
+Not done (needs the user or the real station):
+1. Step 7: run Taking-data mode on the Pi with real toys. Enable it in `~/vision-home/config.json` with `"scan": {"enabled": true}` (the home config for collect mode has NO scan block yet; stop the station first, edit, restart). Log in as a supervisor or admin (`op1` is an operator and cannot scan; create a supervisor with `python -m station users add --config ~/vision-home/config.json sup1 supervisor`). Run the page once in a real browser (only `node --check` and server tests cover it).
+2. Home split: toys 8, 9, 10 held out (decided 2026-10-27), defect names doh_small, doh_large, doh_edge.
+3. Train: `python -m trainer weekly ... --scans-too --holdout-toys <toy ids> --extractor-config docs/home_trial/extractor.home.json` with HOME TRIAL numbers only, then a named person promotes.
+4. Everything in the Open list above; SharePoint transfer (D-C) is postponed until the merge into the AISI MES system.
+5. Push: nothing is on GitHub since commit 115c2a4. Say the word and the commits can be pushed.
 
