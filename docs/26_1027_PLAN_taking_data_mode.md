@@ -171,3 +171,15 @@ Still open:
 |---|---|---|
 | 2026-10-27 | 1 | DONE: `station/scanstore.py` (ScanStore, ScanWriter, verify_scan, load_scan, list_scans), 38 tests, `tools/FORMAT.md` "Scan record" section. Two checker rounds PASS; full suite 1227 OK (2 node skips). Crash-safe write (staging, pictures, scan.json, manifest last, rename), variable steps per side, defect_visible per picture, site/line checked on verify. Open: no cleanup helper for a crashed `.partial` folder (manual removal, documented). contracts.py untouched. |
 | 2026-10-27 | 2 | DONE: `station/scan.py` (ScanSession: IDLE, SCAN_SIDE, WAIT_FLIP, SAVING, DONE, FAULT), 79 scan tests, full suite 1268 OK (2 node skips). Variable steps per side, Done with this side, explicit side skip, per-picture marks (new `ScanWriter.set_defect_visible`), cancel saves nothing, refused while an inspection is busy, camera named on failure with step retry, `min_flip_s` 2.0 (engineering setting) so an unflipped part is never labelled BOTTOM (found by the checker). Known limitations: a disk write error drops the whole scan; press() holds the lock during capture so snapshot() waits. Not wired into the station yet. |
+| 2026-10-27 | 3 | DONE (overnight run, checker PASS): `scan` action for supervisor/admin; optional `scan` config block (enabled, min_flip_s, debounce_s) builds ScanStore + ScanSession on the same cameras in `station/app.py`; scan start refused while an inspection is mid-part, inspection press refused while a scan is active (guard in `_LockedSession.press`, the only UI path). Full suite 1329 OK, 0 skips (node on PATH). |
+| 2026-10-27 | 5 | DONE (checker PASS): `tools/export_evidence.py` also verifies (station.scanstore.verify_scan) and copies `scans/`, manifest last, never deletes, dry-run, report key `scans`. Not run on a real share; SharePoint postponed. |
+| 2026-10-27 | 6 | DONE (checker PASS): `trainer/scans.py`, `weekly --scans-too [--holdout-toys A,B,C]`: official GOOD scans join the per-(camera, side) banks, split whole toys only; BAD scans read for evaluation only. Fake extractor tests only: no real torch run on scans yet. |
+
+## Open list (parked for the owner, from the overnight checker)
+
+- Step 6: `--min-holdout` counts held-out scans, not toys; one held-out toy with 2 scans passes `--min-holdout 2`. Counting held-out toys is stricter. Decide the rule.
+- Step 6: per-defect picture counts overlap for scans with several defects; do not sum across defects (add a note to the docs).
+- Step 3: every inspection press path must go through `app._locked`; a future hardware-button thread calling `app.session.press()` would bypass the scan guard. A cleaner guard inside `StationSession.press` needs a `session.py` change (owner's say-so).
+- Step 3: a scan capture holds the session lock, so inspection UI polling waits during a capture. Releasing the lock during capture is possible; not done.
+- Step 5: every file of an already-exported scan is re-hashed at the destination each run; a failed copy leaves a `.name.part` temp file (never deleted by design).
+

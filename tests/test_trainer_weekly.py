@@ -239,6 +239,32 @@ class TestWeeklyRuns(WeeklyBase):
         self.assertEqual(ms.list_versions("PN-A"), [])
         self.assertEqual(len(ms.list_versions("PN-B")), 1)
 
+    def test_scans_folder_is_ignored_without_scans_too(self):
+        from station.scanstore import ScanStore
+        for day in (1, 2, 3):
+            save_part(self.store, f"S-{day}", "PN-1", f"2026-10-0{day}T08:00:00Z")
+        label = {"verdict": "GOOD", "defects": [], "status": "official", "labelled_by": "sup-1",
+                 "labelled_at": "2026-10-04T08:00:00Z", "approved_by": "admin-1",
+                 "approved_at": "2026-10-04T09:00:00Z"}
+        writer = ScanStore(self.store_root, site="SITE", line="L1").begin_scan(
+            "SC-1", "PN-1", "toy-1", label, "op-1", ["C1", "C2", "C3", "C4"], "2026-10-04T08:00:00Z")
+        for cam in ("C1", "C2", "C3", "C4"):
+            writer.add_picture(cam, "TOP", 1, b"scan-picture" * 40)
+        writer.finish("2026-10-04T08:05:00Z")
+        self.assertEqual(self.run_quiet(self.args())[0], 0)
+        report = self.report_json()
+        self.assertNotIn("scans", report)
+        part = self.part_result(report, "PN-1")
+        self.assertNotIn("scans", part)
+        self.assertNotIn("good_scans", part["counts"])
+        self.assertEqual(part["counts"]["good_parts"], 3)
+        text = (self.reports / "weekly-2026-10-04.txt").read_text(encoding="utf-8")
+        self.assertNotIn("Scans (Taking data", text)
+        ms = ModelStore(self.models)
+        model = PatchCoreModel.load(
+            ms.root / safe_part("PN-1") / part["version"] / "patchcore.npz", fake_decode, FakeExtractor())
+        self.assertEqual(model.describe()["banks"]["C1/TOP"]["train_images"], 3)  # the scan is not used
+
 
 class TestWeeklyArguments(unittest.TestCase):
     def parse_error(self, argv):

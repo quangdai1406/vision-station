@@ -15,6 +15,14 @@ Thresholds (t_img, t_low) and the count of held-out good parts that would be
 flagged are NOT chosen here; the report leaves them as "[Quality to define]".
 --min-good and --min-holdout have no defaults on purpose; they are Quality's.
 
+--scans-too (off by default) adds the official GOOD Taking-data scans of the same part
+number to the banks as training images. Scans are split by whole toy_id (never by
+picture): --holdout-toys names the toys held out, otherwise whole toys are chosen by the
+seeded split with holdout_fraction. Parts keep the day split. With scans included, min-good
+and min-holdout count parts and scans together, and the candidate is built fresh (an
+approved parent is not updated yet). Held-out scan images are scored and reported
+separately, by part and by toy. Official BAD scans are only evaluated, never trained.
+
 Reports: weekly-<UTC date>.json and weekly-<UTC date>.txt in --reports, written
 atomically. --dry-run prints the plan and writes nothing.
 
@@ -55,6 +63,16 @@ from station.anomaly import (
 from station.contracts import Frame, Side, StationError
 from station.modelstore import ModelError, ModelStore
 from trainer.dataset import Dataset, iter_parts, split_holdout
+from trainer.scans import (
+    BAD,
+    GOOD,
+    RULE_EXPLICIT,
+    RULE_SEEDED,
+    ScanSet,
+    read_scans,
+    split_by_toy,
+    summarize,
+)
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -66,6 +84,8 @@ QUALITY = "[Quality to define]"
 REPORT_PREFIX = "weekly-"
 REPORT_SCHEMA = "trainer-weekly-report/1"
 PROBLEMS_SHOWN = 5
+SCANS_FRESH_NOTE = "scans included: built fresh (incremental updates do not include scans yet)"
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)  # cutoff when no good parts were trained
 
 Extractor = Any
 Decode = Callable[[Frame], Any]
@@ -138,6 +158,18 @@ def add_arguments(sub: Any) -> None:
     p.add_argument("--dry-run", action="store_true", help="print the plan; build and write nothing")
     p.add_argument("--now-utc", metavar="ISO",
                    help="run time, ISO 8601 UTC (default: now); names the report and the candidate version")
+    p.add_argument("--scans-too", action="store_true",
+                   help="also train on official GOOD Taking-data scans, split by whole toy (default: off)")
+    p.add_argument("--holdout-toys", metavar="A,B,C",
+                   help="with --scans-too: toy ids held out whole (default: chosen by the seeded split)")
+
+
+def _toy_list(text: str) -> list:
+    """'A, B,C' -> ['A', 'B', 'C']. Empty entries are dropped; duplicates keep their first place."""
+    toys = list(dict.fromkeys(part.strip() for part in text.split(",") if part.strip()))
+    if not toys:
+        raise UsageError("--holdout-toys needs at least one toy id")
+    return toys
 
 
 def run(args: argparse.Namespace) -> int:
@@ -336,6 +368,56 @@ def _evaluate(model: Any, held_out: list, bad: list, runtime: _Runtime) -> dict:
     }
 
 
+def _scored_scans(model: Any, samples: list) -> list:
+    """(scan, [(picture, score), ...]) for each scan."""
+    return [
+        (scan, [(ref, model.predict(_frame(ref, scan, seq)).score) for seq, ref in enumerate(scan.images)])
+        for scan in samples
+    ]
+
+
+def _scan_group(rows: list) -> dict:
+    scores = [score for _scan, pairs in rows for _ref, score in pairs]
+    return {"scans": len(rows), "images_scored": len(scores), "scores": _summary(scores)}
+
+
+def _evaluate_scans(model: Any, held: list, bad: list) -> dict:
+    """Held-out GOOD scans and official BAD scans, scored like held-out parts, kept apart from parts.
+
+    BAD pictures are grouped per defect name and by their 'defect visible' mark.
+    """
+    held_rows = _scored_scans(model, held)
+    bad_rows = _scored_scans(model, bad)
+    held_toys = sorted({scan.toy_id for scan in held})
+    bad_toys = sorted({scan.toy_id for scan in bad})
+    per_defect: dict = {}
+    for scan, pairs in bad_rows:
+        for defect in scan.defects:
+            bucket = per_defect.setdefault(defect, {"scans": 0, "visible_true": [], "visible_false": []})
+            bucket["scans"] += 1
+            for ref, score in pairs:
+                bucket["visible_true" if ref.defect_visible else "visible_false"].append(score)
+    return {
+        "held_out_good": dict(
+            _scan_group(held_rows),
+            per_toy={toy: _scan_group([r for r in held_rows if r[0].toy_id == toy]) for toy in held_toys},
+        ),
+        "bad": dict(
+            _scan_group(bad_rows),
+            per_toy={toy: _scan_group([r for r in bad_rows if r[0].toy_id == toy]) for toy in bad_toys},
+            per_defect={
+                defect: {
+                    "scans": b["scans"],
+                    "visible_true": _summary(b["visible_true"]),
+                    "visible_false": _summary(b["visible_false"]),
+                }
+                for defect, b in sorted(per_defect.items())
+            },
+        ),
+        "held_out_good_scans_flagged": QUALITY,
+    }
+
+
 def _register(ms: ModelStore, part_number: str, version: str, model: Any, manifest: dict, now_iso: str) -> Path:
     ms.root.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".weekly-", dir=str(ms.root)))
@@ -388,7 +470,8 @@ class _Context:
     """Per-run values shared by every part."""
 
     def __init__(self, args: argparse.Namespace, ms: ModelStore, runtime: Optional[_Runtime],
-                 now: datetime, dry_run: bool) -> None:
+                 now: datetime, dry_run: bool, scans: Optional[ScanSet] = None,
+                 holdout_toys: Optional[list] = None) -> None:
         self.args = args
         self.ms = ms
         self.runtime = runtime
@@ -396,30 +479,64 @@ class _Context:
         self.now_iso = _iso(now)
         self.version = "weekly-" + now.strftime("%Y%m%dT%H%M%SZ")
         self.dry_run = dry_run
+        # Scans are used only when --scans-too was given (scans is then a ScanSet).
+        self.scans_too = scans is not None
+        self.holdout_toys = holdout_toys  # None: the seeded split chooses the toys
+        self.scan_good: dict = {}  # part number -> official GOOD scans
+        self.scan_bad: dict = {}  # part number -> official BAD scans (evaluation only)
+        if scans is not None:
+            for scan in scans.good:
+                self.scan_good.setdefault(scan.part_number, []).append(scan)
+            for scan in scans.bad:
+                self.scan_bad.setdefault(scan.part_number, []).append(scan)
+        self.scan_set = scans
 
 
 def _run_part(part_number: str, samples: list, ctx: _Context, result: dict) -> None:
     args = ctx.args
     ds = Dataset.from_samples(part_number, samples, good_policy=GOOD_POLICY)
     good = ds.good
+    scan_good = ctx.scan_good.get(part_number, []) if ctx.scans_too else []
+    scan_bad = ctx.scan_bad.get(part_number, []) if ctx.scans_too else []
     result["counts"].update(good_parts=len(good), bad_parts=len(ds.bad), excluded_parts=len(ds.excluded))
-    if len(good) < args.min_good:
-        raise _Skip(f"{len(good)} good parts, below --min-good {args.min_good}")
+    if ctx.scans_too:
+        result["counts"].update(good_scans=len(scan_good), bad_scans=len(scan_bad))
+    n_good = len(good) + len(scan_good)
+    if n_good < args.min_good:
+        kind = "good parts and scans" if ctx.scans_too else "good parts"
+        raise _Skip(f"{n_good} {kind}, below --min-good {args.min_good}")
     train_all, hold_all = split_holdout(good, args.holdout_fraction, args.seed)
     result["counts"].update(good_train_parts=len(train_all), good_holdout_parts=len(hold_all))
-    if len(hold_all) < args.min_holdout:
-        raise _Skip(f"{len(hold_all)} held-out good parts, below --min-holdout {args.min_holdout}")
+    scan_train: list = []
+    scan_hold: list = []
+    held_toys: list = []
+    rule = RULE_EXPLICIT if ctx.holdout_toys is not None else RULE_SEEDED
+    if ctx.scans_too:
+        scan_train, scan_hold, held_toys = split_by_toy(
+            scan_good, args.holdout_fraction, args.seed, ctx.holdout_toys)
+        result["counts"].update(good_train_scans=len(scan_train), good_holdout_scans=len(scan_hold))
+        result["scans"] = {"holdout_rule": rule, "holdout_toys": held_toys,
+                           "train_scans": len(scan_train), "held_out_scans": len(scan_hold),
+                           "images_by_key": {}}
+    n_hold = len(hold_all) + len(scan_hold)
+    if n_hold < args.min_holdout:
+        kind = "held-out good parts and scans" if ctx.scans_too else "held-out good parts"
+        raise _Skip(f"{n_hold} {kind}, below --min-holdout {args.min_holdout}")
 
-    parent = ctx.ms.current(part_number)  # ModelError when the approved model is unusable: a part error
-    cutoff, note, parent_version = _parent_plan(parent)
     builder: Optional[PatchCoreBuilder] = None
-    if cutoff is not None:
-        if ctx.dry_run:
-            note = "incremental if the approved model is patchcore-v2 and compatible; otherwise fresh (checked at build)"
-        else:
-            builder, note = _load_base(parent, ctx.runtime, args)
-            if builder is None:
-                cutoff = None  # v1, incompatible or unreadable parent: fresh build
+    if ctx.scans_too:
+        # Scans are not part of the incremental update yet, so the candidate is always built fresh.
+        cutoff, note, parent_version = None, SCANS_FRESH_NOTE, None
+    else:
+        parent = ctx.ms.current(part_number)  # ModelError when the approved model is unusable: a part error
+        cutoff, note, parent_version = _parent_plan(parent)
+        if cutoff is not None:
+            if ctx.dry_run:
+                note = "incremental if the approved model is patchcore-v2 and compatible; otherwise fresh (checked at build)"
+            else:
+                builder, note = _load_base(parent, ctx.runtime, args)
+                if builder is None:
+                    cutoff = None  # v1, incompatible or unreadable parent: fresh build
     mode = "incremental" if cutoff is not None else "fresh"
 
     if cutoff is not None:
@@ -429,8 +546,10 @@ def _run_part(part_number: str, samples: list, ctx: _Context, result: dict) -> N
             raise _Skip(f"no good training parts since trained_until_utc {_iso(cutoff)}")
     else:
         new_train, new_hold = train_all, hold_all
-        if len(train_all) < 2:
-            raise _Skip("fewer than 2 good training parts after the holdout split; each camera/side needs 2")
+        n_train = len(train_all) + len(scan_train)
+        if n_train < 2:
+            kind = "good training parts and scans" if ctx.scans_too else "good training parts"
+            raise _Skip(f"fewer than 2 {kind} after the holdout split; each camera/side needs 2")
     result["counts"].update(new_train_parts=len(new_train), new_holdout_parts=len(new_hold))
     result.update(mode=mode, mode_note=note, parent_version=parent_version)
 
@@ -445,23 +564,38 @@ def _run_part(part_number: str, samples: list, ctx: _Context, result: dict) -> N
         _feed(builder, sample, False, ctx.runtime, tally)
     for sample in new_hold:
         _feed(builder, sample, True, ctx.runtime, tally)
+    scan_tally: dict = {}
+    for scan in scan_train:
+        _feed(builder, scan, False, ctx.runtime, scan_tally)
+    for scan in scan_hold:
+        _feed(builder, scan, True, ctx.runtime, scan_tally)
     model = builder.build(ctx.version)
 
-    trained_until = max(_when(s) for s in good)
+    # Parts only: the cutoff is read by the next incremental run, which picks up parts after it.
+    # Scans are not in the incremental path, so they must not move the cutoff.
+    trained_until = max((_when(s) for s in good), default=_EPOCH)
     cutoff_iso = _iso(trained_until)
     evaluation = _evaluate(model, hold_all, ds.bad, ctx.runtime)
     counts = dict(result["counts"], images_by_key=dict(sorted(tally.items())))
+    if ctx.scans_too:
+        evaluation["scans"] = _evaluate_scans(model, scan_hold, scan_bad)
+        result["scans"]["images_by_key"] = dict(sorted(scan_tally.items()))
+        counts["scans"] = result["scans"]
     manifest = _manifest(
         model=model, mode=mode, note=note, parent_version=parent_version, cutoff_iso=cutoff_iso,
         args=args, now_iso=ctx.now_iso, counts=counts, evaluation=evaluation, runtime=ctx.runtime,
     )
     _register(ctx.ms, part_number, ctx.version, model, manifest, ctx.now_iso)
     # Keys read by trainer.purge: only pictures fed to the builder this run are listed as trained.
+    # Scan ids have their own keys: they are not parts and purge never deletes them.
     result.update(status="candidate", version=ctx.version, trained_until_utc=cutoff_iso,
                   counts=counts, evaluation=evaluation,
                   candidate_version=ctx.version, training_succeeded=True,
                   trained_session_ids=sorted(s.session_id for s in new_train),
                   holdout_session_ids=sorted(s.session_id for s in hold_all))
+    if ctx.scans_too:
+        result["trained_scan_ids"] = sorted(s.scan_id for s in scan_train)
+        result["holdout_scan_ids"] = sorted(s.scan_id for s in scan_hold)
 
 
 def _process_part(part_number: str, samples: list, ctx: _Context) -> dict:
@@ -544,7 +678,16 @@ def _render_text(report: dict) -> str:
             lines.append(f"  held-out good ({ev['held_out_good']['parts']} parts): {_fmt_scores(ev['held_out_good'])}")
             lines.append(f"  labelled BAD ({ev['bad']['parts']} parts): {_fmt_scores(ev['bad'])}")
             lines.append(f"  held-out good parts flagged: {QUALITY}")
+            if "scans" in ev:
+                lines += _scan_eval_lines(ev["scans"])
+        if "scans" in part and part["scans"] is not None:
+            sc = part["scans"]
+            toys = ", ".join(sc["holdout_toys"]) or "none"
+            lines.append(f"  scans: train {sc['train_scans']}, held-out {sc['held_out_scans']} "
+                         f"({sc['holdout_rule']}); held-out toys: {toys}")
         lines.append("")
+    if "scans" in report:
+        lines += _scans_section_lines(report["scans"])
     problems = report["store_problems"]
     lines.append(f"store problems: {problems['count']}")
     for item in problems["first"][:PROBLEMS_SHOWN]:
@@ -559,6 +702,108 @@ def _render_text(report: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _fmt_summary(s: dict) -> str:
+    if not s["count"]:
+        return "none"
+    return f"{s['count']} images, score min/median/max {s['min']} / {s['median']} / {s['max']}"
+
+
+def _scan_eval_lines(block: dict) -> list:
+    """Held-out scan scores under one part (kept apart from the part pictures)."""
+    held = block["held_out_good"]
+    bad = block["bad"]
+    lines = [f"  held-out good scans ({held['scans']} scans): {_fmt_scores(held)}"]
+    for toy, row in held["per_toy"].items():
+        lines.append(f"    toy {toy} ({row['scans']} scans): {_fmt_scores(row)}")
+    lines.append(f"  labelled BAD scans ({bad['scans']} scans, evaluation only): {_fmt_scores(bad)}")
+    for defect, row in bad["per_defect"].items():
+        lines.append(f"    defect {defect} ({row['scans']} scans): defect visible "
+                     f"{_fmt_summary(row['visible_true'])}; not visible {_fmt_summary(row['visible_false'])}")
+    lines.append(f"  held-out good scans flagged: {QUALITY}")
+    return lines
+
+
+def _build_scans_section(ctx: _Context, parts: list) -> dict:
+    """The report's 'scans' section: what was read, excluded, held out and scored."""
+    scan_set = ctx.scan_set
+    inv = summarize(scan_set)
+    per_part: dict = {}
+    for part in parts:
+        sc = part.get("scans")
+        if sc is None:
+            continue
+        per_part[part["part_number"]] = {
+            "status": part["status"],
+            "train_scans": sc["train_scans"],
+            "held_out_scans": sc["held_out_scans"],
+            "holdout_rule": sc["holdout_rule"],
+            "holdout_toys": sc["holdout_toys"],
+            "images_by_key": sc["images_by_key"],
+        }
+    held_for: dict = {}
+    for pn, row in per_part.items():
+        for toy in row["holdout_toys"]:
+            held_for.setdefault(toy, []).append(pn)
+    per_toy = {
+        toy: {"GOOD": row[GOOD], "BAD": row[BAD], "held_out_for_part_numbers": held_for.get(toy, [])}
+        for toy, row in inv["by_toy"].items()
+    }
+    return {
+        "folders": inv["folders"],
+        "intact": inv["intact"],
+        "problems": inv["problems"],
+        "by_label": inv["by_label"],
+        "by_status": inv["by_status"],
+        "scans_by_side": inv["scans_by_side"],
+        "training_scans": len(scan_set.good),
+        "evaluation_scans": len(scan_set.bad),
+        "excluded": inv["excluded"],
+        "holdout_rule": RULE_EXPLICIT if ctx.holdout_toys is not None else RULE_SEEDED,
+        "holdout_toys_requested": list(ctx.holdout_toys or []),
+        "per_toy": per_toy,
+        "images_by_camera_side": inv["images_by_camera_side"],
+        "training_images_by_camera_side": inv["training_images_by_camera_side"],
+        "bad_defects_official": inv["bad_defects_official"],
+        "per_part": per_part,
+    }
+
+
+def _scans_section_lines(sec: dict) -> list:
+    lines = [
+        "Scans (Taking data, --scans-too)",
+        f"  folders {sec['folders']}, intact {sec['intact']}, problems {sec['problems']}",
+        f"  labels: GOOD {sec['by_label'][GOOD]}, BAD {sec['by_label'][BAD]}; status official "
+        f"{sec['by_status']['official']}, proposed {sec['by_status']['proposed']}, "
+        f"rejected {sec['by_status']['rejected']}",
+        f"  training scans (official GOOD): {sec['training_scans']}; "
+        f"evaluation only (official BAD): {sec['evaluation_scans']}",
+    ]
+    excl = sec["excluded"]
+    reasons = "".join(f"\n    {n} x {reason}" for reason, n in excl["by_reason"].items())
+    lines.append(f"  excluded: {excl['total']}{reasons}")
+    toys = ", ".join(sec["holdout_toys_requested"]) if sec["holdout_toys_requested"] else "none given"
+    lines.append(f"  holdout rule: {sec['holdout_rule']}; toys named: {toys}")
+    lines.append("  per toy (intact scans):")
+    for toy, row in sec["per_toy"].items():
+        held = ", ".join(row["held_out_for_part_numbers"]) or "no"
+        lines.append(f"    {toy}: GOOD {row[GOOD]}, BAD {row[BAD]}; held out for part {held}")
+    lines.append("  pictures per camera/side, all intact scans: " + (", ".join(
+        f"{k} {v}" for k, v in sec["images_by_camera_side"].items()) or "none"))
+    for pn, row in sec["per_part"].items():
+        imgs = ", ".join(
+            f"{k} train {v.get('good_train', 0)} held-out {v.get('good_holdout', 0)}"
+            for k, v in row["images_by_key"].items()) or "none"
+        held = ", ".join(row["holdout_toys"]) or "none"
+        lines.append(f"  part {pn} ({row['status']}): train scans {row['train_scans']}, "
+                     f"held-out scans {row['held_out_scans']}, held-out toys {held}")
+        lines.append(f"    pictures: {imgs}")
+    for defect, row in sec["bad_defects_official"].items():
+        lines.append(f"  BAD defect {defect}: {row['scans']} scans, pictures defect visible "
+                     f"{row['visible_true']}, not visible {row['visible_false']}")
+    lines.append("")
+    return lines
+
+
 def _build_report(ctx: _Context, store: Path, models: Path, reports: Path, parts: list,
                   store_problems: list) -> dict:
     args = ctx.args
@@ -566,7 +811,7 @@ def _build_report(ctx: _Context, store: Path, models: Path, reports: Path, parts
     for part in parts:
         summary[part["status"]] = summary.get(part["status"], 0) + 1
     exit_code = EXIT_ERROR if summary["error"] else EXIT_OK
-    return {
+    report = {
         "schema": REPORT_SCHEMA,
         "run_utc": ctx.now_iso,
         "dry_run": ctx.dry_run,
@@ -589,6 +834,9 @@ def _build_report(ctx: _Context, store: Path, models: Path, reports: Path, parts
         "parts": parts,
         "exit_code": exit_code,
     }
+    if ctx.scans_too:
+        report["scans"] = _build_scans_section(ctx, parts)
+    return report
 
 
 # -------------------------------------------------------------------- run
@@ -604,6 +852,11 @@ def run_weekly(args: argparse.Namespace, *, extractor_factory: Optional[Callable
             raise UsageError(f"store folder not found: {store}")
         if models.exists() and not models.is_dir():
             raise UsageError(f"--models is not a folder: {models}")
+        holdout_toys = None
+        if args.holdout_toys is not None:
+            if not args.scans_too:
+                raise UsageError("--holdout-toys needs --scans-too")
+            holdout_toys = _toy_list(args.holdout_toys)
         if args.extractor_config and not args.dry_run:
             _load_config(args.extractor_config)  # validate early; contents are not printed
         runtime = None
@@ -621,12 +874,27 @@ def run_weekly(args: argparse.Namespace, *, extractor_factory: Optional[Callable
         groups: dict = {}
         for sample in iter_parts(store, full_station_only=True, verify=True, problems=problems):
             groups.setdefault(sample.part_number, []).append(sample)
+        scan_set = None
+        if args.scans_too:
+            scan_set = read_scans(store)
+            problems.extend(scan_set.problems)
     except (OSError, ValueError) as exc:
         print(f"weekly: could not read the store: {exc}", file=sys.stderr)
         return EXIT_ERROR
+    if holdout_toys is not None:
+        known = {scan.toy_id for scan in scan_set.valid}
+        unknown = [toy for toy in holdout_toys if toy not in known]
+        if unknown:
+            print("weekly: --holdout-toys names toys with no intact scan in the store: "
+                  + ", ".join(unknown), file=sys.stderr)
+            return EXIT_USAGE
 
-    wanted = list(dict.fromkeys(args.part)) if args.part else sorted(groups)
-    ctx = _Context(args, ModelStore(models), runtime, now, bool(args.dry_run))
+    names = set(groups)
+    if scan_set is not None:
+        names |= {scan.part_number for scan in scan_set.good + scan_set.bad}
+    wanted = list(dict.fromkeys(args.part)) if args.part else sorted(names)
+    ctx = _Context(args, ModelStore(models), runtime, now, bool(args.dry_run),
+                   scans=scan_set, holdout_toys=holdout_toys)
     parts = [_process_part(pn, groups.get(pn, []), ctx) for pn in wanted]
     report = _build_report(ctx, store, models, reports, parts, problems)
     text = _render_text(report)
