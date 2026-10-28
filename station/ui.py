@@ -840,6 +840,11 @@ label { display: block; font-size: 14px; color: var(--muted); }
 .part-desc { display: block; font-size: 14px; color: var(--muted); font-weight: 400; }
 .cam-status { color: var(--bad); font-weight: 600; margin: 0 0 8px; }
 .scan-busy { font-weight: 600; border-color: var(--review); }
+/* Shown only with a waiting scan; :not([hidden]) keeps the hidden attribute working. */
+.scan-review-banner:not([hidden]) { display: flex; flex-wrap: wrap; align-items: center;
+  justify-content: space-between; gap: 8px; border-color: var(--review); font-weight: 600;
+  font-size: 15px; padding: 10px 16px; }
+.scan-review-banner button { margin: 0; min-height: 36px; padding: 8px 14px; }
 .scan-fields { border: 0; padding: 0; margin: 4px 0 12px; }
 .scan-fields legend { font-size: 14px; color: var(--muted); padding: 0; }
 label.inline { display: inline-block; color: var(--fg); font-size: 16px; margin: 0 16px 8px 0; }
@@ -873,6 +878,10 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
   </section>
 
   <section id="app" hidden>
+    <section id="scan-review-banner" class="card scan-review-banner" aria-label="Scans waiting for approval" hidden>
+      <span id="scan-review-count" role="status"></span>
+      <button type="button" id="scan-review-open" class="secondary">Review</button>
+    </section>
     <div id="poc" class="poc" role="status" hidden></div>
     <div class="card">
       <div id="state" class="muted">State: -</div>
@@ -1354,6 +1363,7 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
     labelIsAdmin = !!allowed.label_approve;
     scanAllowed = !!allowed.scan;
     reviewAllowed = !!allowed.label_approve;
+    startReviewBanner();
     scanActiveNow = s.scan_active === true;
     // Part number prefill for the Taking-data form: once, and only until the operator types.
     if (!scanPartTouched && typeof s.part_number === "string" && s.part_number
@@ -1710,6 +1720,33 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
   var reviewBusy = false;
   var reviewFetching = false;
   var REVIEW_REASON_MAX = 200;
+  // Banner above the state card: the count is refreshed every REVIEW_BANNER_MS while the
+  // page is visible and logged in. One timer at a time; stopped on logout and 401.
+  var REVIEW_BANNER_MS = 30000;
+  var reviewTimer = null;
+  var reviewWaiting = 0;
+
+  function reviewBannerWanted() {
+    // Taking data must be on: with it off the server answers the pending list with 404.
+    return reviewAllowed && scanAllowed;
+  }
+
+  function startReviewBanner() {
+    if (reviewTimer !== null || !reviewBannerWanted()) { return; }
+    refreshScanReview();
+    reviewTimer = setInterval(function () {
+      if (!reviewBannerWanted() || el.app.hidden || document.visibilityState !== "visible") { return; }
+      refreshScanReview();
+    }, REVIEW_BANNER_MS);
+  }
+
+  function stopReviewBanner() {
+    if (reviewTimer !== null) { clearInterval(reviewTimer); }
+    reviewTimer = null;
+    reviewWaiting = 0;
+    $("scan-review-banner").hidden = true;
+    $("scan-review-count").textContent = "";
+  }
 
   function reviewScanText(row) {
     var defects = Array.isArray(row.defects)
@@ -1727,6 +1764,12 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
     var list = $("scan-review-list");
     while (list.firstChild) { list.removeChild(list.firstChild); }
     $("scan-review-none").hidden = rows.length > 0;
+    // The banner count comes from the same list (it is shown only when the panel's
+    // review section may be used: label_approve and Taking data on).
+    reviewWaiting = rows.length;
+    $("scan-review-banner").hidden = !reviewBannerWanted() || rows.length === 0;
+    $("scan-review-count").textContent = rows.length === 1
+      ? "1 scan waiting for approval" : rows.length + " scans waiting for approval";
     rows.forEach(function (row) {
       var li = document.createElement("li");
       li.appendChild(document.createTextNode(reviewScanText(row) + " "));
@@ -1801,6 +1844,16 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
       refreshScanReview();
     });
   }
+
+  // Review button in the banner: opens the Taking-data panel at the review section.
+  $("scan-review-open").addEventListener("click", function () {
+    scanOpen = true;
+    renderScanPanel();
+    refreshScan();
+    refreshScanReview();
+    var section = $("scan-review");
+    if (section && section.scrollIntoView) { section.scrollIntoView({ behavior: "smooth", block: "start" }); }
+  });
 
   // ----- collected-part labels ---------------------------------------------
   // Shown as text only (textContent), so station data cannot inject markup.
@@ -1922,6 +1975,7 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
     scanFetching = false;
     reviewAllowed = false;
     reviewBusy = false;
+    stopReviewBanner();
     clearScanPics();
     renderScanPanel();
   }

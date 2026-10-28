@@ -622,6 +622,82 @@ class ScanPageTests(ScanHttpBase):
         self.assertIn('$("scan-review").hidden = !reviewAllowed;', html)
         self.assertNotIn("window.prompt", self.scan_block(html))
 
+    def test_review_banner_is_first_in_the_app_and_hidden_by_default(self):
+        html = self.page()
+        self.assertIn('<section id="scan-review-banner" class="card scan-review-banner" '
+                      'aria-label="Scans waiting for approval" hidden>', html)
+        self.assertIn('<span id="scan-review-count" role="status"></span>', html)
+        self.assertIn('<button type="button" id="scan-review-open" class="secondary">Review</button>', html)
+        # First thing in the logged-in area: after the app section opens, before the state card.
+        app = html.index('<section id="app" hidden>')
+        self.assertLess(app, html.index('id="scan-review-banner"'))
+        self.assertLess(html.index('id="scan-review-banner"'), html.index('id="poc"'))
+        self.assertLess(html.index('id="scan-review-banner"'), html.index('id="state"'))
+        self.assertIn(".scan-review-banner:not([hidden]) { display: flex;", html)
+
+    def test_review_banner_button_has_no_data_action(self):
+        html = self.page()
+        start = html.index('<section id="scan-review-banner"')
+        end = html.index("</section>", start)
+        self.assertNotIn("data-action", html[start:end])
+        self.assertIn("scan-review-open", html)
+        handler = html.index('$("scan-review-open").addEventListener')
+        self.assertNotIn("data-action", html[handler:handler + 400])
+
+    def test_review_banner_text_is_set_by_render_scan_review(self):
+        html = self.page()
+        start = html.index("function renderScanReview(rows)")
+        end = html.index("function refreshScanReview()")
+        body = html[start:end]
+        self.assertIn('$("scan-review-banner").hidden', body)
+        self.assertIn("reviewBannerWanted()", body)
+        self.assertIn('$("scan-review-count").textContent', body)
+        self.assertIn('"1 scan waiting for approval"', body)
+        self.assertIn('" scans waiting for approval"', body)
+        self.assertNotIn("innerHTML", body)
+
+    def test_review_banner_needs_label_approve_and_taking_data(self):
+        html = self.page()
+        self.assertIn("function reviewBannerWanted() {", html)
+        self.assertIn("return reviewAllowed && scanAllowed;", html)
+        # Hidden without the feature or the role: the stop path clears the banner and count.
+        stop = html.index("function stopReviewBanner()")
+        self.assertIn('$("scan-review-banner").hidden = true;', html[stop:stop + 300])
+        self.assertIn('$("scan-review-count").textContent = "";', html[stop:stop + 300])
+
+    def test_review_banner_refresh_every_30_seconds_is_guarded(self):
+        html = self.page()
+        self.assertIn("var REVIEW_BANNER_MS = 30000;", html)
+        start = html.index("function startReviewBanner()")
+        end = html.index("function stopReviewBanner()")
+        block = html[start:end]
+        # One timer only, not started without label_approve and Taking data.
+        self.assertIn("if (reviewTimer !== null || !reviewBannerWanted()) { return; }", block)
+        self.assertEqual(block.count("setInterval("), 1)
+        self.assertIn("REVIEW_BANNER_MS);", block)
+        # Each tick is skipped unless the role may review, the page is shown and visible.
+        self.assertIn("if (!reviewBannerWanted() || el.app.hidden || document.visibilityState !== \"visible\") { return; }",
+                      block)
+        self.assertIn("refreshScanReview();", block)
+        # Started on the first render after login, stopped on logout and on 401 (showLogin).
+        self.assertIn("startReviewBanner();", html)
+        logout = html.index("function showLogin()")
+        self.assertIn("stopReviewBanner();", html[logout:html.index("function handleError", logout)])
+        # The review banner is the only interval on the page (the rest use setTimeout).
+        self.assertEqual(html.count("setInterval("), 1)
+
+    def test_review_open_button_shows_the_panel_and_scrolls_to_review(self):
+        html = self.page()
+        start = html.index('$("scan-review-open").addEventListener')
+        block = html[start:start + 600]
+        self.assertIn("scanOpen = true;", block)
+        self.assertIn("renderScanPanel();", block)
+        self.assertIn("refreshScan();", block)
+        self.assertIn("refreshScanReview();", block)
+        self.assertIn('var section = $("scan-review");', block)
+        self.assertIn("if (section && section.scrollIntoView) {", block)
+        self.assertIn("section.scrollIntoView(", block)
+
     @staticmethod
     def scan_block(html):
         start = html.index("// ----- Taking data (supervisor and admin)")
