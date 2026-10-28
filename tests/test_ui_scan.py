@@ -601,6 +601,14 @@ class ScanPageTests(ScanHttpBase):
         self.assertNotIn("insertAdjacentHTML", block)
         self.assertNotIn("document.write", block)
 
+    def test_scan_review_buttons_do_not_trigger_the_part_label_handler(self):
+        # A data-action="label_approve" button also fires the page-wide handler, which would
+        # approve the collected part's label for the same click.
+        html = self.page()
+        start = html.index("function renderScanReview(rows)")
+        end = html.index("function refreshScanReview()")
+        self.assertNotIn("data-action", html[start:end])
+
     def test_review_list_is_in_the_panel_and_hidden_by_default(self):
         html = self.page()
         self.assertIn('<section id="scan-review" aria-label="Scans waiting for approval" hidden>', html)

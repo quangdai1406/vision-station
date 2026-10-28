@@ -1721,6 +1721,8 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
       + " at " + String(row.labelled_at || "-") + ".";
   }
 
+  // These buttons must NOT carry data-action: the page-wide click handler would also send
+  // the collected-part label approval (/api/label/approve) for the same click.
   function renderScanReview(rows) {
     var list = $("scan-review-list");
     while (list.firstChild) { list.removeChild(list.firstChild); }
@@ -1731,13 +1733,11 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
       var approve = document.createElement("button");
       approve.type = "button";
       approve.textContent = "Approve";
-      approve.setAttribute("data-action", "label_approve");
       approve.addEventListener("click", function () { reviewDecide(row.scan_id, "approve", ""); });
       var reject = document.createElement("button");
       reject.type = "button";
       reject.className = "secondary";
       reject.textContent = "Reject";
-      reject.setAttribute("data-action", "label_approve");
       var box = document.createElement("div");
       box.hidden = true;
       var reasonInput = document.createElement("input");
@@ -1749,7 +1749,6 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
       var confirmBtn = document.createElement("button");
       confirmBtn.type = "button";
       confirmBtn.textContent = "Confirm reject";
-      confirmBtn.setAttribute("data-action", "label_approve");
       confirmBtn.addEventListener("click", function () {
         reviewDecide(row.scan_id, "reject", reasonInput.value);
       });
