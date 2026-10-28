@@ -50,6 +50,8 @@ from station.modelstore import ModelError, ModelStore, load_runtime_model, regis
 from station.outbox import Outbox
 from station.outputs import ConsoleOutputs, SerialRelayOutputs
 from station.parts import MesPartsClient, PartsError, build_part_config
+from station.scan import ScanSession, ScanState
+from station.scanstore import ScanStore
 from station.session import StationSession
 from station.storage import (COLLECTED, Store, check_criterion_id, check_reject_reason,
                              label_status)
@@ -60,6 +62,7 @@ DEFAULT_SESSION_TIMEOUT_S = 900.0
 DEFAULT_SYNC_INTERVAL_S = 5.0
 DEFAULT_FLIP_TIMEOUT_S = 60.0
 DEFAULT_MIN_FLIP_S = 2.0
+DEFAULT_SCAN_MIN_FLIP_S = 2.0  # engineering setting for Taking data, not a quality limit
 DEFAULT_CAMERA_WIDTH = 2560
 DEFAULT_CAMERA_HEIGHT = 1440
 DEFAULT_BAD_DISPOSITION = "quarantine"
@@ -76,7 +79,7 @@ _REQUIRED_KEYS = (
     "model", "outputs",
 )
 # part_number is required in 'fixed' mode only (checked in validate_config).
-_OPTIONAL_KEYS = ("part_number", "parts", "ui", "flip_timeout_s", "min_flip_s", "frame_ok")
+_OPTIONAL_KEYS = ("part_number", "parts", "ui", "flip_timeout_s", "min_flip_s", "frame_ok", "scan")
 _ALL_KEYS = _REQUIRED_KEYS + _OPTIONAL_KEYS
 _STRING_KEYS = (
     "site", "line", "station_id", "lot", "operator", "supervisor",
@@ -371,6 +374,20 @@ def _validate_outputs(raw: Any) -> dict:
     return {"kind": kind, "port": port, "channel_map": channel_map}
 
 
+def _validate_scan(raw: Any) -> dict:
+    """scan: 'Taking data' mode (optional, off by default). Validated even when disabled."""
+    path = "scan"
+    scan = _obj({} if raw is None else raw, path)
+    _check_keys(scan, ("enabled", "min_flip_s", "debounce_s"), path)
+    debounce = scan.get("debounce_s")
+    return {
+        "enabled": _bool(scan.get("enabled", False), "scan.enabled"),
+        "min_flip_s": _number(scan.get("min_flip_s", DEFAULT_SCAN_MIN_FLIP_S), "scan.min_flip_s", lo=0.0),
+        # None means "use the ScanSession default" (0.3 s); it is passed on only when a number is given.
+        "debounce_s": None if debounce is None else _number(debounce, "scan.debounce_s", lo=0.0),
+    }
+
+
 def validate_config(data: Any) -> dict:
     """Check a config dict against the schema and return a normalised copy with defaults filled.
 
@@ -440,6 +457,7 @@ def validate_config(data: Any) -> dict:
         _check_keys(frame_ok, ("min_variance",), "frame_ok", required=("min_variance",))
         frame_ok = {"min_variance": _number(frame_ok["min_variance"], "frame_ok.min_variance", lo=0.0)}
     out["frame_ok"] = frame_ok
+    out["scan"] = _validate_scan(cfg.get("scan"))
     return out
 
 
@@ -576,7 +594,11 @@ class _LockedSession:
         return self._app
 
     def press(self) -> bool:
+        # The inverse of the scan start guard: no inspection press while a scan is active.
+        # Refused presses return False, as the session does for an ignored press.
         with self._lock:
+            if self._app is not None and self._app.scan_blocks_press():
+                return False
             return self._session.press()
 
     def ack_alarm(self) -> None:
@@ -636,6 +658,59 @@ class _LockedSession:
             return None
         finally:
             self._lock.release()
+
+
+class _LockedScan:
+    """Serialises every Taking-data call with the inspection session's lock.
+
+    Lock order is always the session lock first, then the scan's own lock, so the
+    press guard in _LockedSession and the busy() check in ScanSession.start cannot deadlock.
+    """
+
+    def __init__(self, scan: ScanSession, lock: threading.RLock) -> None:
+        self._scan = scan
+        self._lock = lock
+
+    def start(self, part_number: str, toy_id: str, label: dict, taken_by: str,
+              sides: tuple = ("TOP", "BOTTOM")) -> str:
+        with self._lock:
+            return self._scan.start(part_number, toy_id, label, taken_by, sides)
+
+    def press(self) -> bool:
+        with self._lock:
+            return self._scan.press()
+
+    def flip_ready(self) -> None:
+        with self._lock:
+            self._scan.flip_ready()
+
+    def done_side(self) -> str:
+        with self._lock:
+            return self._scan.done_side()
+
+    def mark(self, camera_id: str, side: str, step: int, visible: bool) -> None:
+        with self._lock:
+            self._scan.mark(camera_id, side, step, visible)
+
+    def finish(self) -> pathlib.Path:
+        with self._lock:
+            return self._scan.finish()
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._scan.cancel()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._scan.reset()
+
+    def clear_fault(self) -> None:
+        with self._lock:
+            self._scan.clear_fault()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return self._scan.snapshot()
 
 
 # --------------------------------------------------------------- the app
@@ -854,6 +929,27 @@ class StationApp:
             collect_only=self._collect_only,
         )
 
+        # Taking data (optional): same cameras as the inspection session, scans under data_dir/scans.
+        # Built only when enabled, so a disabled station creates no folders and changes nothing.
+        self._scan_session: Optional[ScanSession] = None
+        self.scan: Optional[_LockedScan] = None
+        scan_cfg = cfg["scan"]
+        if scan_cfg["enabled"]:
+            scan_kwargs: dict[str, Any] = {}
+            if scan_cfg["debounce_s"] is not None:
+                scan_kwargs["debounce_s"] = scan_cfg["debounce_s"]
+            self._scan_session = ScanSession(
+                cameras,
+                ScanStore(pathlib.Path(cfg["data_dir"]), site=cfg["site"], line=cfg["line"]),
+                busy=self._inspection_busy,
+                camera_ids=camera_ids,
+                min_flip_s=scan_cfg["min_flip_s"],
+                clock=self._clock,
+                now_utc=self._now_utc,
+                **scan_kwargs,
+            )
+            self.scan = _LockedScan(self._scan_session, self._session_lock)
+
         try:
             users = load_users(cfg["users_file"])
         except FileNotFoundError as exc:
@@ -866,6 +962,26 @@ class StationApp:
         self._locked = _LockedSession(self.session, self._session_lock, self)
         self.server = make_server(self._locked, users, self.sessions,
                                   host=cfg["ui"]["host"], port=cfg["ui"]["port"])
+
+    # ------------------------------------------------------- Taking data
+
+    def _inspection_busy(self) -> bool:
+        """busy() for the scan: any inspection state except IDLE blocks a scan start."""
+        return self.session.state is not State.IDLE
+
+    def scan_active(self) -> bool:
+        """True while a scan holds the cameras (any scan state except IDLE and DONE)."""
+        scan = self._scan_session
+        if scan is None:
+            return False
+        return scan.snapshot()["state"] not in (ScanState.IDLE.value, ScanState.DONE.value)
+
+    def scan_blocks_press(self) -> bool:
+        """True (and logged) when an inspection press must be refused because a scan is active."""
+        if not self.scan_active():
+            return False
+        self.store.append_event("press_ignored", {"reason": "scan_active"})
+        return True
 
     # ------------------------------------------------------------ MES
 

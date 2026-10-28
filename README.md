@@ -45,6 +45,7 @@ value. The station refuses to start while a placeholder is left, and names it.
 | `outputs` | `kind` `console` or `serial_relay` (with `port`, optional `channel_map`). |
 | `flip_timeout_s` | Seconds the station waits for the flip press before voiding a part (default 60). |
 | `frame_ok.min_variance` | Optional sharpness gate; a blurred frame is retaken (up to 2 times). |
+| `scan` | Optional "Taking data" mode: `enabled` (default `false`), `min_flip_s` (default 2.0), `debounce_s` (optional). Scans are saved under `data_dir/scans/`; a scan cannot run during an inspection and an inspection press is refused during a scan. |
 
 ## Run it
 
