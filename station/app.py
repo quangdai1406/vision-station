@@ -1195,7 +1195,9 @@ class StationApp:
             raise StationError(_NEEDS_TORCH)
         decode = cv2_decoder()
         if info.type == "patchcore":
-            from station.anomaly import register_patchcore_loader  # noqa: PLC0415 - lazy, needs numpy
+            # PatchCore is trained on RGB pictures (trainer/weekly.py); the golden decoder gives grayscale
+            from station.anomaly import cv2_rgb_decoder, register_patchcore_loader  # noqa: PLC0415 - lazy
+            decode = cv2_rgb_decoder()
             register_patchcore_loader(self._make_extractor)
         model = load_runtime_model(info, decode)
         model.version = info.version  # the approved version name is what the records show

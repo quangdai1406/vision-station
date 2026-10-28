@@ -19,7 +19,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `station/__init__.py` | 1 | 0 | 0 |  |
 | `station/__main__.py` | 95 | 2 | 2 | Entry point. |
 | `station/anomaly.py` | 841 | 5 | 11 | PatchCore-style anomaly detection trained on GOOD parts only. |
-| `station/app.py` | 1275 | 8 | 6 | Wire the station together: config, build, run, and MES sync. |
+| `station/app.py` | 1277 | 8 | 6 | Wire the station together: config, build, run, and MES sync. |
 | `station/auth.py` | 182 | 9 | 8 | Password hashing, user store, role policy and in-memory session tokens. |
 | `station/cameras.py` | 1013 | 12 | 9 | Camera sources for the inspection station. |
 | `station/contracts.py` | 202 | 40 | 30 | Shared types and interfaces for the camera inspection station. |

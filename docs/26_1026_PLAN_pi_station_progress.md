@@ -151,3 +151,5 @@ BAD; never invent thresholds or counts (write `[Quality to define]`); no secrets
 
 Home-only numbers (HOME TRIAL, NOT QUALITY): min_good 10, min_holdout 3, holdout_fraction 0.3. t_low/t_img: [Quality to define] until tools/thresholds.py gives candidates.
 Known: weekly falls back to whole parts when the store has fewer than 2 UTC days, so one day can land in both train and holdout.
+
+| 2026-10-27 | H5-H8 smoke | SMOKE TEST on a scratch copy of the toy-car evidence (not Quality): train (14/6, held-out good max 0.50), promote (piped yes, no human approval), inspect, post to fake MES. GOOD/BAD/REVIEW/replay all behave. Found and fixed: station decoded PatchCore pictures as grayscale (all scores 1.0). Details and open items: docs/home_trial/SMOKE_RESULTS.md. Real H3/H4/H1 still need the user. |

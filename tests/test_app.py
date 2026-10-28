@@ -1280,6 +1280,20 @@ class MesPartsTests(PartTestCase):
         self.assertEqual(result["reason"], "This part needs the anomaly model, which needs torch on this PC.")
         self.assertFalse(app.session.can_inspect)
 
+    def test_patchcore_part_is_decoded_as_rgb_and_golden_as_grayscale(self) -> None:
+        app = self.build()
+        rgb, gray = object(), object()
+        for kind, expected in (("patchcore", rgb), ("golden", gray)):
+            info = mock.Mock(version="v1")
+            info.type = kind
+            with mock.patch("station.app._torch_importable", return_value=True), \
+                    mock.patch("station.anomaly.cv2_rgb_decoder", return_value=rgb), \
+                    mock.patch("station.anomaly.register_patchcore_loader"), \
+                    mock.patch("station.golden.cv2_decoder", return_value=gray), \
+                    mock.patch("station.app.load_runtime_model") as load:
+                app._load_part_model(info)
+            self.assertIs(load.call_args.args[1], expected, kind)
+
     def test_fixed_station_refuses_part_calls(self) -> None:
         app = build_station(base_config(self.tmp), cameras=FakeCameraSet(), model=MarkerModel("test-1"),
                             outputs=RecordingOutputs(), clock=FakeClock(), token=FAKE_MES_TOKEN)
