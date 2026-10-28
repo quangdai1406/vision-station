@@ -47,3 +47,24 @@ An unsettled camera adds a warning to cameras.<dev>.warnings. The end-of-run sum
 Options: --outlier-sigma (default 5.0), --outlier-floor-gray (default 2.0): a stationary frame is FLAGGED when |mean - median| > max(sigma * 1.4826 * MAD, floor). Flagging only helps you spot frames; nothing is dropped unless you pass --skip-first N. When frames are flagged, the report shows all-frames vs excluding-flagged side by side. --min-shift-response (default 0.1): the apparent drift line is hidden below this phase-correlation peak response and the real value is printed.
 summary.csv extra columns: frames_used, skip_first, flagged_frames, flagged_frame_indices and six excl_flagged_* columns (empty when nothing is flagged). report.json gains "settings" and the median shift response.
 
+
+## Scan record (Taking data mode; written by station/scanstore.py, read by its verify_scan/load_scan)
+Standard library only. A scan is kept apart from inspected parts: it has no part verdict and never goes to the MES. Plan: docs/26_1027_PLAN_taking_data_mode.md.
+
+```
+<root>/scans/<line>/YYYY/MM/DD/<scan_id>/
+  <site>_<line>_<YYYYMMDD>_<HHMMSS>_<scan_id>_<CAM>_<SIDE>_S<step:02d>.<ext>
+  scan.json          the record (below)
+  manifest.sha256    sha256sum text format: one "<sha256>  <file>" line per picture and one for scan.json; written LAST
+```
+- The date and time in the picture names come from `started_utc`, in UTC. `CAM` is a camera id (C1..C4), `SIDE` is TOP or BOTTOM, `step` is 1-based and contiguous per side, `ext` defaults to png.
+- While a scan is being written it lives in the hidden folder `.<scan_id>.partial` inside its day folder. It is renamed to `<scan_id>` only when complete. A folder whose name starts with `.` is never a finished scan: readers (`list_scans`) skip it, `verify_scan` reports it.
+- `scan.json` keys: `scan_id`, `site`, `line`, `part_number`, `toy_id`, `label`, `steps`, `taken_by`, `started_utc`, `finished_utc` (both `YYYY-MM-DDTHH:MM:SSZ`), `camera_ids` (list), `images` (list). `site` and `line` are copied from the `ScanStore` that wrote the scan; each picture name must start with them.
+  - `label`: `verdict` GOOD or BAD; `defects` (list of defect names: empty for GOOD, at least one for BAD); `status` proposed, official or rejected; `labelled_by`, `labelled_at`; `approved_by`, `approved_at` (both or neither; required for rejected); `reject_reason` (rejected only). Labels are never changed by this writer.
+  - `steps`: `{"TOP": n, "BOTTOM": m}`. A side that was not scanned is absent. Each side that is present has n >= 1 and steps 1..n with no gaps.
+  - `images`: one object per picture: `file`, `camera_id`, `side`, `step`, `sha256`, `defect_visible`. For a BAD scan `defect_visible` is true or false on every picture. For a GOOD scan it is null on every picture.
+  - Each step has exactly one picture per listed camera.
+- Writers: `ScanStore(root, site, line).begin_scan(...)` returns a `ScanWriter`; `add_picture(...)` writes each picture as it arrives; `finish(finished_utc)` writes scan.json, then the manifest, then renames the folder; `cancel()` removes the staging folder.
+- Readers: `verify_scan(scan_dir)` returns a list of problems (empty = intact: missing, extra or altered file, manifest or scan.json mismatch, label or step rules broken, symlink, staging folder). `verify_scan` checks each picture's full name (`site_line_date_time_scanid_CAM_SIDE_Sxx.ext`) against scan.json, and that the folder sits at `<line>/YYYY/MM/DD` as scan.json says. `load_scan(scan_dir)` returns the validated scan.json dict or raises ValueError. `list_scans(root, line=None)` returns finished scan folders only.
+- Staging folder blocks the id: while a leftover `.<scan_id>.partial` folder exists, that `scan_id` cannot be used again (`begin_scan` refuses it, and `verify_scan` reports the staging folder). After a crash, the operator removes that hidden folder by hand. There is no code for this yet.
+- Copying or exporting a scan: `manifest.sha256` lists `scan.json` as well as the pictures. A copy or export tool must copy the whole scan folder, or copy the files the manifest lists and check them against it. It must not write a new manifest from the pictures alone, because that would drop the scan.json hash and the record would no longer match what was written.
