@@ -19,7 +19,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `station/__init__.py` | 1 | 0 | 0 |  |
 | `station/__main__.py` | 95 | 2 | 2 | Entry point. |
 | `station/anomaly.py` | 841 | 6 | 14 | PatchCore-style anomaly detection trained on GOOD parts only. |
-| `station/app.py` | 1397 | 10 | 8 | Wire the station together: config, build, run, and MES sync. |
+| `station/app.py` | 1405 | 10 | 8 | Wire the station together: config, build, run, and MES sync. |
 | `station/auth.py` | 183 | 11 | 10 | Password hashing, user store, role policy and in-memory session tokens. |
 | `station/cameras.py` | 1013 | 13 | 11 | Camera sources for the inspection station. |
 | `station/contracts.py` | 202 | 44 | 35 | Shared types and interfaces for the camera inspection station. |
@@ -32,12 +32,12 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `station/outbox.py` | 214 | 2 | 9 | Durable outbox for inspection events waiting to be posted to the MES. |
 | `station/outputs.py` | 122 | 9 | 9 | Output drivers for lights and the alarm (implements contracts.OutputDriver). |
 | `station/parts.py` | 281 | 4 | 10 | Client for the MES part search and per-part inspection criteria. |
-| `station/scan.py` | 504 | 5 | 10 | One "Taking data" scan: from the first press of a part to a saved scan record. |
-| `station/scanstore.py` | 716 | 12 | 17 | Scan records for "Taking data" mode: 360-degree pictures for training. |
+| `station/scan.py` | 568 | 5 | 10 | One "Taking data" scan: from the first press of a part to a saved scan record. |
+| `station/scanstore.py` | 826 | 12 | 17 | Scan records for "Taking data" mode: 360-degree pictures for training. |
 | `station/session.py` | 765 | 3 | 9 | One inspection session: from the first press of a part to a completed record. |
 | `station/storage.py` | 691 | 11 | 16 | Storage for finished inspection parts and the append-only event log. |
 | `station/teach.py` | 179 | 2 | 2 | `python -m station teach`: learn the golden model from GOOD parts on the real cameras. |
-| `station/ui.py` | 2120 | 3 | 9 | HTTP server for the inspection station: a JSON API plus one HTML page. |
+| `station/ui.py` | 2278 | 3 | 9 | HTTP server for the inspection station: a JSON API plus one HTML page. |
 | `station/users_cli.py` | 131 | 2 | 2 | `python -m station users add <username> <role>`: create or update a station login. |
 | `tools/__init__.py` | 6 | 8 | 7 | Repeatability and threshold-selection tools. See FORMAT.md. |
 | `tools/analysis.py` | 263 | 3 | 3 | Numpy-only image repeatability metrics. Shapes and return keys: see tools/FORMAT.md. |

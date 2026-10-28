@@ -37,6 +37,9 @@ SCAN_SIDES = ("TOP", "BOTTOM")
 _SCAN_VIEW_KEYS = ("state", "side", "step", "counts", "sides", "scan_id", "part_number", "toy_id",
                    "label_verdict", "defects", "marks", "camera_names", "fault", "press_ready",
                    "flip_wait_s", "prompt")
+# Pending scan reviews the browser may see: no picture bytes, no folder paths.
+_SCAN_PENDING_KEYS = ("scan_id", "part_number", "toy_id", "verdict", "defects", "labelled_by",
+                      "labelled_at", "steps")
 _SCAN_IMAGE_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}
 PART_SEARCH_MAX_CHARS = 100
 PART_SEARCH_LIMIT_DEFAULT = 20
@@ -73,6 +76,7 @@ _SCAN_POST = {
     "cancel": "_scan_cancel",
     "clear-fault": "_scan_clear_fault",
     "reset": "_scan_reset",
+    "review": "_scan_review",
 }
 
 _CSP = (
@@ -293,6 +297,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._scan_state()
         if path == "/api/scan/step-picture":
             return self._scan_step_picture(urllib.parse.parse_qs(query))
+        if path == "/api/scan/pending":
+            return self._scan_pending()
         raise _HttpError(404, "not found")
 
     def _post(self) -> None:
@@ -594,6 +600,47 @@ class _Handler(BaseHTTPRequestHandler):
         self._scan_call(self.scan.reset)
         self._scan_reply()
 
+    # Approval of finished scans (admin): gate is the 'label_approve' action, then the feature.
+    def _scan_review_gate(self) -> str:
+        _, username, _role = self._require("label_approve")
+        if self.scan is None:
+            raise _HttpError(404, "taking data is not enabled on this station")
+        return username
+
+    def _scan_pending_rows(self) -> list:
+        rows = self._scan_call(self.scan.pending_reviews)
+        if not isinstance(rows, list):
+            raise RuntimeError("pending_reviews() must return a list")
+        return [_pick(r, _SCAN_PENDING_KEYS) for r in rows if isinstance(r, dict)]
+
+    def _scan_pending(self) -> None:
+        self._scan_review_gate()
+        self._send_json(200, {"pending": self._scan_pending_rows()})
+
+    def _scan_review(self) -> None:
+        """Approve or reject a proposed scan label. The reviewer is the login, never the body."""
+        username = self._scan_review_gate()
+        data = self._read_json()
+        scan_id = data.get("scan_id")
+        if not isinstance(scan_id, str) or not scan_id:
+            raise _HttpError(400, "scan_id is required")
+        decision = data.get("decision")
+        if decision not in ("approve", "reject"):
+            raise _HttpError(400, "decision must be approve or reject")
+        reason = data.get("reason")
+        if decision == "reject":
+            if not isinstance(reason, str) or not reason.strip():
+                raise _HttpError(400, "a rejection needs a reason")
+            if len(reason) > MAX_REJECT_REASON_CHARS:
+                raise _HttpError(400, f"reason must be {MAX_REJECT_REASON_CHARS} characters or fewer")
+            reason = reason.strip()
+        elif reason not in (None, ""):
+            raise _HttpError(400, "reason is only for a rejection")
+        else:
+            reason = None
+        label = self._scan_call(self.scan.review, scan_id, decision, username, reason)
+        self._send_json(200, {"label": _to_jsonable(label), "pending": self._scan_pending_rows()})
+
     def _scan_step_picture(self, query: dict) -> None:
         """The picture of the camera for the last saved step. 204 when there is none."""
         self._scan_gate()
@@ -883,6 +930,12 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
         <div id="scan-pics" class="tiles" hidden></div>
         <p id="scan-status" class="status" role="status"></p>
       </div>
+      <section id="scan-review" aria-label="Scans waiting for approval" hidden>
+        <h3>Scans waiting for approval</h3>
+        <p class="muted hint">Only an admin makes a scan label official. Rejecting needs a short reason.</p>
+        <p id="scan-review-none" class="muted" hidden>No scans waiting.</p>
+        <ul id="scan-review-list" class="part-results"></ul>
+      </section>
     </section>
     <div id="inspect-controls">
     <section id="part-panel" class="card" aria-label="Part number" hidden>
@@ -1300,6 +1353,7 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
     pressAllowed = !!allowed.press;
     labelIsAdmin = !!allowed.label_approve;
     scanAllowed = !!allowed.scan;
+    reviewAllowed = !!allowed.label_approve;
     scanActiveNow = s.scan_active === true;
     // Part number prefill for the Taking-data form: once, and only until the operator types.
     if (!scanPartTouched && typeof s.part_number === "string" && s.part_number
@@ -1528,6 +1582,7 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
     $("scan-open").textContent = scanOpen ? "Close Taking data" : "Taking data";
     var show = scanAllowed && (scanOpen || active || (s !== null && s.state === "DONE"));
     $("scan-panel").hidden = !show;
+    $("scan-review").hidden = !reviewAllowed;
     if (!show) { return; }
     var runView = s !== null && s.state !== "IDLE";
     $("scan-setup").hidden = runView;
@@ -1600,7 +1655,7 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
   $("scan-open").addEventListener("click", function () {
     scanOpen = !scanOpen;
     renderScanPanel();
-    if (scanOpen) { refreshScan(); }
+    if (scanOpen) { refreshScan(); refreshScanReview(); }
   });
   Array.prototype.forEach.call(document.querySelectorAll('input[name="scan-verdict"]'), function (r) {
     r.addEventListener("change", renderScanPanel);
@@ -1646,6 +1701,107 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
   $("scan-reset").addEventListener("click", function () {
     scanAction("/api/scan/reset", {}, function () { clearScanPics(); setScanStatus(""); });
   });
+
+  // ----- Taking data: scans waiting for approval (label_approve) ----------
+  // One row per proposed scan. Approve sends at once; Reject opens an inline reason
+  // box (no browser dialog). Every value is set with textContent. Errors go to the
+  // page error line, which stays visible in both panel views.
+  var reviewAllowed = false;
+  var reviewBusy = false;
+  var reviewFetching = false;
+  var REVIEW_REASON_MAX = 200;
+
+  function reviewScanText(row) {
+    var defects = Array.isArray(row.defects)
+      ? row.defects.filter(function (d) { return typeof d === "string"; }) : [];
+    return "Toy " + String(row.toy_id || "-") + " (part " + String(row.part_number || "-") + "): "
+      + (row.verdict === "BAD" ? "BAD" : "GOOD")
+      + (defects.length ? " [" + defects.join(", ") + "]" : "")
+      + ", taken by " + String(row.labelled_by || "-")
+      + " at " + String(row.labelled_at || "-") + ".";
+  }
+
+  function renderScanReview(rows) {
+    var list = $("scan-review-list");
+    while (list.firstChild) { list.removeChild(list.firstChild); }
+    $("scan-review-none").hidden = rows.length > 0;
+    rows.forEach(function (row) {
+      var li = document.createElement("li");
+      li.appendChild(document.createTextNode(reviewScanText(row) + " "));
+      var approve = document.createElement("button");
+      approve.type = "button";
+      approve.textContent = "Approve";
+      approve.setAttribute("data-action", "label_approve");
+      approve.addEventListener("click", function () { reviewDecide(row.scan_id, "approve", ""); });
+      var reject = document.createElement("button");
+      reject.type = "button";
+      reject.className = "secondary";
+      reject.textContent = "Reject";
+      reject.setAttribute("data-action", "label_approve");
+      var box = document.createElement("div");
+      box.hidden = true;
+      var reasonInput = document.createElement("input");
+      reasonInput.type = "text";
+      reasonInput.maxLength = REVIEW_REASON_MAX;
+      reasonInput.autocomplete = "off";
+      reasonInput.placeholder = "Reason for rejection (required)";
+      reasonInput.setAttribute("aria-label", "Reject reason");
+      var confirmBtn = document.createElement("button");
+      confirmBtn.type = "button";
+      confirmBtn.textContent = "Confirm reject";
+      confirmBtn.setAttribute("data-action", "label_approve");
+      confirmBtn.addEventListener("click", function () {
+        reviewDecide(row.scan_id, "reject", reasonInput.value);
+      });
+      reject.addEventListener("click", function () {
+        box.hidden = !box.hidden;
+        if (!box.hidden) { reasonInput.focus(); }
+      });
+      box.appendChild(reasonInput);
+      box.appendChild(confirmBtn);
+      li.appendChild(approve);
+      li.appendChild(reject);
+      li.appendChild(box);
+      list.appendChild(li);
+    });
+  }
+
+  function refreshScanReview() {
+    if (!reviewAllowed || reviewFetching) { return; }
+    reviewFetching = true;
+    var g = gen;
+    request("GET", "/api/scan/pending").then(function (d) {
+      reviewFetching = false;
+      if (g !== gen) { return; }
+      renderScanReview(Array.isArray(d.pending) ? d.pending : []);
+    }, function (err) {
+      reviewFetching = false;
+      if (g !== gen) { return; }
+      if (err.status === 401) { showLogin(); return; }
+      setError(err.message);
+    });
+  }
+
+  function reviewDecide(scanId, decision, reason) {
+    if (reviewBusy) { return; }
+    var body = { scan_id: scanId, decision: decision };
+    if (decision === "reject") {
+      var text = String(reason || "").trim();
+      if (!text) { setError("A rejection needs a reason."); return; }
+      body.reason = text;
+    }
+    reviewBusy = true;
+    setError("");
+    request("POST", "/api/scan/review", body).then(function (d) {
+      reviewBusy = false;
+      renderScanReview(Array.isArray(d.pending) ? d.pending : []);
+    }, function (err) {
+      reviewBusy = false;
+      if (err.status === 401) { showLogin(); return; }
+      setError(err.message);
+      refreshScanReview();
+    });
+  }
 
   // ----- collected-part labels ---------------------------------------------
   // Shown as text only (textContent), so station data cannot inject markup.
@@ -1765,6 +1921,8 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
     scanSnap = null;
     scanBusy = false;
     scanFetching = false;
+    reviewAllowed = false;
+    reviewBusy = false;
     clearScanPics();
     renderScanPanel();
   }

@@ -190,6 +190,9 @@ Still open:
 - Evaluation: scores are clipped to 1.0 (`anomaly.py` `_clip01`), so every BAD picture at or above the reference reads exactly 1.0 and the size of the gap is hidden. Recommended (checker): add unclipped raw ratio and a count of saturated pictures to the weekly evaluation JSON (additive, evaluation only, no `contracts.py` change; needs a raw-score accessor in `station/anomaly.py`), plus a docs note meanwhile. Needs the owner's decision.
 - Evaluation: held-out GOOD max is exactly 0.5 for both toys (likely `norm_ref` normalisation); one-line check once raw values are reported.
 
+### 2026-10-28 (day) Scan label approval (added after step 7 started)
+Why: scans taken by a supervisor are saved `proposed` and the trainer only uses `official`; there was no way to approve a scan. Built: `scanstore.review_scan_label`, `ScanSession.pending_reviews/review`, `GET /api/scan/pending`, `POST /api/scan/review` (admin only, action `label_approve`), and a "Scans waiting for approval" list in the Taking-data panel. Checker PASS (real scans, real HTTP roles, path traversal refused, full suite 1395 OK). Open: the list loads only when the admin clicks Taking data (not on auto-open); damaged scans drop out of the list silently ("needs attention" view not built); crash between the two renames needs manual repair (documented in tools/FORMAT.md); a rejection stores the reviewer in approved_by/approved_at because the label check requires both.
+
 ## Handover note (end of the overnight run, 2026-10-28)
 
 State: plan steps 1 to 6 are DONE and committed locally (not pushed): scan store, ScanSession, auth + app wiring, UI screen and endpoints, scan export, trainer with `--scans-too`. Full suite 1366 OK, 0 skipped (node on PATH). `contracts.py` was never touched. The running collect station and `~/vision-home` were not touched. A real-extractor smoke test on synthetic scans passed.

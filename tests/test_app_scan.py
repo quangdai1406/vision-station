@@ -139,9 +139,9 @@ class ScanAppTests(unittest.TestCase):
         self.addCleanup(app.stop)
         return app, clock, cameras
 
-    def _good_scan(self, app, clock) -> pathlib.Path:
+    def _good_scan(self, app, clock, label=None) -> pathlib.Path:
         """2 TOP steps, flip, 2 BOTTOM steps, finish. Returns the saved scan folder."""
-        app.scan.start("PN-100", "TOY-1", dict(GOOD_LABEL), "sup1")
+        app.scan.start("PN-100", "TOY-1", dict(GOOD_LABEL if label is None else label), "sup1")
         app.scan.press()          # TOP step 1
         clock.now += 0.5
         app.scan.press()          # TOP step 2
@@ -306,6 +306,18 @@ class ScanAppTests(unittest.TestCase):
         self.assertTrue(picture)
         status, _, _ = self._http(app, "POST", "/api/scan/cancel", cookie, {})
         self.assertEqual(status, 200)
+
+    def test_pending_and_review_go_through_the_locked_wrapper(self) -> None:
+        app, clock, _ = self._app({"enabled": True})
+        proposed = {"verdict": "GOOD", "defects": [], "status": "proposed",
+                    "labelled_by": "sup1", "labelled_at": "2026-10-27T08:42:00Z"}
+        scan_dir = self._good_scan(app, clock, proposed)
+        self.assertEqual([r["scan_id"] for r in app.scan.pending_reviews()], [scan_dir.name])
+        label = app.scan.review(scan_dir.name, "approve", "admin1")
+        self.assertEqual(label["status"], "official")
+        self.assertEqual(label["approved_by"], "admin1")
+        self.assertEqual(app.scan.pending_reviews(), [])
+        self.assertEqual(verify_scan(scan_dir), [])
 
     def test_scan_routes_are_not_served_when_disabled(self) -> None:
         app, _, _ = self._app()

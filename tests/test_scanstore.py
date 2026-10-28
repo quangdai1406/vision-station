@@ -7,7 +7,15 @@ import unittest
 from unittest import mock
 
 from station import scanstore
-from station.scanstore import MANIFEST, SCAN_JSON, ScanStore, list_scans, load_scan, verify_scan
+from station.scanstore import (
+    MANIFEST,
+    SCAN_JSON,
+    ScanStore,
+    list_scans,
+    load_scan,
+    review_scan_label,
+    verify_scan,
+)
 
 CAMS = ["C1", "C2", "C3", "C4"]
 STARTED = "2026-10-27T08:30:12Z"
@@ -532,6 +540,135 @@ class TestSetDefectVisible(ScanTestCase):
         with self.assertRaises(RuntimeError):
             bad.set_defect_visible("C1", "TOP", 1, True)  # after finish
         self.assertEqual(verify_scan(self.scan_dir("SC-B")), [])
+
+
+PROPOSED_GOOD = {
+    "verdict": "GOOD",
+    "defects": [],
+    "status": "proposed",
+    "labelled_by": "sup-1",
+    "labelled_at": "2026-10-27T08:42:00Z",
+}
+REVIEW_AT = "2026-10-28T10:00:00Z"
+
+
+class TestReviewLabel(ScanTestCase):
+    def snapshot(self, scan_id="SC-1"):
+        """Bytes of every file in the scan folder, by name."""
+        folder = self.scan_dir(scan_id)
+        return {p.name: p.read_bytes() for p in sorted(folder.iterdir())}
+
+    def test_approve_makes_label_official_and_verifies(self):
+        self.finished_scan(label=PROPOSED_GOOD)
+        label = review_scan_label(self.scan_dir(), "approve", "admin-1", REVIEW_AT)
+        self.assertEqual(label["status"], "official")
+        self.assertEqual(label["approved_by"], "admin-1")
+        self.assertEqual(label["approved_at"], REVIEW_AT)
+        self.assertIsNone(label["reject_reason"])
+        self.assertEqual(verify_scan(self.scan_dir()), [])
+        self.assertEqual(load_scan(self.scan_dir())["label"], label)
+
+    def test_reject_needs_a_reason_and_records_the_reviewer(self):
+        self.finished_scan(label=PROPOSED_GOOD)
+        before = self.snapshot()
+        with self.assertRaises(ValueError):
+            review_scan_label(self.scan_dir(), "reject", "admin-1", REVIEW_AT)
+        with self.assertRaises(ValueError):
+            review_scan_label(self.scan_dir(), "reject", "admin-1", REVIEW_AT, reason="   ")
+        self.assertEqual(self.snapshot(), before)
+
+        label = review_scan_label(
+            self.scan_dir(), "reject", "admin-1", REVIEW_AT, reason="blurred TOP side"
+        )
+        self.assertEqual(label["status"], "rejected")
+        self.assertEqual(label["reject_reason"], "blurred TOP side")
+        self.assertEqual(label["approved_by"], "admin-1")
+        self.assertEqual(label["approved_at"], REVIEW_AT)
+        self.assertEqual(verify_scan(self.scan_dir()), [])
+
+    def test_second_review_of_official_scan_refused(self):
+        self.finished_scan(label=PROPOSED_GOOD)
+        review_scan_label(self.scan_dir(), "approve", "admin-1", REVIEW_AT)
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "this label is official"):
+            review_scan_label(self.scan_dir(), "reject", "admin-2", REVIEW_AT, reason="late")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_bad_decision_refused_and_nothing_changed(self):
+        self.finished_scan(label=PROPOSED_GOOD)
+        before = self.snapshot()
+        for decision in ("Approve", "accept", "", None):
+            with self.assertRaises(ValueError):
+                review_scan_label(self.scan_dir(), decision, "admin-1", REVIEW_AT)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_reason_on_approve_refused(self):
+        self.finished_scan(label=PROPOSED_GOOD)
+        with self.assertRaises(ValueError):
+            review_scan_label(self.scan_dir(), "approve", "admin-1", REVIEW_AT, reason="x")
+
+    def test_verdict_defects_and_labeller_unchanged(self):
+        self.finished_scan(label=BAD_LABEL, bad=True)
+        review_scan_label(self.scan_dir(), "approve", "admin-1", REVIEW_AT)
+        label = load_scan(self.scan_dir())["label"]
+        self.assertEqual(label["verdict"], "BAD")
+        self.assertEqual(label["defects"], ["doh_small", "doh_edge"])
+        self.assertEqual(label["labelled_by"], "sup-1")
+        self.assertEqual(label["labelled_at"], "2026-10-27T08:42:00Z")
+        self.assertEqual(label["status"], "official")
+
+    def test_flipped_byte_in_picture_refused_and_untouched(self):
+        self.finished_scan(label=PROPOSED_GOOD)
+        picture = self.scan_dir() / "SITE_L1_20261027_083012_SC-1_C1_TOP_S01.png"
+        data = bytearray(picture.read_bytes())
+        data[0] ^= 0x01
+        picture.write_bytes(bytes(data))
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            review_scan_label(self.scan_dir(), "approve", "admin-1", REVIEW_AT)
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(any(name.startswith(".") for name in before))
+
+    def test_pictures_and_their_hashes_unchanged_by_approve(self):
+        self.finished_scan(label=PROPOSED_GOOD, steps={"TOP": 2, "BOTTOM": 1})
+        before = self.snapshot()
+        review_scan_label(self.scan_dir(), "approve", "admin-1", REVIEW_AT)
+        after = self.snapshot()
+        pictures = [name for name in before if name not in (SCAN_JSON, MANIFEST)]
+        self.assertEqual(len(pictures), 12)  # 3 steps x 4 cameras
+        for name in pictures:
+            self.assertEqual(after[name], before[name])
+        before_lines = before[MANIFEST].decode().splitlines()
+        after_lines = after[MANIFEST].decode().splitlines()
+        changed = [(a, b) for a, b in zip(before_lines, after_lines) if a != b]
+        self.assertEqual(len(changed), 1)
+        self.assertTrue(changed[0][1].endswith(f"  {SCAN_JSON}"))
+        self.assertEqual(
+            [line for line in after_lines if not line.endswith(f"  {SCAN_JSON}")],
+            [line for line in before_lines if not line.endswith(f"  {SCAN_JSON}")],
+        )
+
+    def test_failed_manifest_step_leaves_scan_and_no_temp_files(self):
+        self.finished_scan(label=PROPOSED_GOOD)
+        before = self.snapshot()
+        real_replace = os.replace
+
+        def fail_on_manifest(src, dst):
+            if pathlib.Path(dst).name == MANIFEST:
+                raise OSError("replace failed (simulated)")
+            return real_replace(src, dst)
+
+        with mock.patch.object(scanstore.os, "replace", side_effect=fail_on_manifest):
+            with self.assertRaises(OSError):
+                review_scan_label(self.scan_dir(), "approve", "admin-1", REVIEW_AT)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual([p for p in self.scan_dir().iterdir() if p.name.startswith(".")], [])
+        self.assertEqual(verify_scan(self.scan_dir()), [])
+
+    def test_success_leaves_no_temp_files(self):
+        self.finished_scan(label=PROPOSED_GOOD)
+        review_scan_label(self.scan_dir(), "approve", "admin-1", REVIEW_AT)
+        self.assertEqual([p for p in self.scan_dir().iterdir() if p.name.startswith(".")], [])
 
 
 if __name__ == "__main__":

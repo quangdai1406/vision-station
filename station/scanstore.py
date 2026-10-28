@@ -694,6 +694,116 @@ def load_scan(scan_dir: pathlib.Path) -> dict:
     return doc
 
 
+def review_scan_label(
+    scan_dir: pathlib.Path,
+    decision: str,
+    by: str,
+    when_utc: str,
+    reason: Optional[str] = None,
+) -> dict:
+    """Approve or reject a finished scan's proposed label. Returns the new label dict.
+
+    ``decision`` is "approve" (status becomes official) or "reject" (status becomes
+    rejected; ``reason`` is required). Only a label whose status is "proposed" can be
+    reviewed. The scan must pass verify_scan() first; a damaged scan is never touched.
+    verdict, defects and the labeller stay as they were. For a rejection, approved_by
+    and approved_at record the reviewer (the rules require them on a rejected label).
+
+    scan.json is rewritten, then manifest.sha256 (its scan.json line only). Both are
+    written to hidden temp files first, then swapped in, manifest last, and the folder
+    is fsynced. If a step fails, scan.json is restored to its old bytes and the temp
+    files are removed. Two files cannot be swapped in one atomic step, so a crash in
+    the middle can leave a mismatch that verify_scan reports.
+
+    No lock: this is a module function, not a ScanStore method, so the store lock is
+    not taken. The caller must not review the same scan from two threads.
+    """
+    if decision not in ("approve", "reject"):
+        raise ValueError(f"decision must be 'approve' or 'reject', got {decision!r}")
+    scan_dir = pathlib.Path(scan_dir)
+    problems = verify_scan(scan_dir)
+    if problems:
+        raise ValueError("scan is damaged or invalid, not reviewed: " + "; ".join(problems))
+
+    scan_path = scan_dir / SCAN_JSON
+    manifest_path = scan_dir / MANIFEST
+    old_scan = scan_path.read_bytes()
+    old_manifest = manifest_path.read_bytes()
+    doc = json.loads(old_scan.decode("utf-8"))
+    label = doc["label"]
+    if label["status"] != "proposed":
+        raise ValueError(
+            f"only a proposed label can be reviewed; this label is {label['status']}"
+        )
+
+    reviewer = _text(by, "approved_by")
+    stamp = _parse_utc(when_utc, "approved_at").strftime(_UTC_FMT)
+    new_label = dict(label)
+    if decision == "approve":
+        if reason is not None:
+            raise ValueError("reason is only for a rejection")
+        new_label.update(
+            status="official", approved_by=reviewer, approved_at=stamp, reject_reason=None
+        )
+    else:
+        new_label.update(
+            status="rejected",
+            approved_by=reviewer,
+            approved_at=stamp,
+            reject_reason=_text(reason, "reject_reason", MAX_REASON_CHARS),
+        )
+    new_label = _label_doc(new_label)
+    problems = _label_problems(new_label)
+    if problems:
+        raise ValueError("; ".join(problems))
+    doc["label"] = new_label
+    problems = _scan_problems(doc)
+    if problems:
+        raise ValueError("; ".join(problems))
+
+    scan_bytes = _dump_json(doc)
+    new_digest = hashlib.sha256(scan_bytes).hexdigest()
+    out_lines: list[str] = []
+    replaced = 0
+    for line in old_manifest.decode("utf-8").splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        _digest, _sep, name = body.partition("  ")
+        if name == SCAN_JSON:
+            out_lines.append(f"{new_digest}  {SCAN_JSON}" + line[len(body):])
+            replaced += 1
+        else:
+            out_lines.append(line)
+    if replaced != 1:
+        raise ValueError("manifest.sha256 must list scan.json exactly once")
+    manifest_bytes = "".join(out_lines).encode("utf-8")
+
+    scan_tmp = scan_dir / ".scan.json.tmp"
+    manifest_tmp = scan_dir / ".manifest.sha256.tmp"
+    scan_swapped = False
+    try:
+        _write_durable(scan_tmp, scan_bytes)
+        _write_durable(manifest_tmp, manifest_bytes)
+        os.replace(scan_tmp, scan_path)
+        scan_swapped = True
+        os.replace(manifest_tmp, manifest_path)  # manifest last
+        _fsync_dir(scan_dir)
+    except BaseException:
+        if scan_swapped:
+            # Put the old scan.json back so the scan still matches its old manifest.
+            try:
+                _write_durable(scan_tmp, old_scan)
+                os.replace(scan_tmp, scan_path)
+            except OSError:
+                pass
+        for tmp in (scan_tmp, manifest_tmp):
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+    return dict(new_label)
+
+
 def list_scans(root: pathlib.Path, line: Optional[str] = None) -> list[pathlib.Path]:
     """Finished scan folders under ``root/scans`` (one line, or all). Staging folders are skipped."""
     base = pathlib.Path(root) / "scans"

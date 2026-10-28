@@ -52,7 +52,9 @@ from enum import Enum
 from typing import Any, Callable, Optional, Sequence
 
 from station.contracts import CAMERA_IDS, Side, StationError
-from station.scanstore import SIDES, ScanStore
+from station.scanstore import (
+    SIDES, ScanStore, list_scans, load_scan, review_scan_label, verify_scan,
+)
 
 
 class ScanState(str, Enum):
@@ -66,6 +68,9 @@ class ScanState(str, Enum):
 
 class ScanError(StationError):
     """A scan action refused: busy, wrong state, bad arguments or a failed save."""
+
+
+PENDING_REVIEW_CAP = 200  # most scans listed for approval at once
 
 
 def _default_scan_id() -> str:
@@ -322,6 +327,65 @@ class ScanSession:
             if self._state not in (ScanState.SCAN_SIDE, ScanState.WAIT_FLIP, ScanState.SAVING):
                 return None
             return self._last_pictures.get(camera_id)
+
+    def pending_reviews(self) -> list[dict]:
+        """Finished scans of this line whose label waits for approval, newest first.
+
+        Only a label with status "proposed" whose scan verifies clean is listed; a
+        damaged scan is left out. No picture bytes. At most PENDING_REVIEW_CAP rows.
+        """
+        with self._lock:
+            found = []
+            for scan_dir in list_scans(self._store.root, self._store.line):
+                try:
+                    doc = load_scan(scan_dir)
+                except (OSError, ValueError):
+                    continue
+                if doc["label"]["status"] == "proposed":
+                    found.append((doc, scan_dir))
+            # started_utc is a fixed-width UTC text, so the text order is the time order.
+            found.sort(key=lambda item: item[0]["started_utc"], reverse=True)
+            rows: list[dict] = []
+            for doc, scan_dir in found:
+                if len(rows) >= PENDING_REVIEW_CAP:
+                    break
+                if verify_scan(scan_dir):
+                    continue
+                label = doc["label"]
+                rows.append({
+                    "scan_id": doc["scan_id"],
+                    "part_number": doc["part_number"],
+                    "toy_id": doc["toy_id"],
+                    "verdict": label["verdict"],
+                    "defects": list(label["defects"]),
+                    "labelled_by": label["labelled_by"],
+                    "labelled_at": label["labelled_at"],
+                    "steps": dict(doc["steps"]),
+                })
+            return rows
+
+    def review(self, scan_id: str, decision: str, by: str, reason: Optional[str] = None) -> dict:
+        """Approve or reject one proposed scan label. Returns the new label dict.
+
+        scan_id must be the exact name of a finished scan folder on this line; anything
+        with a path separator, or any other name, is refused. Other finished scans may be
+        reviewed while a new scan is running. Raises ValueError with the reason.
+        """
+        with self._lock:
+            if not isinstance(scan_id, str) or not scan_id:
+                raise ValueError("scan_id is required")
+            if any(ch in scan_id for ch in "/\\\x00"):
+                raise ValueError("scan_id must be a scan folder name, not a path")
+            matches = [d for d in list_scans(self._store.root, self._store.line) if d.name == scan_id]
+            if len(matches) != 1:
+                raise ValueError(f"no finished scan {scan_id!r} on this line")
+            try:
+                return review_scan_label(matches[0], decision, by, self._now_utc(), reason)
+            except OSError as exc:
+                raise ValueError(
+                    "the scan label could not be written; nothing was approved "
+                    f"({exc.__class__.__name__})"
+                ) from exc
 
     def snapshot(self) -> dict[str, Any]:
         """State for the UI. No pictures. Keys are listed in the module tests."""

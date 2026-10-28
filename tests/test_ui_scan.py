@@ -15,6 +15,7 @@ import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 
 from station.app import StationApp, _LockedSession
 from station.auth import SessionManager, UserStore, hash_password
@@ -600,6 +601,19 @@ class ScanPageTests(ScanHttpBase):
         self.assertNotIn("insertAdjacentHTML", block)
         self.assertNotIn("document.write", block)
 
+    def test_review_list_is_in_the_panel_and_hidden_by_default(self):
+        html = self.page()
+        self.assertIn('<section id="scan-review" aria-label="Scans waiting for approval" hidden>', html)
+        for control in ("scan-review-none", "scan-review-list"):
+            self.assertIn('id="%s"' % control, html)
+        self.assertLess(html.index('id="scan-panel"'), html.index('id="scan-review"'))
+        self.assertLess(html.index('id="scan-review"'), html.index('id="inspect-controls"'))
+        self.assertIn('"/api/scan/pending"', html)
+        self.assertIn('"/api/scan/review"', html)
+        self.assertIn("reviewAllowed = !!allowed.label_approve;", html)
+        self.assertIn('$("scan-review").hidden = !reviewAllowed;', html)
+        self.assertNotIn("window.prompt", self.scan_block(html))
+
     @staticmethod
     def scan_block(html):
         start = html.index("// ----- Taking data (supervisor and admin)")
@@ -620,6 +634,257 @@ class ScanPageTests(ScanHttpBase):
             proc = subprocess.run(["node", "--check", path], capture_output=True, text=True,
                                   timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+PROPOSED_GOOD = {"verdict": "GOOD", "defects": [], "status": "proposed",
+                 "labelled_by": SUP_USER, "labelled_at": NOW}
+
+
+class ScanReviewSessionTests(unittest.TestCase):
+    """ScanSession.pending_reviews and ScanSession.review on a real store (fake cameras)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = pathlib.Path(self._tmp.name)
+        self.stamp = [NOW]
+        self.store = ScanStore(self.root, site="SITE", line="L1")
+        ids = iter(f"SC-{i}" for i in range(1, 500))
+        self.scan = ScanSession(
+            FakeCams(), self.store, busy=lambda: False, debounce_s=0.0, min_flip_s=0.0,
+            now_utc=lambda: self.stamp[0], scan_id_factory=lambda: next(ids),
+        )
+
+    def take(self, verdict="GOOD", defects=None, toy="toy-1", status="proposed",
+             taken_by=SUP_USER, when=NOW):
+        """One finished scan: TOP step 1, flip, BOTTOM step 1, saved."""
+        self.stamp[0] = when
+        label = {"verdict": verdict, "defects": [] if defects is None else defects,
+                 "status": status, "labelled_by": taken_by, "labelled_at": when}
+        scan_id = self.scan.start("AISI-100", toy, label, taken_by)
+        self.scan.press()
+        self.scan.done_side()
+        self.scan.press()
+        self.scan.done_side()
+        self.scan.finish()
+        self.scan.reset()
+        return scan_id
+
+    def folder(self, scan_id):
+        return next(d for d in list_scans(self.root) if d.name == scan_id)
+
+    def test_pending_lists_only_proposed_scans_newest_first(self):
+        older = self.take(when="2026-10-27T08:00:00Z")
+        newer = self.take("BAD", ["doh_small"], toy="toy-2", when="2026-10-27T09:00:00Z")
+        self.take(status="official", taken_by=ADM_USER, when="2026-10-27T09:30:00Z")
+        rejected = self.take(when="2026-10-27T09:45:00Z")
+        self.scan.review(rejected, "reject", ADM_USER, "photo blurred")
+        rows = self.scan.pending_reviews()
+        self.assertEqual([r["scan_id"] for r in rows], [newer, older])
+        row = rows[0]
+        self.assertEqual(set(row), {"scan_id", "part_number", "toy_id", "verdict", "defects",
+                                    "labelled_by", "labelled_at", "steps"})
+        self.assertEqual(row["verdict"], "BAD")
+        self.assertEqual(row["defects"], ["doh_small"])
+        self.assertEqual(row["labelled_by"], SUP_USER)
+        self.assertEqual(row["labelled_at"], "2026-10-27T09:00:00Z")
+        self.assertEqual(row["steps"], {"TOP": 1, "BOTTOM": 1})
+        self.assertEqual(row["part_number"], "AISI-100")
+
+    def test_pending_is_capped(self):
+        with mock.patch("station.scan.PENDING_REVIEW_CAP", 2):
+            scans = [self.take(when=f"2026-10-27T0{h}:00:00Z") for h in (7, 8, 9)]
+            rows = self.scan.pending_reviews()
+        self.assertEqual([r["scan_id"] for r in rows], [scans[2], scans[1]])
+
+    def test_a_damaged_scan_is_not_listed_and_not_reviewed(self):
+        damaged = self.take(when="2026-10-27T08:00:00Z")
+        intact = self.take(toy="toy-2", when="2026-10-27T09:00:00Z")
+        picture = next(p for p in self.folder(damaged).iterdir() if p.suffix == ".png")
+        picture.write_bytes(b"changed after the save")
+        self.assertEqual([r["scan_id"] for r in self.scan.pending_reviews()], [intact])
+        with self.assertRaises(ValueError) as ctx:
+            self.scan.review(damaged, "approve", ADM_USER)
+        self.assertIn("damaged", str(ctx.exception))
+        self.assertEqual(load_scan(self.folder(damaged))["label"]["status"], "proposed")
+
+    def test_approve_makes_the_label_official_and_the_scan_verifies(self):
+        scan_id = self.take(when="2026-10-27T08:00:00Z")
+        self.stamp[0] = "2026-10-27T10:00:00Z"
+        label = self.scan.review(scan_id, "approve", ADM_USER)
+        self.assertEqual(label["status"], "official")
+        self.assertEqual(label["approved_by"], ADM_USER)
+        self.assertEqual(label["approved_at"], "2026-10-27T10:00:00Z")
+        self.assertEqual(label["labelled_by"], SUP_USER)
+        self.assertEqual(verify_scan(self.folder(scan_id)), [])
+        self.assertEqual(self.scan.pending_reviews(), [])
+
+    def test_reject_needs_a_reason_and_records_the_reviewer(self):
+        scan_id = self.take()
+        with self.assertRaises(ValueError):
+            self.scan.review(scan_id, "reject", ADM_USER)
+        with self.assertRaises(ValueError):
+            self.scan.review(scan_id, "reject", ADM_USER, "   ")
+        label = self.scan.review(scan_id, "reject", ADM_USER, "photo blurred")
+        self.assertEqual(label["status"], "rejected")
+        self.assertEqual(label["reject_reason"], "photo blurred")
+        self.assertEqual(label["approved_by"], ADM_USER)
+        self.assertEqual(verify_scan(self.folder(scan_id)), [])
+        self.assertEqual(self.scan.pending_reviews(), [])
+
+    def test_bad_scan_ids_and_reviewers_are_refused(self):
+        scan_id = self.take()
+        bad_ids = ["../x", "a/b", "..\\x", "", "SC-404", "x\x00y", str(self.folder(scan_id)), None]
+        for bad in bad_ids:
+            with self.subTest(scan_id=bad):
+                with self.assertRaises(ValueError):
+                    self.scan.review(bad, "approve", ADM_USER)
+        with self.assertRaises(ValueError):
+            self.scan.review(scan_id, "approve", "")
+        self.assertEqual([r["scan_id"] for r in self.scan.pending_reviews()], [scan_id])
+
+    def test_only_a_proposed_label_can_be_reviewed(self):
+        scan_id = self.take()
+        self.scan.review(scan_id, "approve", ADM_USER)
+        with self.assertRaises(ValueError) as ctx:
+            self.scan.review(scan_id, "approve", ADM_USER)
+        self.assertIn("only a proposed label", str(ctx.exception))
+        official = self.take(status="official", taken_by=ADM_USER, toy="toy-2")
+        with self.assertRaises(ValueError):
+            self.scan.review(official, "reject", ADM_USER, "no")
+
+    def test_other_scans_can_be_reviewed_while_a_scan_runs(self):
+        scan_id = self.take()
+        self.scan.start("AISI-100", "toy-3", dict(PROPOSED_GOOD), SUP_USER)
+        self.assertEqual(self.scan.snapshot()["state"], "SCAN_SIDE")
+        self.scan.review(scan_id, "approve", ADM_USER)
+        self.assertEqual(load_scan(self.folder(scan_id))["label"]["status"], "official")
+
+
+class ScanReviewHttpTests(ScanHttpBase):
+    def take_scan(self, role="sup", verdict="GOOD", defects=None, toy="toy-8"):
+        started = self.ok(role, "/api/scan/start", start_body(verdict, defects, toy=toy))
+        self.ok(role, "/api/scan/press")
+        self.ok(role, "/api/scan/done-side")
+        self.ok(role, "/api/scan/press")
+        self.ok(role, "/api/scan/done-side")
+        self.ok(role, "/api/scan/finish")
+        self.ok(role, "/api/scan/reset")
+        return started["scan_id"]
+
+    def pending_rows(self, role="adm"):
+        reply = self.get(role, "/api/scan/pending")
+        self.assertEqual(reply.status, 200, reply.body)
+        return json.loads(reply.body.decode("utf-8"))["pending"]
+
+    def test_both_routes_need_a_login_then_the_label_approve_action(self):
+        self.assertEqual(self.call("GET", "/api/scan/pending").status, 401)
+        self.assertEqual(self.call("POST", "/api/scan/review", body={}).status, 401)
+        for role in ("op", "sup"):
+            self.assertEqual(self.get(role, "/api/scan/pending").status, 403, role)
+            reply = self.post(role, "/api/scan/review",
+                              {"scan_id": "SC-1", "decision": "approve"})
+            self.assertEqual(reply.status, 403, role)
+            self.assertNotIn(b"Traceback", reply.body)
+        self.assertNotIn("label_approve", json.loads(self.get("sup", "/api/state").body)["auth"]["actions"])
+        self.assertIn("label_approve", json.loads(self.get("adm", "/api/state").body)["auth"]["actions"])
+
+    def test_supervisor_scan_is_listed_for_the_admin_without_pictures_or_paths(self):
+        scan_id = self.take_scan("sup", toy="toy-8")
+        reply = self.get("adm", "/api/scan/pending")
+        rows = json.loads(reply.body.decode("utf-8"))["pending"]
+        self.assertEqual([r["scan_id"] for r in rows], [scan_id])
+        row = rows[0]
+        self.assertEqual(row["toy_id"], "toy-8")
+        self.assertEqual(row["verdict"], "GOOD")
+        self.assertEqual(row["defects"], [])
+        self.assertEqual(row["labelled_by"], SUP_USER)
+        self.assertEqual(row["steps"], {"TOP": 1, "BOTTOM": 1})
+        self.assertNotIn("images", row)
+        self.assertNotIn(str(self.root), reply.body.decode("utf-8"))
+
+    def test_admin_approves_and_the_scan_verifies(self):
+        scan_id = self.take_scan("sup")
+        reply = self.post("adm", "/api/scan/review", {"scan_id": scan_id, "decision": "approve"})
+        self.assertEqual(reply.status, 200, reply.body)
+        body = json.loads(reply.body.decode("utf-8"))
+        self.assertEqual(body["label"]["status"], "official")
+        self.assertEqual(body["label"]["approved_by"], ADM_USER)
+        self.assertEqual(body["pending"], [])
+        folder = self.saved_scans()[0]
+        doc = self.scan_doc(folder)
+        self.assertEqual(doc["label"]["status"], "official")
+        self.assertEqual(doc["label"]["approved_by"], ADM_USER)
+        self.assertEqual(doc["label"]["labelled_by"], SUP_USER)
+        self.assertEqual(verify_scan(folder), [])
+
+    def test_reviewer_name_comes_from_the_login(self):
+        scan_id = self.take_scan("sup")
+        reply = self.post("adm", "/api/scan/review", {
+            "scan_id": scan_id, "decision": "approve", "by": "someone-else",
+            "approved_by": "someone-else", "label": {"status": "rejected"},
+        })
+        self.assertEqual(reply.status, 200, reply.body)
+        self.assertEqual(self.scan_doc(self.saved_scans()[0])["label"]["approved_by"], ADM_USER)
+
+    def test_reject_needs_a_reason_and_is_recorded(self):
+        scan_id = self.take_scan("sup")
+        for body in ({"scan_id": scan_id, "decision": "reject"},
+                     {"scan_id": scan_id, "decision": "reject", "reason": "   "},
+                     {"scan_id": scan_id, "decision": "reject", "reason": "x" * 201}):
+            with self.subTest(body=body):
+                reply = self.post("adm", "/api/scan/review", body)
+                self.assertEqual(reply.status, 400, reply.body)
+        reply = self.post("adm", "/api/scan/review", {
+            "scan_id": scan_id, "decision": "reject", "reason": "  photo blurred  "})
+        self.assertEqual(reply.status, 200, reply.body)
+        body = json.loads(reply.body.decode("utf-8"))
+        self.assertEqual(body["label"]["status"], "rejected")
+        self.assertEqual(body["label"]["reject_reason"], "photo blurred")
+        self.assertEqual(body["label"]["approved_by"], ADM_USER)
+        self.assertEqual(body["pending"], [])
+        self.assertEqual(verify_scan(self.saved_scans()[0]), [])
+
+    def test_bad_requests_are_400_with_a_message(self):
+        scan_id = self.take_scan("sup")
+        cases = [
+            ({}, "scan_id is required"),
+            ({"scan_id": "", "decision": "approve"}, "scan_id is required"),
+            ({"scan_id": 7, "decision": "approve"}, "scan_id is required"),
+            ({"scan_id": scan_id}, "decision must be approve or reject"),
+            ({"scan_id": scan_id, "decision": "maybe"}, "decision must be approve or reject"),
+            ({"scan_id": scan_id, "decision": "approve", "reason": "why"},
+             "reason is only for a rejection"),
+            ({"scan_id": "SC-404", "decision": "approve"}, "no finished scan"),
+            ({"scan_id": "../x", "decision": "approve"}, "scan_id must be a scan folder name"),
+        ]
+        for body, text in cases:
+            with self.subTest(body=body):
+                reply = self.post("adm", "/api/scan/review", body)
+                self.assertEqual(reply.status, 400, reply.body)
+                self.assertIn(text, json.loads(reply.body.decode("utf-8"))["error"])
+        self.assertEqual([r["scan_id"] for r in self.pending_rows()], [scan_id])
+        self.post("adm", "/api/scan/review", {"scan_id": scan_id, "decision": "approve"})
+        reply = self.post("adm", "/api/scan/review", {"scan_id": scan_id, "decision": "approve"})
+        self.assertEqual(reply.status, 400)
+        self.assertIn("only a proposed label", json.loads(reply.body.decode("utf-8"))["error"])
+
+    def test_disabled_scan_is_404_after_the_login_and_label_check(self):
+        self.start_server(self.inspect, None)
+        self.assertEqual(self.get("adm", "/api/scan/pending").status, 404)
+        reply = self.post("adm", "/api/scan/review", {"scan_id": "SC-1", "decision": "approve"})
+        self.assertEqual(reply.status, 404)
+        self.assertIn("not enabled", json.loads(reply.body.decode("utf-8"))["error"])
+        self.assertEqual(self.get("sup", "/api/scan/pending").status, 403)
+
+    def test_review_works_while_a_scan_is_running(self):
+        scan_id = self.take_scan("sup")
+        self.ok("sup", "/api/scan/start", start_body(toy="toy-9"))
+        self.assertEqual(self.state()["state"], "SCAN_SIDE")
+        reply = self.post("adm", "/api/scan/review", {"scan_id": scan_id, "decision": "approve"})
+        self.assertEqual(reply.status, 200, reply.body)
+        self.assertEqual(self.pending_rows(), [])
+        self.assertEqual(self.state()["state"], "SCAN_SIDE")
 
 
 if __name__ == "__main__":

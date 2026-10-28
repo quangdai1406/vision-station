@@ -716,6 +716,14 @@ class _LockedScan:
         with self._lock:
             return self._scan.step_picture(camera_id)
 
+    def pending_reviews(self) -> list:
+        with self._lock:
+            return self._scan.pending_reviews()
+
+    def review(self, scan_id: str, decision: str, by: str, reason: Optional[str] = None) -> dict:
+        with self._lock:
+            return self._scan.review(scan_id, decision, by, reason)
+
 
 # --------------------------------------------------------------- the app
 
