@@ -5,6 +5,13 @@ laptop trainer can read. It checks every part against its `manifest.sha256` befo
 incomplete, corrupt or purged parts (and reports them), and is incremental. It is read-only at the
 source, never deletes anything, and uses plain file copy only. It has no network code.
 
+**Scans are exported too** (Taking data mode, `scans/` next to `store/`). Each scan folder is checked
+with `station.scanstore.verify_scan` and only ok scans are copied, to `DEST/scans/{line}/{YYYY}/{MM}/{DD}/{scan_id}/`.
+`scan.json` is copied with the pictures. Hidden `.{scan_id}.partial` folders are reported as incomplete
+and never copied. The report has a `scans` section; the parts counts are unchanged. The SharePoint
+transfer is postponed (plan decision D-C): for now the destination is any folder (SMB mount, USB or
+staging).
+
 Status: built and tested with fake evidence built by the real storage code. **Not yet run on the
 Pi or against a real SMB share.** The steps below are the plan; run them by hand.
 
@@ -24,12 +31,13 @@ python3 -m tools.export_evidence --source /home/pi/vision-station/data --dest /m
 python3 -m tools.export_evidence --source /home/pi/vision-station/data --dest /mnt/evidence_share --since 2026-10-20
 ```
 
-`--source` is the folder that holds `store/` (or `store/` itself). Use the evidence root from your
-station config. `--dest` is the destination folder. It becomes `DEST/store/...` with the same layout,
-plus `DEST/export_report.json`.
+`--source` is the folder that holds `store/` and/or `scans/` (or `store/` or `scans/` itself). Use the
+evidence root from your station config. `--dest` is the destination folder. Parts become
+`DEST/store/...` and scans become `DEST/scans/...`, both with the same layout, plus
+`DEST/export_report.json`.
 
-Exit codes: `0` nothing corrupt or failed, `1` a part is corrupt or failed (read the printed lines),
-`2` bad arguments or unusable source or destination.
+Exit codes: `0` nothing corrupt or failed, `1` a part or a scan is corrupt or failed (read the printed
+lines), `2` bad arguments or unusable source or destination.
 
 Rerun the same command any time. Parts already at the destination with an identical manifest are
 skipped. A destination manifest that differs from the source is never overwritten; that part is
@@ -95,10 +103,11 @@ weekly runbook, section 2 step 6).
 ## 4. Report
 
 `export_report.json` (in the destination root) holds: `schema`, `generated_utc`, `dry_run`,
-`source`, `dest`, `since`, `counts` (found, copied, already_present, incomplete, corrupt, purged,
-failed, skipped, out_of_range, temp_ignored) and `problems` (one entry per part that was not
-copied, with its reasons). It contains no passwords or tokens and no image data. Keep it with the
-evidence for the record.
+`source`, `scans_source`, `dest`, `since`, `counts` (found, copied, already_present, incomplete,
+corrupt, purged, failed, skipped, out_of_range, temp_ignored) and `problems` (one entry per part that
+was not copied, with its reasons). Scans are in `scans`: `{"counts": {...same keys...}, "problems": [...]}`,
+one entry per scan not copied, keyed `scan`. It contains no passwords or tokens and no image data. Keep
+it with the evidence for the record.
 
 ## 5. Limits
 
@@ -106,4 +115,7 @@ evidence for the record.
   run hashes each file as it copies it, so the copy itself is verified.
 - Parts that are still being written are not published yet (the station renames the finished part
   into place), so they are not picked up.
-- `--since` is by the date folder (UTC day) in the store path.
+- `--since` is by the date folder (UTC day) in the store path, and in the scans path for scans.
+- A scan that is copied while the station is still writing another scan is safe: a scan is published
+  only when its folder is renamed into place. A scan that was never finished stays hidden and is only reported.
+- Scan folders have no purge tool yet; `purged.json` is handled the same way as for parts if one is ever added.
