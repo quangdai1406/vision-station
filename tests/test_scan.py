@@ -572,6 +572,59 @@ class TestSnapshot(ScanSessionTestCase):
         self.assertEqual(snap["marks"]["visible"], 1)
 
 
+class TestStepPicture(ScanSessionTestCase):
+    """step_picture(): the picture of the most recent saved step, for the UI thumbnails."""
+
+    def test_none_before_any_step_and_for_unknown_camera(self):
+        self.assertIsNone(self.s.step_picture("C1"))
+        self.h.start()
+        self.assertIsNone(self.s.step_picture("C1"))
+        self.take(1)
+        self.assertIsNone(self.s.step_picture("C9"))
+
+    def test_returns_latest_step_bytes_and_ext_per_camera(self):
+        self.h.start()
+        first = [Frame(camera_id=c, side=Side.TOP, seq=i, timestamp_utc=NOW,
+                       data=f"one-{c}".encode(), ext="jpg") for i, c in enumerate(CAMS)]
+        second = [Frame(camera_id=c, side=Side.TOP, seq=i, timestamp_utc=NOW,
+                        data=f"two-{c}".encode(), ext="png") for i, c in enumerate(CAMS)]
+        self.h.cameras.script = [first, second]
+        self.take(1)
+        self.assertEqual(self.s.step_picture("C2"), (b"one-C2", "jpg"))
+        self.take(1)
+        self.assertEqual(self.s.step_picture("C2"), (b"two-C2", "png"))
+        self.assertEqual(self.s.step_picture("C4"), (b"two-C4", "png"))
+
+    def test_kept_through_done_side_and_flip_wait_then_none_after_finish(self):
+        self.h.start()
+        self.take(1)
+        self.s.done_side()
+        self.assertIsNotNone(self.s.step_picture("C1"))
+        self.h.flip()
+        self.take(1)
+        self.s.done_side()
+        self.assertIsNotNone(self.s.step_picture("C1"))
+        self.s.finish()
+        self.assertIsNone(self.s.step_picture("C1"))
+
+    def test_none_after_cancel_and_after_a_camera_fault(self):
+        self.h.start()
+        self.take(1)
+        self.s.cancel()
+        self.assertIsNone(self.s.step_picture("C1"))
+        self.h.start()
+        self.h.cameras.script = [CameraError("C3 lost the image")]
+        self.assertTrue(self.h.press(1.0))  # a camera fault is still a processed press
+        self.assertEqual(self.s.snapshot()["state"], "FAULT")
+        self.assertIsNone(self.s.step_picture("C1"))
+
+    def test_memory_holds_only_the_last_step(self):
+        self.h.start()
+        self.take(3)
+        self.assertEqual(set(self.s._last_pictures), set(CAMS))
+        self.assertEqual(len(self.s._last_pictures), len(CAMS))
+
+
 class TestNoOutputs(unittest.TestCase):
     def test_session_has_no_outputs_parameter(self):
         self.assertNotIn("outputs", inspect.signature(ScanSession).parameters)

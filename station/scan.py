@@ -312,6 +312,17 @@ class ScanSession:
             self._fault_return = None
             self._state = ScanState.SCAN_SIDE
 
+    def step_picture(self, camera_id: str) -> Optional[tuple[bytes, str]]:
+        """(bytes, ext) of this camera's picture from the most recent saved step, or None.
+
+        Only the last step is kept (4 frames at most). None when no step has been
+        taken in this scan yet, after a fault, after cancel, or once the scan is saved.
+        """
+        with self._lock:
+            if self._state not in (ScanState.SCAN_SIDE, ScanState.WAIT_FLIP, ScanState.SAVING):
+                return None
+            return self._last_pictures.get(camera_id)
+
     def snapshot(self) -> dict[str, Any]:
         """State for the UI. No pictures. Keys are listed in the module tests."""
         with self._lock:
@@ -376,6 +387,7 @@ class ScanSession:
             return False
         for cam in self._camera_ids:
             self._visible[(cam, side, step)] = bool(defect_visible)
+        self._last_pictures = pictures
         self._counts[side] = step
         return True
 
@@ -488,3 +500,4 @@ class ScanSession:
         self._fault_return = None
         self._flip_started = None
         self._saved_path = None
+        self._last_pictures: dict[str, tuple[bytes, str]] = {}

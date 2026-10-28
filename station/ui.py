@@ -14,16 +14,30 @@ import re
 import sys
 import traceback
 import urllib.parse
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
 from station.auth import ACTIONS, SessionManager, UserStore, role_allows
-from station.contracts import InvalidTransition, Verdict
+from station.contracts import InvalidTransition, StationError, Verdict
+from station.scan import ScanError
+from station.scanstore import _component as _scan_name_check
 
 SESSION_COOKIE = "station_session"
 MAX_BODY_BYTES = 64 * 1024
 MAX_REASON_CHARS = 500
 PREVIEW_CAMERA_RE = re.compile(r"C[1-4]")
+# Taking data (plan section 8, step 4). Input bounds only; no quality limit is set here.
+MAX_SCAN_TOY_CHARS = 64  # same as the scan store's name limit
+MAX_SCAN_DEFECT_CHARS = 64
+MAX_SCAN_DEFECTS = 32
+SCAN_ACTIVE_STATES = ("SCAN_SIDE", "WAIT_FLIP", "SAVING", "FAULT")
+SCAN_SIDES = ("TOP", "BOTTOM")
+# Snapshot keys the browser may see. saved_path is left out: it is a path on the station.
+_SCAN_VIEW_KEYS = ("state", "side", "step", "counts", "sides", "scan_id", "part_number", "toy_id",
+                   "label_verdict", "defects", "marks", "camera_names", "fault", "press_ready",
+                   "flip_wait_s", "prompt")
+_SCAN_IMAGE_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}
 PART_SEARCH_MAX_CHARS = 100
 PART_SEARCH_LIMIT_DEFAULT = 20
 PART_SEARCH_LIMIT_MAX = 50
@@ -47,6 +61,18 @@ _ACTION_PATHS = {
     "/api/override": "override",
     "/api/clear-fault": "clear_fault",
     "/api/label": "label_propose",
+}
+
+# Taking data POST routes: the part after /api/scan/ -> _Handler method name.
+_SCAN_POST = {
+    "start": "_scan_start",
+    "press": "_scan_press",
+    "done-side": "_scan_done_side",
+    "mark": "_scan_mark",
+    "finish": "_scan_finish",
+    "cancel": "_scan_cancel",
+    "clear-fault": "_scan_clear_fault",
+    "reset": "_scan_reset",
 }
 
 _CSP = (
@@ -131,6 +157,71 @@ def _parse_part_id(data: dict) -> Optional[str]:
     return raw.strip()
 
 
+def _scan_toy_id(raw: Any) -> str:
+    """toy_id: 1 to 64 printable characters, usable as one path component (store rule)."""
+    if not isinstance(raw, str):
+        raise _HttpError(400, "toy_id is required")
+    text = raw.strip()
+    if not 1 <= len(text) <= MAX_SCAN_TOY_CHARS:
+        raise _HttpError(400, f"toy_id must be 1 to {MAX_SCAN_TOY_CHARS} characters")
+    if not text.isprintable():
+        raise _HttpError(400, "toy_id must not contain control characters")
+    try:
+        _scan_name_check(text, "toy_id")
+    except ValueError:
+        raise _HttpError(400, "toy_id must not contain / or \\ and must not start with a dot") from None
+    return text
+
+
+def _scan_part_number(raw: Any) -> Optional[str]:
+    """part_number, or None when empty (the station's current part is used then)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or len(raw) > MAX_PART_NUMBER_CHARS:
+        raise _HttpError(400, f"part_number must be a string up to {MAX_PART_NUMBER_CHARS} characters")
+    text = raw.strip()
+    if not text:
+        return None
+    if not text.isprintable():
+        raise _HttpError(400, "part_number must not contain control characters")
+    return text
+
+
+def _parse_scan_defects(raw: Any) -> list:
+    """Defect names as the operator typed them (no list of allowed names is enforced here)."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or len(raw) > MAX_SCAN_DEFECTS:
+        raise _HttpError(400, f"defects must be a list of up to {MAX_SCAN_DEFECTS} names")
+    out = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise _HttpError(400, "defect names must be text")
+        name = item.strip()
+        if not 1 <= len(name) <= MAX_SCAN_DEFECT_CHARS:
+            raise _HttpError(400, f"each defect name must be 1 to {MAX_SCAN_DEFECT_CHARS} characters")
+        out.append(name)
+    return out
+
+
+def _parse_scan_sides(raw: Any) -> list:
+    if not isinstance(raw, list) or not 1 <= len(raw) <= len(SCAN_SIDES) or any(
+            s not in SCAN_SIDES for s in raw):
+        raise _HttpError(400, "sides must be a list of TOP and/or BOTTOM")
+    return list(raw)
+
+
+def _scan_view(snap: Any) -> dict:
+    """The part of a scan snapshot the browser may see."""
+    if not isinstance(snap, dict):
+        raise RuntimeError("scan snapshot must be a dict")
+    return {key: snap[key] for key in _SCAN_VIEW_KEYS if key in snap}
+
+
+def _utc_now_text() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _pick(row: dict, keys: tuple) -> dict:
     """Copy only the listed keys that the row has."""
     return {key: row[key] for key in keys if key in row}
@@ -154,6 +245,8 @@ class _Handler(BaseHTTPRequestHandler):
     station: Any = None
     users: UserStore | None = None
     sessions: SessionManager | None = None
+    # Taking data: None when disabled. Duck-typed like the session (see make_server).
+    scan: Any = None
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         """No access log: nothing from a request (credentials included) is printed."""
@@ -196,6 +289,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._label_last()
         if path == "/api/label/pending":
             return self._label_pending()
+        if path == "/api/scan/state":
+            return self._scan_state()
+        if path == "/api/scan/step-picture":
+            return self._scan_step_picture(urllib.parse.parse_qs(query))
         raise _HttpError(404, "not found")
 
     def _post(self) -> None:
@@ -208,6 +305,11 @@ class _Handler(BaseHTTPRequestHandler):
             return self._part_select()
         if path in ("/api/label/approve", "/api/label/reject"):
             return self._label_review(path.rsplit("/", 1)[1])
+        if path.startswith("/api/scan/"):
+            handler = _SCAN_POST.get(path[len("/api/scan/"):])
+            if handler is None:
+                raise _HttpError(404, "not found")
+            return getattr(self, handler)()
         action = _ACTION_PATHS.get(path)
         if action is None:
             raise _HttpError(404, "not found")
@@ -223,11 +325,15 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(snap, dict):
             raise RuntimeError("snapshot() must return a dict")
         body = dict(snap)
+        # "scan" is listed only when Taking data is enabled on this station and the role may use it.
         body["auth"] = {
             "username": username,
             "role": role,
-            "actions": [a for a in ACTIONS if role_allows(role, a)],
+            "actions": [a for a in ACTIONS if role_allows(role, a)
+                        and (a != "scan" or self.scan is not None)],
         }
+        # Everyone may see that a scan holds the cameras (no scan details, no names).
+        body["scan_active"] = self._scan_is_active()
         self._send_json(200, body)
 
     def _preview(self, query: dict) -> None:
@@ -360,6 +466,149 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"pending": [_pick(r, _PENDING_LABEL_KEYS) for r in rows
                                           if isinstance(r, dict)]})
 
+    # ----- Taking data -----------------------------------------------------
+    # Every route: login (401), then the 'scan' role (403), then the feature (404 when
+    # scan is disabled). Scan refusals (busy, wrong state, bad input) are 400, or 409 for
+    # an InvalidTransition. Pictures are only ever sent by /api/scan/step-picture.
+
+    def _scan_gate(self) -> tuple[str, str]:
+        _, username, role = self._require("scan")
+        if self.scan is None:
+            raise _HttpError(404, "taking data is not enabled on this station")
+        return username, role
+
+    def _scan_is_active(self) -> bool:
+        scan = self.scan
+        if scan is None:
+            return False
+        return scan.snapshot()["state"] in SCAN_ACTIVE_STATES
+
+    def _scan_call(self, fn, *args, **kwargs):
+        """Run one scan action. Refusals become 400 with the station's own message."""
+        try:
+            return fn(*args, **kwargs)
+        except InvalidTransition:
+            raise
+        except (ScanError, StationError, ValueError) as exc:
+            raise _HttpError(400, str(exc) or "scan action refused") from None
+
+    def _scan_reply(self, extra: Optional[dict] = None) -> None:
+        body = {"scan": _scan_view(self._scan_call(self.scan.snapshot))}
+        if extra:
+            body.update(extra)
+        self._send_json(200, body)
+
+    def _scan_state(self) -> None:
+        self._scan_gate()
+        self._scan_reply({"may_scan": True})
+
+    def _scan_start(self) -> None:
+        username, role = self._scan_gate()
+        data = self._read_json()
+        toy_id = _scan_toy_id(data.get("toy_id"))
+        part_number = _scan_part_number(data.get("part_number"))
+        if part_number is None:
+            part_number = self._default_part_number()
+        label_in = data.get("label")
+        if not isinstance(label_in, dict):
+            raise _HttpError(400, "label must be an object with verdict and defects")
+        verdict = _parse_verdict(label_in).value
+        defects = _parse_scan_defects(label_in.get("defects"))
+        # Only the verdict and defects come from the client. The label status and the
+        # labeller are set here, from the login: a supervisor's label is proposed, an admin's official.
+        label = {
+            "verdict": verdict,
+            "defects": defects,
+            "status": "official" if role == "admin" else "proposed",
+            "labelled_by": username,
+            "labelled_at": _utc_now_text(),
+        }
+        kwargs: dict[str, Any] = {}
+        if data.get("sides") is not None:
+            kwargs["sides"] = _parse_scan_sides(data.get("sides"))
+        scan_id = self._scan_call(self.scan.start, part_number, toy_id, label, username, **kwargs)
+        self._scan_reply({"scan_id": scan_id})
+
+    def _default_part_number(self) -> str:
+        """The station's current part, used when the form leaves part_number empty."""
+        try:
+            current = _call_parts(self.station.current_part)
+        except StationError:
+            current = None
+        pn = current.get("part_number") if isinstance(current, dict) else None
+        if not isinstance(pn, str) or not pn.strip():
+            raise _HttpError(400, "part_number is required: the station has no current part")
+        return pn.strip()
+
+    def _scan_press(self) -> None:
+        self._scan_gate()
+        self._read_json()
+        accepted = self._scan_call(self.scan.press)
+        self._scan_reply({"accepted": bool(accepted)})
+
+    def _scan_done_side(self) -> None:
+        self._scan_gate()
+        self._read_json()
+        self._scan_call(self.scan.done_side)
+        self._scan_reply()
+
+    def _scan_mark(self) -> None:
+        self._scan_gate()
+        data = self._read_json()
+        camera = data.get("camera_id")
+        if not isinstance(camera, str) or not PREVIEW_CAMERA_RE.fullmatch(camera):
+            raise _HttpError(400, "camera_id must be C1, C2, C3 or C4")
+        side = data.get("side")
+        if side not in SCAN_SIDES:
+            raise _HttpError(400, "side must be TOP or BOTTOM")
+        step = data.get("step")
+        if not isinstance(step, int) or isinstance(step, bool) or step < 1:
+            raise _HttpError(400, "step must be a whole number of at least 1")
+        visible = data.get("visible")
+        if not isinstance(visible, bool):
+            raise _HttpError(400, "visible must be true or false")
+        self._scan_call(self.scan.mark, camera, side, step, visible)
+        self._scan_reply()
+
+    def _scan_finish(self) -> None:
+        self._scan_gate()
+        self._read_json()
+        self._scan_call(self.scan.finish)  # the folder path stays on the station
+        self._scan_reply({"saved": True})
+
+    def _scan_cancel(self) -> None:
+        self._scan_gate()
+        self._read_json()
+        self._scan_call(self.scan.cancel)
+        self._scan_reply()
+
+    def _scan_clear_fault(self) -> None:
+        self._scan_gate()
+        self._read_json()
+        self._scan_call(self.scan.clear_fault)
+        self._scan_reply()
+
+    def _scan_reset(self) -> None:
+        self._scan_gate()
+        self._read_json()
+        self._scan_call(self.scan.reset)
+        self._scan_reply()
+
+    def _scan_step_picture(self, query: dict) -> None:
+        """The picture of the camera for the last saved step. 204 when there is none."""
+        self._scan_gate()
+        camera = query.get("camera", [""])[-1]
+        if not PREVIEW_CAMERA_RE.fullmatch(camera):
+            raise _HttpError(400, "camera must be C1, C2, C3 or C4")
+        got = self._scan_call(self.scan.step_picture, camera)
+        if not got:
+            return self._send_empty(204)
+        data, ext = got
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            return self._send_empty(204)
+        ctype = _SCAN_IMAGE_TYPES.get(str(ext).lower(), "application/octet-stream")
+        return self._send(200, bytes(data), ctype)
+
     # ----- helpers -------------------------------------------------------
 
     def _cookie_token(self):
@@ -432,7 +681,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def make_server(session, users: UserStore, sessions: SessionManager,
-                host: str = "127.0.0.1", port: int = 0) -> ThreadingHTTPServer:
+                host: str = "127.0.0.1", port: int = 0, scan=None) -> ThreadingHTTPServer:
     """Build (but do not start) the UI server.
 
     `session` must provide: snapshot(include_images=False) -> dict, press() -> bool,
@@ -444,11 +693,18 @@ def make_server(session, users: UserStore, sessions: SessionManager,
     search_parts(q, limit) -> list[dict], select_part(part_number, by) -> dict,
     current_part() -> dict. A PartsError (matched by class name) maps to 502.
     InvalidTransition -> 409, ValueError -> 400.
+
+    `scan` (optional, Taking data): None when disabled, else a ScanSession or a wrapper
+    with start, press, done_side, mark, finish, cancel, clear_fault, reset,
+    step_picture(camera_id) -> (bytes, ext) | None and snapshot() -> dict. Disabled means
+    the scan routes answer 404 (after the login and role checks) and the 'scan' action is
+    not listed for anyone.
     """
     handler = type("StationHandler", (_Handler,), {
         "station": session,
         "users": users,
         "sessions": sessions,
+        "scan": scan,
     })
     return ThreadingHTTPServer((host, port), handler)
 
@@ -536,6 +792,16 @@ label { display: block; font-size: 14px; color: var(--muted); }
 .part-pn { font-weight: 700; margin-right: 8px; }
 .part-desc { display: block; font-size: 14px; color: var(--muted); font-weight: 400; }
 .cam-status { color: var(--bad); font-weight: 600; margin: 0 0 8px; }
+.scan-busy { font-weight: 600; border-color: var(--review); }
+.scan-fields { border: 0; padding: 0; margin: 4px 0 12px; }
+.scan-fields legend { font-size: 14px; color: var(--muted); padding: 0; }
+label.inline { display: inline-block; color: var(--fg); font-size: 16px; margin: 0 16px 8px 0; }
+input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin: 0 6px 0 0; }
+.scan-buttons button:disabled { opacity: 0.4; }
+.scan-pic { margin: 0; min-width: 0; }
+.scan-pic img { width: 100%; height: auto; min-height: 120px; display: block; background: #000;
+  border-radius: 6px; }
+.scan-pic figcaption { font-size: 13px; color: var(--muted); margin: 4px 0; }
 </style>
 </head>
 <body>
@@ -543,6 +809,7 @@ label { display: block; font-size: 14px; color: var(--muted); }
   <h1>Vision Station</h1>
   <div>
     <span id="who" class="muted"></span>
+    <button id="scan-open" class="secondary" hidden>Taking data</button>
     <button id="logout" class="secondary" hidden>Log out</button>
   </div>
 </header>
@@ -576,6 +843,48 @@ label { display: block; font-size: 14px; color: var(--muted); }
       <p class="muted hint">Live view (not saved)</p>
     </section>
     <div id="tiles" class="card"></div>
+    <p id="scan-busy" class="card scan-busy" role="status" hidden></p>
+    <section id="scan-panel" class="card" aria-label="Taking data" hidden>
+      <h2>Taking data</h2>
+      <div id="scan-setup">
+        <form id="scan-start-form" autocomplete="off">
+          <label for="scan-toy">Toy ID</label>
+          <input id="scan-toy" maxlength="64" autocomplete="off">
+          <label for="scan-part">Part number (empty: the station's current part)</label>
+          <input id="scan-part" maxlength="100" autocomplete="off">
+          <fieldset class="scan-fields">
+            <legend>Label</legend>
+            <label class="inline"><input type="radio" name="scan-verdict" value="GOOD" checked> GOOD</label>
+            <label class="inline"><input type="radio" name="scan-verdict" value="BAD"> BAD</label>
+          </fieldset>
+          <div id="scan-defects-box" hidden>
+            <label for="scan-defects">Defect names for BAD (comma-separated)</label>
+            <input id="scan-defects" maxlength="2000" autocomplete="off">
+            <p class="muted hint">Names are kept as typed. Home trial examples: doh_small, doh_large, doh_edge.</p>
+          </div>
+          <button type="submit" id="scan-start">Start scan</button>
+        </form>
+        <p id="scan-start-reason" class="muted hint" hidden></p>
+      </div>
+      <div id="scan-run" hidden>
+        <p id="scan-meta" class="muted"></p>
+        <p id="scan-prompt" class="prompt" role="status"></p>
+        <p id="scan-counts" class="muted"></p>
+        <div class="scan-buttons">
+          <button type="button" id="scan-press">Press (Enter)</button>
+          <button type="button" id="scan-done">Done with this side</button>
+          <button type="button" id="scan-fault" class="secondary" hidden>Clear fault</button>
+          <button type="button" id="scan-finish">Finish</button>
+          <button type="button" id="scan-cancel" class="secondary">Cancel scan</button>
+          <button type="button" id="scan-reset" class="secondary" hidden>Start another scan</button>
+        </div>
+        <p id="scan-marks" class="muted"></p>
+        <p id="scan-pics-note" class="muted hint" hidden>Defect marks apply to the step shown here. Earlier steps keep the marks already given, and cannot be changed from this screen.</p>
+        <div id="scan-pics" class="tiles" hidden></div>
+        <p id="scan-status" class="status" role="status"></p>
+      </div>
+    </section>
+    <div id="inspect-controls">
     <section id="part-panel" class="card" aria-label="Part number" hidden>
       <h2>Part number</h2>
       <p id="part-line" class="part-line" role="status"></p>
@@ -617,6 +926,7 @@ label { display: block; font-size: 14px; color: var(--muted); }
         <input id="reject-reason" maxlength="200" autocomplete="off">
         <ul id="label-pending" class="part-results"></ul>
       </div>
+    </div>
     </div>
   </section>
   <p id="error" class="error" role="alert"></p>
@@ -914,7 +1224,7 @@ label { display: block; font-size: 14px; color: var(--muted); }
 
   function liveWanted() {
     if (el.app.hidden || document.visibilityState !== "visible") { return false; }
-    if (curFault) { return false; }
+    if (curFault || scanActiveNow) { return false; }
     return curState === "IDLE" || curState === "WAIT_FLIP";
   }
 
@@ -984,6 +1294,13 @@ label { display: block; font-size: 14px; color: var(--muted); }
     // A state that differs from the one seen at press time ends the capture lockout.
     pressAllowed = !!allowed.press;
     labelIsAdmin = !!allowed.label_approve;
+    scanAllowed = !!allowed.scan;
+    scanActiveNow = s.scan_active === true;
+    // Part number prefill for the Taking-data form: once, and only until the operator types.
+    if (!scanPartTouched && typeof s.part_number === "string" && s.part_number
+        && !$("scan-part").value) {
+      $("scan-part").value = s.part_number;
+    }
     if (captureLocked && s.state !== lockFromState) { unlockPress(); }
     curState = s.state;
     curFault = !!s.fault;
@@ -1014,6 +1331,8 @@ label { display: block; font-size: 14px; color: var(--muted); }
     var cams = cameraList(s);
     ensureTiles(cams);
     ensureLive(cams);
+    renderScanPanel();
+    if (scanAllowed) { refreshScan(); }
 
     // Proof-of-concept banner: only for a partial station (not the 8-image rule).
     var partial = s.partial_station === true;
@@ -1031,6 +1350,294 @@ label { display: block; font-size: 14px; color: var(--muted); }
     syncLive();
     maybeRefreshLabels(false);
   }
+
+  // ----- Taking data (supervisor and admin) -----------------------------------
+  // The browser sees scan_active (everyone, from /api/state) and, for a role that may
+  // scan, the snapshot from /api/scan/state. A running scan pauses inspection: the
+  // inspection controls step aside and the server refuses inspection presses anyway.
+  // Every scan value is shown with textContent.
+  var SCAN_ACTIVE = { SCAN_SIDE: true, WAIT_FLIP: true, SAVING: true, FAULT: true };
+  var MSG_SCAN_FLIP_WAIT = "Press ignored: wait for the countdown, flip the part, then press Enter.";
+  var MSG_SCAN_REFUSED = "Press was not accepted in the current state.";
+  var scanOpen = false;
+  var scanAllowed = false;
+  var scanActiveNow = false;
+  var scanSnap = null;
+  var scanBusy = false;
+  var scanFetching = false;
+  var scanPicKey = "";
+  var scanPicURLs = [];
+  var scanPartTouched = false;
+
+  function setScanStatus(msg) { $("scan-status").textContent = msg || ""; }
+
+  function scanIsActive() {
+    return scanActiveNow || !!(scanSnap && SCAN_ACTIVE[scanSnap.state] === true);
+  }
+
+  function scanVerdict() {
+    var picked = document.querySelector('input[name="scan-verdict"]:checked');
+    return picked && picked.value === "BAD" ? "BAD" : "GOOD";
+  }
+
+  function scanPressEnabled() {
+    var s = scanSnap;
+    if (!s || scanBusy || inPressLockout()) { return false; }
+    if (s.state !== "SCAN_SIDE" && s.state !== "WAIT_FLIP" && s.state !== "FAULT") { return false; }
+    return s.press_ready === true;
+  }
+
+  function scanDoneEnabled() {
+    var s = scanSnap;
+    if (!s || scanBusy || s.state !== "SCAN_SIDE") { return false; }
+    return ((s.counts && s.counts[s.side]) || 0) >= 1;
+  }
+
+  function clearScanPics() {
+    scanPicURLs.forEach(function (u) { URL.revokeObjectURL(u); });
+    scanPicURLs = [];
+    scanPicKey = "";
+    var box = $("scan-pics");
+    while (box.firstChild) { box.removeChild(box.firstChild); }
+    box.hidden = true;
+    $("scan-pics-note").hidden = true;
+  }
+
+  // Pictures of the last saved step, BAD scans only. The key (scan, side, step count)
+  // decides when they are rebuilt, so a tick on screen survives the 1 s poll.
+  function refreshScanPictures(s) {
+    var side = s.side;
+    var count = side && s.counts ? (s.counts[side] || 0) : 0;
+    var live = s.state === "SCAN_SIDE" || s.state === "WAIT_FLIP" || s.state === "SAVING";
+    if (s.label_verdict !== "BAD" || count < 1 || !live) { clearScanPics(); return; }
+    var key = String(s.scan_id) + "|" + side + "|" + count;
+    if (key === scanPicKey) { return; }
+    clearScanPics();
+    scanPicKey = key;
+    var box = $("scan-pics");
+    box.hidden = false;
+    $("scan-pics-note").hidden = false;
+    var cams = Array.isArray(s.camera_names) ? s.camera_names : [];
+    cams.forEach(function (cam) {
+      if (typeof cam !== "string" || cam.length === 0 || cam.length > 32) { return; }
+      var base = cam + " " + side + " step " + count;
+      var fig = document.createElement("figure");
+      fig.className = "scan-pic";
+      var img = document.createElement("img");
+      img.alt = "Picture " + base;
+      var cap = document.createElement("figcaption");
+      cap.textContent = base + ", loading";
+      var lab = document.createElement("label");
+      lab.className = "inline";
+      var tick = document.createElement("input");
+      tick.type = "checkbox";
+      tick.checked = false;
+      lab.appendChild(tick);
+      lab.appendChild(document.createTextNode("defect visible"));
+      tick.addEventListener("change", function () { markScanPicture(tick, cam, side, count); });
+      fig.appendChild(img);
+      fig.appendChild(cap);
+      fig.appendChild(lab);
+      box.appendChild(fig);
+      loadScanPicture(img, cap, base, cam, key);
+    });
+  }
+
+  function loadScanPicture(img, cap, base, cam, key) {
+    fetch("/api/scan/step-picture?camera=" + encodeURIComponent(cam), {
+      method: "GET", credentials: "same-origin", cache: "no-store"
+    }).then(function (res) {
+      if (res.status === 401) { showLogin(); return null; }
+      if (res.status !== 200) { return null; }
+      return res.blob();
+    }).then(function (blob) {
+      if (key !== scanPicKey) { return; }
+      if (!blob) { cap.textContent = base + ", no picture"; return; }
+      var url = URL.createObjectURL(blob);
+      scanPicURLs.push(url);
+      img.src = url;
+      cap.textContent = base;
+    }).then(null, function () {
+      if (key === scanPicKey) { cap.textContent = base + ", picture failed to load"; }
+    });
+  }
+
+  function markScanPicture(tick, cam, side, step) {
+    var want = tick.checked;
+    tick.disabled = true;
+    request("POST", "/api/scan/mark", { camera_id: cam, side: side, step: step, visible: want }).then(function (d) {
+      tick.disabled = false;
+      if (d && d.scan) { scanSnap = d.scan; renderScanPanel(); }
+    }, function (err) {
+      tick.disabled = false;
+      tick.checked = !want;
+      if (err.status === 401) { showLogin(); return; }
+      setError(err.message);
+    });
+  }
+
+  function renderScanRun(s) {
+    var defects = Array.isArray(s.defects) ? s.defects.filter(function (d) { return typeof d === "string"; }) : [];
+    var meta = "Scan " + String(s.scan_id || "-") + ", toy " + String(s.toy_id || "-")
+      + ", part " + String(s.part_number || "-") + ", label " + String(s.label_verdict || "-");
+    if (s.label_verdict === "BAD" && defects.length) { meta += " (" + defects.join(", ") + ")"; }
+    $("scan-meta").textContent = meta;
+    $("scan-prompt").textContent = typeof s.prompt === "string" ? s.prompt : "";
+    var counts = s.counts || {};
+    $("scan-counts").textContent = (Array.isArray(s.sides) ? s.sides : []).map(function (side) {
+      return side + ": " + (counts[side] || 0) + " step(s)";
+    }).join(". ");
+    var pressWait = s.state === "WAIT_FLIP" && typeof s.flip_wait_s === "number" && s.flip_wait_s > 0;
+    var pressBtn = $("scan-press");
+    pressBtn.textContent = pressWait ? "Wait " + Math.ceil(s.flip_wait_s) + " s" : "Press (Enter)";
+    pressBtn.disabled = !scanPressEnabled();
+    $("scan-done").disabled = !scanDoneEnabled();
+    $("scan-fault").hidden = s.state !== "FAULT";
+    $("scan-fault").disabled = scanBusy;
+    $("scan-finish").disabled = scanBusy || s.state !== "SAVING";
+    $("scan-cancel").hidden = s.state === "DONE";
+    $("scan-cancel").disabled = scanBusy;
+    $("scan-reset").hidden = s.state !== "DONE";
+    $("scan-reset").disabled = scanBusy;
+    var marks = s.marks;
+    $("scan-marks").textContent = marks && s.label_verdict === "BAD"
+      ? "Defect visible so far: " + marks.visible + " of " + marks.pictures + " pictures (all steps)."
+      : "";
+    refreshScanPictures(s);
+  }
+
+  // Shows the panel, the inspection lock and the Start/Press controls from scanSnap.
+  function renderScanPanel() {
+    var s = scanSnap;
+    var active = scanIsActive();
+    $("inspect-controls").hidden = active;
+    $("live").hidden = active;
+    $("scan-busy").hidden = !active;
+    $("scan-busy").textContent = active
+      ? "Taking data is running on this station. Inspection is paused until the scan is saved or cancelled."
+      : "";
+    $("scan-open").hidden = !scanAllowed;
+    $("scan-open").textContent = scanOpen ? "Close Taking data" : "Taking data";
+    var show = scanAllowed && (scanOpen || active || (s !== null && s.state === "DONE"));
+    $("scan-panel").hidden = !show;
+    if (!show) { return; }
+    var runView = s !== null && s.state !== "IDLE";
+    $("scan-setup").hidden = runView;
+    $("scan-run").hidden = !runView;
+    // Start is off while an inspection part is in progress (the server refuses it too).
+    var inspectBusy = curState !== undefined && curState !== "IDLE";
+    $("scan-defects-box").hidden = scanVerdict() !== "BAD";
+    $("scan-start").disabled = scanBusy || inspectBusy || active;
+    var reason = inspectBusy ? "Taking data starts only when the station is idle. Finish the part in progress first." : "";
+    $("scan-start-reason").textContent = reason;
+    $("scan-start-reason").hidden = reason === "";
+    if (runView) {
+      renderScanRun(s);
+    } else {
+      clearScanPics();
+    }
+  }
+
+  function refreshScan() {
+    if (!scanAllowed || scanFetching) { return; }
+    scanFetching = true;
+    var g = gen;
+    request("GET", "/api/scan/state").then(function (d) {
+      scanFetching = false;
+      if (g !== gen) { return; }
+      scanSnap = d && d.scan ? d.scan : null;
+      renderScanPanel();
+    }, function (err) {
+      scanFetching = false;
+      if (g !== gen) { return; }
+      if (err.status === 401) { showLogin(); return; }
+      setError(err.message);
+    });
+  }
+
+  function scanAction(path, body, onDone) {
+    if (scanBusy) { return; }
+    scanBusy = true;
+    setError("");
+    renderScanPanel();
+    request("POST", path, body || {}).then(function (d) {
+      scanBusy = false;
+      if (d && d.scan) { scanSnap = d.scan; }
+      if (onDone) { onDone(d); }
+      renderScanPanel();
+      refreshScan();
+    }, function (err) {
+      scanBusy = false;
+      if (err.status === 401) { showLogin(); return; }
+      setError(err.message);
+      renderScanPanel();
+      refreshScan();
+    });
+  }
+
+  function scanPress() {
+    if (!scanPressEnabled()) { return; }
+    var wasWait = scanSnap !== null && scanSnap.state === "WAIT_FLIP";
+    lastPressAt = Date.now();
+    setScanStatus(MSG_CAPTURING);
+    scanAction("/api/scan/press", {}, function (d) {
+      if (d && d.accepted === false) {
+        setScanStatus(wasWait ? MSG_SCAN_FLIP_WAIT : MSG_SCAN_REFUSED);
+      } else {
+        setScanStatus("");
+      }
+    });
+  }
+
+  $("scan-open").addEventListener("click", function () {
+    scanOpen = !scanOpen;
+    renderScanPanel();
+    if (scanOpen) { refreshScan(); }
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('input[name="scan-verdict"]'), function (r) {
+    r.addEventListener("change", renderScanPanel);
+  });
+  $("scan-part").addEventListener("input", function () { scanPartTouched = true; });
+  $("scan-start-form").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    if (scanBusy) { return; }
+    var toy = $("scan-toy").value.trim();
+    if (!toy) { setError("Enter the toy ID first."); return; }
+    var verdict = scanVerdict();
+    var label = { verdict: verdict, defects: [] };
+    if (verdict === "BAD") {
+      label.defects = $("scan-defects").value.split(",").map(function (x) { return x.trim(); })
+        .filter(function (x) { return x !== ""; });
+      if (!label.defects.length) { setError("A BAD scan needs at least one defect name."); return; }
+    }
+    var body = { toy_id: toy, label: label };
+    var part = $("scan-part").value.trim();
+    if (part) { body.part_number = part; }
+    scanAction("/api/scan/start", body, function () {
+      $("scan-toy").value = "";
+      $("scan-defects").value = "";
+      setScanStatus("Scan started. Press Enter (or the Press button) for step 1.");
+    });
+  });
+  $("scan-press").addEventListener("click", function () { scanPress(); });
+  $("scan-done").addEventListener("click", function () {
+    if (scanDoneEnabled()) { scanAction("/api/scan/done-side", {}, function () { setScanStatus(""); }); }
+  });
+  $("scan-finish").addEventListener("click", function () {
+    scanAction("/api/scan/finish", {}, function () {
+      setScanStatus("Scan saved. Press Start another scan when ready.");
+    });
+  });
+  $("scan-cancel").addEventListener("click", function () {
+    if (!window.confirm("Cancel this scan? Nothing will be saved.")) { return; }
+    scanAction("/api/scan/cancel", {}, function () { setScanStatus("Scan cancelled. Nothing was saved."); });
+  });
+  $("scan-fault").addEventListener("click", function () {
+    scanAction("/api/scan/clear-fault", {}, function () { setScanStatus(""); });
+  });
+  $("scan-reset").addEventListener("click", function () {
+    scanAction("/api/scan/reset", {}, function () { clearScanPics(); setScanStatus(""); });
+  });
 
   // ----- collected-part labels ---------------------------------------------
   // Shown as text only (textContent), so station data cannot inject markup.
@@ -1144,6 +1751,14 @@ label { display: block; font-size: 14px; color: var(--muted); }
     el.login.hidden = false;
     el.logout.hidden = true;
     el.who.textContent = "";
+    scanOpen = false;
+    scanAllowed = false;
+    scanActiveNow = false;
+    scanSnap = null;
+    scanBusy = false;
+    scanFetching = false;
+    clearScanPics();
+    renderScanPanel();
   }
 
   function handleError(g, err) {
@@ -1445,6 +2060,12 @@ label { display: block; font-size: 14px; color: var(--muted); }
     var focus = document.activeElement;
     var tag = focus && focus.tagName ? focus.tagName : "";
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON") { return; }
+    // While a scan runs, Enter takes a scan step and never an inspection press.
+    if (scanIsActive()) {
+      if (inPressLockout()) { setScanStatus(MSG_WAIT_CAPTURE); return; }
+      if (scanPressEnabled()) { scanPress(); }
+      return;
+    }
     if (inPressLockout()) { setPressStatus(MSG_WAIT_CAPTURE); return; }
     if (el.press.disabled) { return; }
     pressPart();

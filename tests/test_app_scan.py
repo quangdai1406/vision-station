@@ -269,6 +269,54 @@ class ScanAppTests(unittest.TestCase):
         self.assertIn("unknown key(s) ['min_flp_s']", str(ctx.exception))
         self.assertFalse((self.data_dir / "scans").exists())
 
+    def _http(self, app, method, path, cookie=None, body=None):
+        import urllib.error
+        import urllib.request
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if cookie:
+            headers["Cookie"] = cookie
+        req = urllib.request.Request(app.url.rstrip("/") + path, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as reply:
+                return reply.status, reply.headers, reply.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.headers, exc.read()
+
+    def test_scan_routes_are_served_by_the_real_app_over_http(self) -> None:
+        # regression: the UI server must get the scan object from the app, and the scan wrapper
+        # must offer step_picture, or the Taking-data screen never works on the real station
+        app, _, _ = self._app({"enabled": True})
+        app.start()
+        status, headers, _ = self._http(app, "POST", "/api/login",
+                                        body={"username": "sup1", "password": "supervisor-pass-1"})
+        self.assertEqual(status, 200)
+        cookie = headers["Set-Cookie"].split(";")[0]
+        status, _, raw = self._http(app, "GET", "/api/scan/state", cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(raw)["may_scan"])
+        status, _, _ = self._http(app, "POST", "/api/scan/start", cookie, {
+            "toy_id": "TOY-1", "part_number": "PN-100",
+            "label": {"verdict": "BAD", "defects": ["doh_small"]}})
+        self.assertEqual(status, 200)
+        status, _, _ = self._http(app, "POST", "/api/scan/press", cookie, {})
+        self.assertEqual(status, 200)
+        status, _, picture = self._http(app, "GET", "/api/scan/step-picture?camera=C1", cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(picture)
+        status, _, _ = self._http(app, "POST", "/api/scan/cancel", cookie, {})
+        self.assertEqual(status, 200)
+
+    def test_scan_routes_are_not_served_when_disabled(self) -> None:
+        app, _, _ = self._app()
+        app.start()
+        status, headers, _ = self._http(app, "POST", "/api/login",
+                                        body={"username": "sup1", "password": "supervisor-pass-1"})
+        self.assertEqual(status, 200)
+        cookie = headers["Set-Cookie"].split(";")[0]
+        status, _, _ = self._http(app, "GET", "/api/scan/state", cookie)
+        self.assertEqual(status, 404)
+
 
 if __name__ == "__main__":
     unittest.main()

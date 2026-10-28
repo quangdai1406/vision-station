@@ -72,6 +72,17 @@ no light is lit green or red, the counters count the part in total only, and
 nothing is queued for the MES. The per-image `score` in `part.json` is a
 placeholder `0.0` and must not be read as a result.
 
+### Taking data mode
+
+For training data only, a supervisor or admin can take 360-degree scans from the
+**Taking data** button (enabled by the `scan` config block). Enter the toy ID, the
+label (GOOD, or BAD with defect names) and press Enter for each step; for BAD scans
+tick "defect visible" per picture, then Done with each side and Finish. A scan is
+saved as its own record under `scans/`, never as a part verdict and never to the
+MES. A supervisor's label is proposed, an admin's is official. The inspection
+controls pause while a scan runs. Format: [tools/FORMAT.md](tools/FORMAT.md),
+"Scan record". Plan: [docs/26_1027_PLAN_taking_data_mode.md](docs/26_1027_PLAN_taking_data_mode.md).
+
 ## Create users
 
     python3 -m station users add alice operator

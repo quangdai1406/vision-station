@@ -174,6 +174,7 @@ Still open:
 | 2026-10-27 | 3 | DONE (overnight run, checker PASS): `scan` action for supervisor/admin; optional `scan` config block (enabled, min_flip_s, debounce_s) builds ScanStore + ScanSession on the same cameras in `station/app.py`; scan start refused while an inspection is mid-part, inspection press refused while a scan is active (guard in `_LockedSession.press`, the only UI path). Full suite 1329 OK, 0 skips (node on PATH). |
 | 2026-10-27 | 5 | DONE (checker PASS): `tools/export_evidence.py` also verifies (station.scanstore.verify_scan) and copies `scans/`, manifest last, never deletes, dry-run, report key `scans`. Not run on a real share; SharePoint postponed. |
 | 2026-10-27 | 6 | DONE (checker PASS): `trainer/scans.py`, `weekly --scans-too [--holdout-toys A,B,C]`: official GOOD scans join the per-(camera, side) banks, split whole toys only; BAD scans read for evaluation only. Fake extractor tests only: no real torch run on scans yet. |
+| 2026-10-28 | 4 | DONE (checker PASS): `station/ui.py` Taking-data endpoints (/api/scan/start, press, done-side, mark, finish, cancel, clear-fault, reset, state, step-picture) gated by the `scan` action (operator 403), label status from the login (supervisor proposed, admin official; forged client fields ignored), page panel with per-camera "defect visible" checkboxes on BAD scans, `ScanSession.step_picture`, `_LockedScan.step_picture` and `scan=self.scan` in `app.py`. Real-app HTTP regression tests. Full suite 1366 OK, 0 skips. NOT run in a real browser yet. |
 
 ## Open list (parked for the owner, from the overnight checker)
 
@@ -182,4 +183,7 @@ Still open:
 - Step 3: every inspection press path must go through `app._locked`; a future hardware-button thread calling `app.session.press()` would bypass the scan guard. A cleaner guard inside `StationSession.press` needs a `session.py` change (owner's say-so).
 - Step 3: a scan capture holds the session lock, so inspection UI polling waits during a capture. Releasing the lock during capture is possible; not done.
 - Step 5: every file of an already-exported scan is re-hashed at the destination each run; a failed copy leaves a `.name.part` temp file (never deleted by design).
+- Step 4: after a page reload the checkboxes show unticked although the server holds the marks; only the last step's pictures can be re-marked on screen (the server accepts a mark on any picture until Finish). Tick from the snapshot marks or keep all steps' pictures: decide.
+- Step 4: a scan press while IDLE returns 200 {accepted:false}, unlike other refusals (cosmetic).
+- Step 4: the page has only been covered by `node --check` and server-side tests. Run it once in a real browser on the Pi at home (supervisor login, GOOD and BAD scan).
 

@@ -712,6 +712,10 @@ class _LockedScan:
         with self._lock:
             return self._scan.snapshot()
 
+    def step_picture(self, camera_id: str):
+        with self._lock:
+            return self._scan.step_picture(camera_id)
+
 
 # --------------------------------------------------------------- the app
 
@@ -961,7 +965,7 @@ class StationApp:
         self.sessions = SessionManager(timeout_s=cfg["ui"]["session_timeout_s"])
         self._locked = _LockedSession(self.session, self._session_lock, self)
         self.server = make_server(self._locked, users, self.sessions,
-                                  host=cfg["ui"]["host"], port=cfg["ui"]["port"])
+                                  host=cfg["ui"]["host"], port=cfg["ui"]["port"], scan=self.scan)
 
     # ------------------------------------------------------- Taking data
 
