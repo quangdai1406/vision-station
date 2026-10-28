@@ -498,5 +498,41 @@ class TestReadAndList(ScanTestCase):
         self.assertEqual(list_scans(self.root / "nothing-here"), [])
 
 
+class TestSetDefectVisible(ScanTestCase):
+    def test_mark_changed_before_finish_is_written_to_scan_json(self):
+        writer = self.begin(label=BAD_LABEL)
+        self.fill(writer, {"TOP": 2, "BOTTOM": 1}, bad=True)
+        writer.set_defect_visible("C2", "TOP", 2, True)
+        writer.set_defect_visible("C2", "TOP", 2, False)
+        writer.set_defect_visible("C4", "BOTTOM", 1, True)
+        final = writer.finish(FINISHED)
+        doc = load_scan(final)
+        visible = {(i["camera_id"], i["side"], i["step"]): i["defect_visible"] for i in doc["images"]}
+        self.assertIs(visible[("C2", "TOP", 2)], False)
+        self.assertIs(visible[("C4", "BOTTOM", 1)], True)
+        self.assertIs(visible[("C1", "TOP", 1)], False)
+        self.assertEqual(verify_scan(final), [])
+
+    def test_refused_for_good_unknown_closed_and_bad_value(self):
+        good = self.begin("SC-G")
+        self.fill(good, {"TOP": 1})
+        with self.assertRaises(ValueError):
+            good.set_defect_visible("C1", "TOP", 1, True)
+        good.cancel()
+
+        bad = self.begin("SC-B", label=BAD_LABEL)
+        self.fill(bad, {"TOP": 1}, bad=True)
+        with self.assertRaises(ValueError):
+            bad.set_defect_visible("C1", "TOP", 2, True)  # no such step
+        with self.assertRaises(ValueError):
+            bad.set_defect_visible("C1", "BOTTOM", 1, True)  # no such side
+        with self.assertRaises(ValueError):
+            bad.set_defect_visible("C1", "TOP", 1, "yes")  # not a bool
+        bad.finish(FINISHED)
+        with self.assertRaises(RuntimeError):
+            bad.set_defect_visible("C1", "TOP", 1, True)  # after finish
+        self.assertEqual(verify_scan(self.scan_dir("SC-B")), [])
+
+
 if __name__ == "__main__":
     unittest.main()

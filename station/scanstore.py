@@ -414,6 +414,21 @@ class ScanWriter:
         self._keys.add(key)
         return name
 
+    def set_defect_visible(self, camera_id: str, side: str, step: int, value: bool) -> None:
+        """Change one picture's defect_visible. Only on a BAD scan, and only before finish()."""
+        with self._store._lock:
+            if self._closed:
+                raise RuntimeError("scan writer is closed")
+            if self.verdict != "BAD":
+                raise ValueError("defect_visible can only be set on a BAD scan")
+            if not isinstance(value, bool):
+                raise ValueError(f"defect_visible must be True or False, got {value!r}")
+            for img in self._images:
+                if img["camera_id"] == camera_id and img["side"] == side and img["step"] == step:
+                    img["defect_visible"] = value
+                    return
+            raise ValueError(f"no picture {camera_id} {side} step {step} in this scan")
+
     def finish(self, finished_utc: str) -> pathlib.Path:
         """Validate, write scan.json, then the manifest (last), then publish the folder."""
         if self._closed:

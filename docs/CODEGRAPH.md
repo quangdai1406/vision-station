@@ -10,7 +10,7 @@ python3 .claude/skills/code-graph/scripts/gen_codegraph_doc.py [--check]
 
 Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` tests need numpy, no camera or network). Station core is standard library only; `tools/` imports numpy/opencv lazily.
 
-40 code files, 40 test files, 190 import edges.
+41 code files, 41 test files, 195 import edges.
 
 ## Modules
 
@@ -22,7 +22,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `station/app.py` | 1277 | 8 | 6 | Wire the station together: config, build, run, and MES sync. |
 | `station/auth.py` | 182 | 9 | 8 | Password hashing, user store, role policy and in-memory session tokens. |
 | `station/cameras.py` | 1013 | 12 | 9 | Camera sources for the inspection station. |
-| `station/contracts.py` | 202 | 40 | 30 | Shared types and interfaces for the camera inspection station. |
+| `station/contracts.py` | 202 | 42 | 31 | Shared types and interfaces for the camera inspection station. |
 | `station/features_torch.py` | 324 | 4 | 11 | PyTorch feature extractor and cdist backend for the PatchCore anomaly model. |
 | `station/fusion.py` | 87 | 2 | 8 | Per-image classification and per-part fusion. |
 | `station/golden.py` | 416 | 9 | 13 | Compare-with-a-good-part model for the one-camera proof of concept. |
@@ -32,7 +32,8 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `station/outbox.py` | 214 | 2 | 7 | Durable outbox for inspection events waiting to be posted to the MES. |
 | `station/outputs.py` | 122 | 8 | 7 | Output drivers for lights and the alarm (implements contracts.OutputDriver). |
 | `station/parts.py` | 281 | 4 | 8 | Client for the MES part search and per-part inspection criteria. |
-| `station/scanstore.py` | 701 | 1 | 1 | Scan records for "Taking data" mode: 360-degree pictures for training. |
+| `station/scan.py` | 491 | 1 | 1 | One "Taking data" scan: from the first press of a part to a saved scan record. |
+| `station/scanstore.py` | 716 | 3 | 2 | Scan records for "Taking data" mode: 360-degree pictures for training. |
 | `station/session.py` | 765 | 3 | 7 | One inspection session: from the first press of a part to a completed record. |
 | `station/storage.py` | 691 | 9 | 12 | Storage for finished inspection parts and the append-only event log. |
 | `station/teach.py` | 179 | 2 | 2 | `python -m station teach`: learn the golden model from GOOD parts on the real cameras. |
@@ -59,7 +60,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 
 ## Hubs (change with care)
 
-- `station/contracts.py`: imported by 40 files
+- `station/contracts.py`: imported by 42 files
 - `station/cameras.py`: imported by 12 files
 - `station/modelstore.py`: imported by 10 files
 - `station/auth.py`: imported by 9 files
@@ -86,6 +87,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 - `station/outbox.py` -> `station/mes_client.py`
 - `station/outputs.py` -> `station/contracts.py`
 - `station/parts.py` -> `station/contracts.py`
+- `station/scan.py` -> `station/contracts.py`, `station/scanstore.py`
 - `station/scanstore.py` -> (no internal imports)
 - `station/session.py` -> `station/contracts.py`, `station/fusion.py`, `station/storage.py`
 - `station/storage.py` -> `station/contracts.py`
@@ -132,6 +134,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 - `tests/test_outputs.py` -> `station/contracts.py`, `station/outputs.py`
 - `tests/test_parts.py` -> `station/contracts.py`, `station/parts.py`, `tools/criteria.py`
 - `tests/test_poc_e2e.py` -> `station/app.py`, `station/auth.py`, `station/cameras.py`, `station/contracts.py`, `station/golden.py`, `station/inference.py`, `station/outputs.py`
+- `tests/test_scan.py` -> `station/contracts.py`, `station/scan.py`, `station/scanstore.py`
 - `tests/test_scanstore.py` -> `station/scanstore.py`
 - `tests/test_scripts_weekly.py` -> `trainer/weekly.py`
 - `tests/test_session.py` -> `station/contracts.py`, `station/session.py`
@@ -160,7 +163,7 @@ None.
 
 ## External packages (code files importing each)
 
-`__future__` (33), `typing` (33), `json` (25), `sys` (18), `argparse` (17), `pathlib` (17), `os` (15), `dataclasses` (14), `datetime` (14), `time` (12), `re` (10), `numpy` (9), `cv2` (8), `hashlib` (8), `threading` (8), `tempfile` (6), `http` (5), `math` (5), `urllib` (5), `collections` (4), `contextlib` (4), `shutil` (4), `csv` (3), `importlib` (3), `io` (3), `base64` (2), `enum` (2), `hmac` (2), `sqlite3` (2), `statistics` (2), `torch` (2), `unicodedata` (2), `uuid` (2), `zipfile` (2), `email` (1), `getpass` (1), `mimetypes` (1), `onnxruntime` (1), `platform` (1), `random` (1), `secrets` (1), `signal` (1), `torchvision` (1), `traceback` (1)
+`__future__` (34), `typing` (34), `json` (25), `pathlib` (18), `sys` (18), `argparse` (17), `datetime` (15), `os` (15), `dataclasses` (14), `time` (13), `re` (10), `numpy` (9), `threading` (9), `cv2` (8), `hashlib` (8), `math` (6), `tempfile` (6), `http` (5), `urllib` (5), `collections` (4), `contextlib` (4), `shutil` (4), `csv` (3), `enum` (3), `importlib` (3), `io` (3), `uuid` (3), `base64` (2), `hmac` (2), `sqlite3` (2), `statistics` (2), `torch` (2), `unicodedata` (2), `zipfile` (2), `email` (1), `getpass` (1), `mimetypes` (1), `onnxruntime` (1), `platform` (1), `random` (1), `secrets` (1), `signal` (1), `torchvision` (1), `traceback` (1)
 
 ## What the graph cannot see
 
