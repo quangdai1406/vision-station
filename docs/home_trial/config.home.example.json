@@ -1,0 +1,67 @@
+{
+  "site": "[SITE CODE, e.g. AISI1]",
+  "line": "[LINE CODE, e.g. POCTEST]",
+  "station_id": "[STATION ID as registered in the MES, e.g. pi-home-1]",
+  "part_number": "[PART NUMBER from the MES, e.g. TOYCAR-TEST]",
+  "lot": "[LOT NUMBER for this run]",
+  "operator": "[OPERATOR NAME for the shift]",
+  "supervisor": "[SUPERVISOR NAME for the shift]",
+  "material_handler": "[MATERIAL HANDLER NAME for the shift]",
+
+  "thresholds": {
+    "t_low": "[T_LOW: from tools/thresholds.py and Quality, a number 0..1]",
+    "t_img": "[T_IMG: from tools/thresholds.py and Quality, a number 0..1, >= t_low]"
+  },
+
+  "data_dir": "./data",
+  "users_file": "./users.json",
+
+  "ui": {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "session_timeout_s": 900
+  },
+
+  "mes": {
+    "base_url": "http://127.0.0.1:3000",
+    "token_env": "STATION_MES_TOKEN",
+    "criteria_ids": ["[CRITERION ID from GET /api/machine/criteria/PART, Quality to define]"],
+    "class_to_criterion": {
+      "[DEFECT CLASS from the model, Quality to define]": "[CRITERION ID it maps to]"
+    },
+    "default_criterion_id": null,
+    "sync_interval_s": 5,
+    "default_bad_disposition": "quarantine"
+  },
+
+  "cameras": {
+    "kind": "opencv",
+    "devices": [0, 2, 4, 6],
+    "width": 1280,
+    "height": 720,
+    "session_mode": "keep_open",
+    "capture": {
+      "mjpg": true,
+      "threaded": true,
+      "flush_frames": 1
+    },
+    "manual": {
+      "focus": null,
+      "exposure": null,
+      "white_balance": null
+    }
+  },
+
+  "model": {
+    "kind": "collect",
+    "version": "HOME-TRIAL-collect-1"
+  },
+
+  "outputs": {
+    "kind": "console"
+  },
+
+  "parts": {"mode": "fixed", "models_dir": "./models"},
+  "flip_timeout_s": 60,
+  "min_flip_s": 2.0
+}

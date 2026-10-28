@@ -10,7 +10,7 @@ python3 .claude/skills/code-graph/scripts/gen_codegraph_doc.py [--check]
 
 Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` tests need numpy, no camera or network). Station core is standard library only; `tools/` imports numpy/opencv lazily.
 
-38 code files, 38 test files, 185 import edges.
+39 code files, 39 test files, 189 import edges.
 
 ## Modules
 
@@ -22,16 +22,16 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `station/app.py` | 1275 | 8 | 6 | Wire the station together: config, build, run, and MES sync. |
 | `station/auth.py` | 182 | 9 | 8 | Password hashing, user store, role policy and in-memory session tokens. |
 | `station/cameras.py` | 1013 | 12 | 9 | Camera sources for the inspection station. |
-| `station/contracts.py` | 202 | 40 | 29 | Shared types and interfaces for the camera inspection station. |
+| `station/contracts.py` | 202 | 40 | 30 | Shared types and interfaces for the camera inspection station. |
 | `station/features_torch.py` | 324 | 4 | 11 | PyTorch feature extractor and cdist backend for the PatchCore anomaly model. |
 | `station/fusion.py` | 87 | 2 | 8 | Per-image classification and per-part fusion. |
 | `station/golden.py` | 416 | 9 | 13 | Compare-with-a-good-part model for the one-camera proof of concept. |
 | `station/inference.py` | 176 | 8 | 7 | Inference models for the inspection station. |
-| `station/mes_client.py` | 280 | 5 | 8 | MES client for the camera inspection station. |
+| `station/mes_client.py` | 280 | 6 | 9 | MES client for the camera inspection station. |
 | `station/modelstore.py` | 607 | 10 | 12 | Per-part model versions on disk, with human approval. |
 | `station/outbox.py` | 214 | 2 | 7 | Durable outbox for inspection events waiting to be posted to the MES. |
 | `station/outputs.py` | 122 | 8 | 7 | Output drivers for lights and the alarm (implements contracts.OutputDriver). |
-| `station/parts.py` | 281 | 3 | 7 | Client for the MES part search and per-part inspection criteria. |
+| `station/parts.py` | 281 | 4 | 8 | Client for the MES part search and per-part inspection criteria. |
 | `station/session.py` | 765 | 3 | 7 | One inspection session: from the first press of a part to a completed record. |
 | `station/storage.py` | 691 | 9 | 12 | Storage for finished inspection parts and the append-only event log. |
 | `station/teach.py` | 179 | 2 | 2 | `python -m station teach`: learn the golden model from GOOD parts on the real cameras. |
@@ -41,8 +41,9 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `tools/analysis.py` | 263 | 3 | 3 | Numpy-only image repeatability metrics. Shapes and return keys: see tools/FORMAT.md. |
 | `tools/capture.py` | 1062 | 2 | 2 | Real-webcam capture for the repeatability study. Run on the user's Windows PC. |
 | `tools/capture_speed.py` | 145 | 1 | 1 | Timing probe for the keep-open camera session: N rounds of one picture per camera. |
-| `tools/criteria.py` | 465 | 3 | 3 | MES inspection criteria for a part -> station config pieces and a sample-collection checklist. |
+| `tools/criteria.py` | 465 | 4 | 4 | MES inspection criteria for a part -> station config pieces and a sample-collection checklist. |
 | `tools/export_evidence.py` | 407 | 1 | 1 | Export saved evidence from the Pi station to a destination folder. |
+| `tools/fake_mes.py` | 367 | 1 | 1 | HOME TRIAL fake MES: a local stand-in for the machine API, for testing at home. |
 | `tools/hubtest.py` | 717 | 1 | 1 | USB hub feasibility test for several webcams. Run on the user's Windows PC. |
 | `tools/liveview.py` | 198 | 1 | 1 | Live view of the 4 station cameras in a browser, for aiming and lighting. |
 | `tools/report.py` | 949 | 2 | 2 | Plain-language repeatability report for capture session folders. |
@@ -95,6 +96,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 - `tools/capture_speed.py` -> `station/cameras.py`, `tools/__init__.py`
 - `tools/criteria.py` -> (no internal imports)
 - `tools/export_evidence.py` -> (no internal imports)
+- `tools/fake_mes.py` -> `tools/criteria.py`
 - `tools/hubtest.py` -> `station/cameras.py`, `tools/__init__.py`
 - `tools/liveview.py` -> `tools/__init__.py`
 - `tools/report.py` -> `tools/__init__.py`, `tools/analysis.py`
@@ -138,6 +140,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 - `tests/test_tools_criteria.py` -> `tools/criteria.py`
 - `tests/test_tools_dryrun.py` -> `tools/capture.py`, `tools/criteria.py`, `tools/report.py`, `tools/thresholds.py`
 - `tests/test_tools_export_evidence.py` -> `station/contracts.py`, `station/storage.py`, `tools/export_evidence.py`
+- `tests/test_tools_fake_mes.py` -> `station/mes_client.py`, `station/parts.py`, `tools/fake_mes.py`
 - `tests/test_tools_liveview.py` -> `tools/liveview.py`
 - `tests/test_tools_report.py` -> `tools/__init__.py`, `tools/analysis.py`, `tools/report.py`
 - `tests/test_tools_thresholds.py` -> `tools/thresholds.py`
@@ -154,7 +157,7 @@ None.
 
 ## External packages (code files importing each)
 
-`__future__` (31), `typing` (31), `json` (23), `sys` (17), `argparse` (16), `pathlib` (15), `dataclasses` (14), `os` (13), `datetime` (12), `time` (12), `numpy` (9), `re` (9), `cv2` (8), `hashlib` (7), `tempfile` (6), `threading` (6), `math` (5), `collections` (4), `http` (4), `urllib` (4), `contextlib` (3), `csv` (3), `importlib` (3), `io` (3), `shutil` (3), `base64` (2), `enum` (2), `sqlite3` (2), `statistics` (2), `torch` (2), `unicodedata` (2), `uuid` (2), `zipfile` (2), `getpass` (1), `hmac` (1), `mimetypes` (1), `onnxruntime` (1), `platform` (1), `random` (1), `secrets` (1), `signal` (1), `torchvision` (1), `traceback` (1)
+`__future__` (32), `typing` (32), `json` (24), `sys` (18), `argparse` (17), `pathlib` (16), `dataclasses` (14), `os` (14), `datetime` (13), `time` (12), `numpy` (9), `re` (9), `cv2` (8), `hashlib` (7), `threading` (7), `tempfile` (6), `http` (5), `math` (5), `urllib` (5), `collections` (4), `contextlib` (3), `csv` (3), `importlib` (3), `io` (3), `shutil` (3), `base64` (2), `enum` (2), `hmac` (2), `sqlite3` (2), `statistics` (2), `torch` (2), `unicodedata` (2), `uuid` (2), `zipfile` (2), `email` (1), `getpass` (1), `mimetypes` (1), `onnxruntime` (1), `platform` (1), `random` (1), `secrets` (1), `signal` (1), `torchvision` (1), `traceback` (1)
 
 ## What the graph cannot see
 

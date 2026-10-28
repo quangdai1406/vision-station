@@ -1,0 +1,7 @@
+{
+  "arch": "resnet18",
+  "device": "cpu",
+  "input_hw": [360, 640],
+  "weights_path": "/home/quangdai1406/.cache/torch/hub/checkpoints/resnet18-f37072fd.pth",
+  "keep_aspect": true
+}

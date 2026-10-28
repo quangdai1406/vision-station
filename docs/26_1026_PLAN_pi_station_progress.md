@@ -138,3 +138,16 @@ BAD; never invent thresholds or counts (write `[Quality to define]`); no secrets
 | 2026-10-26 | 1.3b | Evidence of the 20-part rerun kept at ~/Pictures/vision-station-collect-test-26_1026/ (143 MB, 20 manifests re-verified after copy, 0 failures). Password files not copied. |
 | 2026-10-26 | 0.8 | Code graph rebuilt (76 files) and docs/CODEGRAPH.md regenerated. Commits 1f3e89f (plan, 1.3b done) and 51b89d2 (liveview). First push failed: no GitHub login on the Pi. gh downloaded to ~/bin with a verified checksum; user completed the login in a terminal; push succeeded. |
 | 2026-10-26 | - | Run totals this evening (multi-agent runner): 3 rounds, 5 Haiku workers, 3 Sonnet checker calls. Next: docs/26_1026_PLAN_office_day.md (network and MES token, real parts, Quality counts, laptop setup). |
+
+## Home trial (2026-10-27)
+
+| # | Step | Verify | Owner | Status |
+|---|---|---|---|---|
+| H2 | Fake MES for home: `python3 -m tools.fake_mes --token-env STATION_MES_TOKEN --port 3000` | 19 tests, full suite 1188 OK, checker PASS | Claude | DONE |
+| H1 | Live view and speed check, cameras not moved | 0 failures | user at the Pi | TODO |
+| H3 | Collect GOOD parts: 10+ different parts over 2+ UTC days (HOME TRIAL numbers, NOT QUALITY) | `python3 -m trainer inventory` | user | TODO |
+| H4 | Collect BAD parts, label them (operator proposes, admin official) | official labels | user | TODO |
+| H5-H8 | Train on the Pi, promote, run with the model, thresholds, full cycle vs fake MES | see docs/home_trial/README.md | Claude + user | TODO |
+
+Home-only numbers (HOME TRIAL, NOT QUALITY): min_good 10, min_holdout 3, holdout_fraction 0.3. t_low/t_img: [Quality to define] until tools/thresholds.py gives candidates.
+Known: weekly falls back to whole parts when the store has fewer than 2 UTC days, so one day can land in both train and holdout.
