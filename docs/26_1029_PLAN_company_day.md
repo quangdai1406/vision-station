@@ -28,11 +28,12 @@ Taking-data scans, label approval, and a promoted HOME TRIAL model. Numbers that
 ## At the company
 | # | Step | Owner | Verify |
 |---|---|---|---|
-| 1 | Network: get the MES address and port; `ping` and `curl` from the Pi; ask IT about firewall and proxy | You, IT | Pi gets an HTTP code from the MES |
-| 2 | Token: ask the MES administrator for a machine token; export it in the shell that starts the station | MES admin | Part search returns real parts; token in no file |
+| 1 | Network: get the MES address and port; `ping` and `curl` from the Pi; ask IT about firewall and proxy. Use plain HTTP, `http://<laptop>:3000` (the MES listens on all interfaces; HTTPS on 3443 exists only with a self-signed cert, which our client cannot trust) | You, IT | Pi gets an HTTP code from the MES |
+| 2 | Token: issue it on the MES machine with `npm run machine-token -- <station>` (prints once, stored hashed; revoke with `-- --revoke <station>`). It acts as user `machine-<station>` with role `inspector`. Export it in the shell that starts the station | MES admin | Part search returns real parts; token in no file |
+| 2b | Register the station: the station id in the config must already exist in the MES (else `UnknownStationError`). Use the FGI station service or `scripts/seedFgiProductionStations.ts`. Check with `GET /api/machine/stations` | MES admin | Station id is listed |
 | 3 | Test target: ask whether the MES has a test line, test part or sandbox. If not, stay in collect mode and post nothing | You, MES admin | Written answer |
 | 4 | Config: `mes.base_url`, `mes.token_env`, `parts.mode: "mes"`; create real logins per role with `users add` | Claude | Page loads; each role sees the right actions |
-| 5 | Part and criteria: search one real part number; run `tools.criteria`; fill `mes.criteria_ids` and `mes.class_to_criterion` | Claude, Quality | Mapping complete for that part |
+| 5 | Part and criteria: search one real part number; check `GET /api/machine/criteria/<part>` returns criteria; run `tools.criteria`; fill `mes.criteria_ids` and `mes.class_to_criterion` | Claude, Quality | Mapping complete for that part |
 | 6 | Collect REAL GOOD parts in collect mode: many different parts, not one repeated | You | 8 images each; counts as Quality sets (`min_good`, `min_holdout`, `holdout_fraction`: `[Quality to define]`) |
 | 7 | Collect BAD parts per defect type; operator proposes the label, admin makes it official | You, admin | Official labels matching MES criteria |
 | 8 | Taking-data scans (supervisor), approved by the admin | You | Scans are `official` |
@@ -56,6 +57,20 @@ Taking-data scans, label approval, and a promoted HOME TRIAL model. Numbers that
 - After a station restart the part's own MES criteria are not reloaded until the part is selected again.
 - The 60 s flip window; an override works only before the alarm is acknowledged (found in the home demo).
 - Small-defect detection at 360x640 is unmeasured. Check it on the real labelled pictures from steps 6 to 8.
+
+## MES facts (read from `quangdai1406/AISI_MES`, 2026-10-28; clone at `~/AISI_MES`)
+- Node/TypeScript Express on PostgreSQL. The station only talks to `/api/machine` (`src/server/machineRoutes.ts`),
+  mounted before the login check, token auth, `Idempotency-Key` required on `POST /inspection-events`
+  (201 first time, 200 on a retry).
+- Our `station/mes_client.py` sends the fields the MES documents (`docs/vision-station-integration.md`):
+  `stationId`, `partNumber`, `quantityInspected`, `checklistResults`, `supervisor`, `operators`, `materialHandler`,
+  `visionSessionId`, `modelVersion`, `archiveRef`, `verdict`, `disposition`, the override trio and
+  `defectPhoto_<criterionId>`. Checked by reading code only; never run against the real MES.
+- The MES `audit_trail` is immutable. An event posted to a live MES cannot be taken back. This is why collect mode
+  comes first.
+- A BAD class with no mapped criterion makes the enqueue fail (see Risks).
+- Tokens travel in clear over plain HTTP: keep the Pi and the MES on a trusted network.
+- MES tests need `psql` and `DATABASE_URL`; they cannot run on the Pi.
 
 ## Open questions for the owner
 1. Does the MES have a test line, test part or sandbox, or is it production only? This decides whether anything
