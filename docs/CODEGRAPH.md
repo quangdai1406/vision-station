@@ -37,7 +37,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `station/session.py` | 765 | 3 | 9 | One inspection session: from the first press of a part to a completed record. |
 | `station/storage.py` | 691 | 11 | 16 | Storage for finished inspection parts and the append-only event log. |
 | `station/teach.py` | 179 | 2 | 2 | `python -m station teach`: learn the golden model from GOOD parts on the real cameras. |
-| `station/ui.py` | 2112 | 3 | 9 | HTTP server for the inspection station: a JSON API plus one HTML page. |
+| `station/ui.py` | 2120 | 3 | 9 | HTTP server for the inspection station: a JSON API plus one HTML page. |
 | `station/users_cli.py` | 131 | 2 | 2 | `python -m station users add <username> <role>`: create or update a station login. |
 | `tools/__init__.py` | 6 | 8 | 7 | Repeatability and threshold-selection tools. See FORMAT.md. |
 | `tools/analysis.py` | 263 | 3 | 3 | Numpy-only image repeatability metrics. Shapes and return keys: see tools/FORMAT.md. |

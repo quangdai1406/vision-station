@@ -565,6 +565,15 @@ class ScanPageTests(ScanHttpBase):
         self.assertIn("doh_small, doh_large, doh_edge", html)
         self.assertLess(html.index('id="scan-panel"'), html.index('id="inspect-controls"'))
 
+    def test_live_view_and_step_pictures_stay_on_during_a_scan(self):
+        html = self.page()
+        # The live view is not hidden while a scan runs; it pauses only while saving or in a fault.
+        self.assertNotIn('$("live").hidden', html)
+        self.assertIn('scanSnap.state === "SCAN_SIDE" || scanSnap.state === "WAIT_FLIP"', html)
+        # Step pictures are listed for GOOD scans too; only BAD scans get the defect checkbox.
+        self.assertNotIn('if (s.label_verdict !== "BAD" || count < 1', html)
+        self.assertIn("if (isBad) {", html)
+
     def test_button_visibility_comes_from_the_actions_list(self):
         html = self.page()
         self.assertIn('var scanAllowed = false;', html)

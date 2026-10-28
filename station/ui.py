@@ -1224,7 +1224,12 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
 
   function liveWanted() {
     if (el.app.hidden || document.visibilityState !== "visible") { return false; }
-    if (curFault || scanActiveNow) { return false; }
+    if (curFault) { return false; }
+    // While a scan runs the live view stays on, so the part can be placed and turned
+    // by eye. It pauses while a step is being saved or the scan is in a fault.
+    if (scanIsActive()) {
+      return !scanSnap || scanSnap.state === "SCAN_SIDE" || scanSnap.state === "WAIT_FLIP";
+    }
     return curState === "IDLE" || curState === "WAIT_FLIP";
   }
 
@@ -1409,14 +1414,15 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
     var side = s.side;
     var count = side && s.counts ? (s.counts[side] || 0) : 0;
     var live = s.state === "SCAN_SIDE" || s.state === "WAIT_FLIP" || s.state === "SAVING";
-    if (s.label_verdict !== "BAD" || count < 1 || !live) { clearScanPics(); return; }
+    if (count < 1 || !live) { clearScanPics(); return; }
+    var isBad = s.label_verdict === "BAD";
     var key = String(s.scan_id) + "|" + side + "|" + count;
     if (key === scanPicKey) { return; }
     clearScanPics();
     scanPicKey = key;
     var box = $("scan-pics");
     box.hidden = false;
-    $("scan-pics-note").hidden = false;
+    $("scan-pics-note").hidden = !isBad;
     var cams = Array.isArray(s.camera_names) ? s.camera_names : [];
     cams.forEach(function (cam) {
       if (typeof cam !== "string" || cam.length === 0 || cam.length > 32) { return; }
@@ -1427,17 +1433,19 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
       img.alt = "Picture " + base;
       var cap = document.createElement("figcaption");
       cap.textContent = base + ", loading";
-      var lab = document.createElement("label");
-      lab.className = "inline";
-      var tick = document.createElement("input");
-      tick.type = "checkbox";
-      tick.checked = false;
-      lab.appendChild(tick);
-      lab.appendChild(document.createTextNode("defect visible"));
-      tick.addEventListener("change", function () { markScanPicture(tick, cam, side, count); });
       fig.appendChild(img);
       fig.appendChild(cap);
-      fig.appendChild(lab);
+      if (isBad) {
+        var lab = document.createElement("label");
+        lab.className = "inline";
+        var tick = document.createElement("input");
+        tick.type = "checkbox";
+        tick.checked = false;
+        lab.appendChild(tick);
+        lab.appendChild(document.createTextNode("defect visible"));
+        tick.addEventListener("change", function () { markScanPicture(tick, cam, side, count); });
+        fig.appendChild(lab);
+      }
       box.appendChild(fig);
       loadScanPicture(img, cap, base, cam, key);
     });
@@ -1511,7 +1519,7 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
     var s = scanSnap;
     var active = scanIsActive();
     $("inspect-controls").hidden = active;
-    $("live").hidden = active;
+    syncLive();
     $("scan-busy").hidden = !active;
     $("scan-busy").textContent = active
       ? "Taking data is running on this station. Inspection is paused until the scan is saved or cancelled."
