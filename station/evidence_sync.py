@@ -197,6 +197,15 @@ def _adopt_existing(final: pathlib.Path, src: _Source) -> str:
 
 # ----------------------------------------------------------------- copying
 
+def planned_destination(part_dir, dest_root) -> str:
+    """The laptop path a part will have after sync_part: ``<dest_root>/<line>/YYYY/MM/DD/<part_id>``.
+
+    Pure: nothing is read or written. sync_part returns the same string. Raises SyncError when
+    part_dir is not in the store layout.
+    """
+    return str(pathlib.Path(dest_root) / _layout(pathlib.Path(part_dir)))
+
+
 def sync_part(part_dir, dest_root) -> str:
     """Copy one saved part to ``dest_root`` (the laptop store folder); return the final path.
 
@@ -215,7 +224,7 @@ def sync_part(part_dir, dest_root) -> str:
     if not dest_root.is_dir():
         # Do not create the folder: a missing SMB mount must not turn into a local folder.
         raise SyncError("destination is not reachable")
-    final = dest_root / rel
+    final = dest_root / rel  # == planned_destination(part_dir, dest_root)
     if os.path.lexists(final):
         return _adopt_existing(final, src)
 

@@ -60,6 +60,8 @@ _LABEL_STATUS_KEYS = ("session_id", "part_id", "part_number", "label_status", "v
 _PENDING_LABEL_KEYS = ("session_id", "part_id", "part_number", "verdict", "criterion_id",
                        "proposed_by", "proposed_at")
 MAX_REJECT_REASON_CHARS = 200  # keep in step with station.storage.MAX_REJECT_REASON_CHARS
+MAX_DEFECT_NOTE_CHARS = 500  # keep in step with station.defect_proposal.MAX_NOTE_CHARS
+_CRITERIA_KEYS = ("id", "name", "description")
 
 _ACTION_PATHS = {
     "/api/press": "press",
@@ -311,6 +313,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._label_last()
         if path == "/api/label/pending":
             return self._label_pending()
+        if path == "/api/part/criteria":
+            return self._part_criteria()
         if path == "/api/scan/state":
             return self._scan_state()
         if path == "/api/scan/step-picture":
@@ -331,6 +335,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._logout()
         if path == "/api/part/select":
             return self._part_select()
+        if path == "/api/part/defects":
+            return self._defect_add()
+        if path == "/api/part/defects/remove":
+            return self._defect_remove()
         if path in ("/api/label/approve", "/api/label/reject"):
             return self._label_review(path.rsplit("/", 1)[1])
         if path.startswith("/api/scan/"):
@@ -466,6 +474,47 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(result, dict):
             raise RuntimeError("select_part() must return a dict")
         self._send_json(200, _pick(result, _PART_KEYS))
+
+    def _part_criteria(self) -> None:
+        """Active criteria (id, name, description) of the part being shown. Any logged-in role."""
+        self._require()
+        rows = _call_parts(self.station.part_criteria)
+        if not isinstance(rows, list):
+            raise RuntimeError("part_criteria() must return a list")
+        self._send_json(200, {"criteria": [_pick(r, _CRITERIA_KEYS) for r in rows if isinstance(r, dict)]})
+
+    def _defect_add(self) -> None:
+        """Propose a defect on the part being shown. The inspector is the login, never the body."""
+        _, username, _role = self._require("propose_defect")
+        data = self._read_json()
+        criterion = data.get("criterion_id")
+        if not isinstance(criterion, str) or not 1 <= len(criterion) <= MAX_CRITERION_CHARS:
+            raise _HttpError(400, f"criterion_id must be 1 to {MAX_CRITERION_CHARS} characters")
+        camera = data.get("camera_id")
+        if not isinstance(camera, str) or not PREVIEW_CAMERA_RE.fullmatch(camera):
+            raise _HttpError(400, "camera_id must be C1, C2, C3 or C4")
+        side = data.get("side")
+        if side not in SCAN_SIDES:
+            raise _HttpError(400, "side must be TOP or BOTTOM")
+        note = data.get("note")
+        if note is None:
+            note = ""
+        if not isinstance(note, str) or len(note) > MAX_DEFECT_NOTE_CHARS:
+            raise _HttpError(400, f"note must be text up to {MAX_DEFECT_NOTE_CHARS} characters")
+        result = self.station.propose_defect(by=username, criterion_id=criterion, camera_id=camera,
+                                             side=side, note=note)
+        replaced = bool(result.get("replaced")) if isinstance(result, dict) else False
+        self._send_json(200, {"ok": True, "replaced": replaced})
+
+    def _defect_remove(self) -> None:
+        self._require("propose_defect")
+        data = self._read_json()
+        criterion = data.get("criterion_id")
+        if not isinstance(criterion, str) or not 1 <= len(criterion) <= MAX_CRITERION_CHARS:
+            raise _HttpError(400, f"criterion_id must be 1 to {MAX_CRITERION_CHARS} characters")
+        result = self.station.remove_defect(criterion)
+        removed = bool(result.get("removed")) if isinstance(result, dict) else False
+        self._send_json(200, {"ok": True, "removed": removed})
 
     def _act(self, action: str) -> None:
         _, username, _role = self._require(action)
@@ -1122,6 +1171,21 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
       <p id="press-hint" class="muted hint">Enter key or click: start TOP scan, flip the part, press again for the BOTTOM scan.</p>
       <p id="press-status" class="status" role="status"></p>
     </div>
+    <section id="defect-panel" class="card" aria-label="Propose a defect" hidden>
+      <h2>Propose a defect</h2>
+      <p class="muted hint">Pick one criterion and the picture that shows it. A proposal makes this part BAD. It never makes a BAD part GOOD.</p>
+      <p id="defect-none" class="part-block" hidden>This part has no active criteria, so a defect cannot be proposed for it.</p>
+      <h3>Criterion</h3>
+      <ul id="defect-criteria" class="part-results"></ul>
+      <h3>Picture</h3>
+      <ul id="defect-pictures" class="part-results"></ul>
+      <label for="defect-note">Note (optional, up to 500 characters)</label>
+      <input id="defect-note" maxlength="500" autocomplete="off">
+      <button type="button" id="defect-add">Propose defect</button>
+      <p id="defect-status" class="part-note muted" role="status"></p>
+      <h3>Proposals on this part</h3>
+      <ul id="defect-pending" class="part-results"></ul>
+    </section>
     <div class="card">
       <label for="reason">Reason (required for resolve and override)</label>
       <input id="reason" maxlength="500" autocomplete="off">
@@ -1516,6 +1580,7 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
     pressAllowed = !!allowed.press;
     labelIsAdmin = !!allowed.label_approve;
     scanAllowed = !!allowed.scan;
+    proposeAllowed = !!allowed.propose_defect;
     reviewAllowed = !!allowed.label_approve;
     startReviewBanner();
     scanActiveNow = s.scan_active === true;
@@ -1529,6 +1594,7 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
     curFault = !!s.fault;
     pressReady = s.press_ready !== false;
     flipWait = typeof s.flip_wait_s === "number" && s.flip_wait_s > 0 ? s.flip_wait_s : 0;
+    renderDefects(s);
     el.prompt.textContent = typeof s.prompt === "string" ? s.prompt : "";
     el.prompt.hidden = el.prompt.textContent === "";
     renderPart(s);
@@ -2164,6 +2230,150 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
       });
     }).then(null, function (err) { handleError(g, err); });
   }
+
+  // ----- defect proposals (shown while the part is VERDICT or SUPERVISOR_REVIEW) ----
+  // Every name and description comes from the MES: it is written with textContent only.
+  var proposeAllowed = false;
+  var defectCriteria = [];        // [{id, name, description}] of the part shown
+  var defectCriteriaPart = null;  // part_number the list was loaded for
+  var defectCriteriaBusy = false;
+  var defectPartId = null;        // part shown last: choices reset when a new part starts
+  var defectCrit = "";            // chosen criterion id
+  var defectPic = null;           // chosen {camera_id, side}
+  var defectImages = [];          // pictures of the part shown (from the snapshot)
+
+  function clearChildren(node) { while (node.firstChild) { node.removeChild(node.firstChild); } }
+  function setDefectStatus(msg) { $("defect-status").textContent = msg || ""; }
+
+  function criterionName(id) {
+    for (var i = 0; i < defectCriteria.length; i++) {
+      if (defectCriteria[i].id === id) { return String(defectCriteria[i].name || id); }
+    }
+    return String(id);
+  }
+
+  function loadDefectCriteria(part) {
+    if (defectCriteriaBusy || defectCriteriaPart === part) { return; }
+    defectCriteriaBusy = true;
+    var g = gen;
+    request("GET", "/api/part/criteria").then(function (r) {
+      defectCriteriaBusy = false;
+      if (g !== gen) { return; }
+      defectCriteria = Array.isArray(r.criteria) ? r.criteria : [];
+      defectCriteriaPart = part;
+      renderDefectCriteria();
+    }, function () { defectCriteriaBusy = false; });
+  }
+
+  function renderDefectCriteria() {
+    var list = $("defect-criteria");
+    clearChildren(list);
+    defectCriteria.forEach(function (c) {
+      var li = document.createElement("li");
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "part-choice secondary";
+      btn.disabled = !proposeAllowed;
+      btn.setAttribute("aria-pressed", c.id === defectCrit ? "true" : "false");
+      var name = document.createElement("span");
+      name.className = "part-pn";
+      name.textContent = String(c.name || c.id);
+      var desc = document.createElement("span");
+      desc.className = "part-desc";
+      desc.textContent = String(c.description || "");
+      btn.appendChild(name);
+      btn.appendChild(desc);
+      btn.addEventListener("click", function () {
+        defectCrit = String(c.id);
+        renderDefectCriteria();
+        renderDefectPictures();
+      });
+      li.appendChild(btn);
+      list.appendChild(li);
+    });
+    $("defect-add").disabled = !proposeAllowed || !defectCrit || !defectPic;
+  }
+
+  function renderDefectPictures() {
+    var list = $("defect-pictures");
+    clearChildren(list);
+    defectImages.forEach(function (img) {
+      var li = document.createElement("li");
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "part-choice secondary";
+      btn.disabled = !proposeAllowed;
+      var chosen = defectPic && defectPic.camera_id === img.camera_id && defectPic.side === img.side;
+      btn.setAttribute("aria-pressed", chosen ? "true" : "false");
+      btn.textContent = String(img.camera_id) + " " + String(img.side);
+      btn.addEventListener("click", function () {
+        defectPic = { camera_id: String(img.camera_id), side: String(img.side) };
+        renderDefectPictures();
+        renderDefectCriteria();
+      });
+      li.appendChild(btn);
+      list.appendChild(li);
+    });
+    $("defect-add").disabled = !proposeAllowed || !defectCrit || !defectPic;
+  }
+
+  function renderDefectPending(rows) {
+    var list = $("defect-pending");
+    clearChildren(list);
+    rows.forEach(function (p) {
+      var li = document.createElement("li");
+      var text = document.createElement("span");
+      var note = p.note ? " - " + String(p.note) : "";
+      text.textContent = criterionName(p.criterion_id) + ": " + String(p.camera_id) + " " +
+        String(p.side) + " (" + String(p.proposed_by || "") + ")" + note;
+      var remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "secondary";
+      remove.disabled = !proposeAllowed;
+      remove.textContent = "Remove";
+      remove.addEventListener("click", function () {
+        request("POST", "/api/part/defects/remove", { criterion_id: String(p.criterion_id) }).then(
+          function () { setDefectStatus("Proposal removed."); },
+          function (err) { setDefectStatus(err.message || "Could not remove the proposal."); });
+      });
+      li.appendChild(text);
+      li.appendChild(remove);
+      list.appendChild(li);
+    });
+  }
+
+  function renderDefects(s) {
+    var shown = s.state === "VERDICT" || s.state === "SUPERVISOR_REVIEW";
+    $("defect-panel").hidden = !shown;
+    if (s.part_id !== defectPartId) {
+      defectPartId = s.part_id;
+      defectCrit = "";
+      defectPic = null;
+      setDefectStatus("");
+    }
+    if (!shown) { return; }
+    var part = typeof s.part_number === "string" ? s.part_number : "";
+    loadDefectCriteria(part);
+    defectImages = Array.isArray(s.images) ? s.images : [];
+    $("defect-none").hidden = !(defectCriteriaPart === part && defectCriteria.length === 0);
+    renderDefectCriteria();
+    renderDefectPictures();
+    renderDefectPending(Array.isArray(s.defect_proposals) ? s.defect_proposals : []);
+  }
+
+  function proposeDefect() {
+    if (!defectCrit || !defectPic) { setDefectStatus("Choose a criterion and a picture first."); return; }
+    setDefectStatus("Saving the proposal...");
+    request("POST", "/api/part/defects", {
+      criterion_id: defectCrit, camera_id: defectPic.camera_id, side: defectPic.side,
+      note: $("defect-note").value || ""
+    }).then(function (r) {
+      setDefectStatus(r.replaced ? "Replaced the earlier proposal for this criterion." : "Proposal added.");
+      $("defect-note").value = "";
+    }, function (err) { setDefectStatus(err.message || "The proposal was refused."); });
+  }
+
+  $("defect-add").addEventListener("click", proposeDefect);
 
   // ----- part picker (only when parts_mode is 'mes') ---------------------
   // The part may change only between parts: the picker is locked while a press is

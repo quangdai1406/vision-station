@@ -43,6 +43,7 @@ from station.contracts import (
     InvalidTransition,
     OperatorLabel,
     PartRecord,
+    Side,
     State,
     StationError,
     Thresholds,
@@ -53,7 +54,8 @@ from station.contracts import (
 )
 from station.inference import CollectModel, MarkerModel
 from station.mes_client import MesClient, MesConfig, build_request
-from station.evidence_sync import SyncQueue
+from station.defect_proposal import DefectProposal
+from station.evidence_sync import SyncQueue, planned_destination
 from station.mes_session import MesSessionClient
 from station.modelstore import ModelError, ModelStore, load_runtime_model, register_loader
 from station.outbox import Outbox
@@ -706,6 +708,18 @@ class _LockedSession:
         with self._lock:
             self._session.override(by=by, new_verdict=new_verdict, reason=reason)
 
+    def part_criteria(self) -> list:
+        return self._need_app().part_criteria()
+
+    def propose_defect(self, by: str, criterion_id: str, camera_id: str, side: str,
+                       note: str = "") -> dict:
+        # The app takes the session lock itself (it reads the part's criteria first).
+        return self._need_app().propose_defect(by=by, criterion_id=criterion_id, camera_id=camera_id,
+                                               side=side, note=note)
+
+    def remove_defect(self, criterion_id: str) -> dict:
+        return self._need_app().remove_defect(criterion_id)
+
     def label_part(self, by: str, verdict, criterion_id: Optional[str] = None,
                    part_id: Optional[str] = None) -> dict:
         # Stored parts only: the store locks itself, so the session lock is not needed.
@@ -1208,8 +1222,10 @@ class StationApp:
             if self.auth_mode == MES_MODE and not station_session:
                 # mes_ticket: a part is posted only under the inspector's MES session, never anonymously
                 raise StationError("no MES session for this part: it is not sent to the MES")
+            proposals = self.session.proposals_for(record.part_id)
+            extra: dict[str, Any] = {"proposals": proposals} if proposals else {}
             fields, files = build_request(record, self._mes_cfg_for(record.part_number),
-                                          self.store.archive_ref(part_dir))
+                                          self._archive_ref(part_dir), **extra)
             self._with_outbox(lambda ob: ob.enqueue(record.session_id, fields, files,
                                                     station_session=station_session))
         except Exception as exc:
@@ -1218,6 +1234,13 @@ class StationApp:
                 {"part_id": record.part_id, "error": str(exc) or type(exc).__name__},
                 session_id=record.session_id,
             )
+
+    def _archive_ref(self, part_dir: pathlib.Path) -> str:
+        """archiveRef for the MES post: the laptop path the part will have after sync when
+        evidence.sync is configured (planned_destination), else the local folder."""
+        if self._evidence_cfg is None:
+            return self.store.archive_ref(part_dir)
+        return planned_destination(part_dir, self._evidence_cfg["dest_root"])
 
     def sync_once(self, now: Optional[float] = None) -> dict[str, int]:
         """Drain the outbox once. Logs a 'mes_sync' event when anything was attempted."""
@@ -1524,6 +1547,39 @@ class StationApp:
                  "criterion_id": r["operator_label"].get("criterion_id"),
                  "proposed_by": r["operator_label"].get("proposed_by"),
                  "proposed_at": r["operator_label"].get("proposed_at")} for r in rows]
+
+    # ------------------------------------------------------- defect proposals
+
+    def part_criteria(self) -> list[dict]:
+        """The active criteria (id, name, description) of the part being shown; [] if none."""
+        with self._session_lock:
+            part = self._part_configs.get(self.session.part_number) if self._parts_mode == "mes" else None
+            return [dict(c) for c in part["criteria"]] if part is not None else []
+
+    def propose_defect(self, by: str, criterion_id: str, camera_id: str, side: str,
+                       note: str = "") -> dict:
+        """Add a human defect proposal to the part being shown. `by` is the logged-in inspector.
+
+        Raises ValueError (no criteria, criterion not active, picture not one of the 8, bad note),
+        InvalidTransition (the part is not shown in VERDICT or SUPERVISOR_REVIEW).
+        """
+        if not isinstance(by, str) or not by.strip():
+            raise ValueError("by is required")
+        try:
+            side_value = Side(side)
+        except ValueError:
+            raise ValueError("side must be TOP or BOTTOM") from None
+        proposal = DefectProposal(criterion_id=criterion_id, camera_id=camera_id, side=side_value, note=note)
+        with self._session_lock:
+            part = self._part_configs.get(self.session.part_number) if self._parts_mode == "mes" else None
+            criteria_ids = list(part["criteria_ids"]) if part is not None else []
+            replaced = self.session.propose_defect(proposal, by=by.strip(), criteria_ids=criteria_ids)
+        return {"replaced": replaced}
+
+    def remove_defect(self, criterion_id: str) -> dict:
+        """Remove the proposal for one criterion of the part being shown."""
+        with self._session_lock:
+            return {"removed": self.session.remove_defect(criterion_id)}
 
     def _block_part(self, part_number: str, reason: str, warnings: list[str]) -> dict:
         self.session.clear_part()

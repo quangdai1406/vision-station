@@ -68,12 +68,16 @@ def criterion_for(defect_class: str, cfg: MesConfig) -> str:
 
 
 def build_request(
-    record: PartRecord, cfg: MesConfig, archive_ref: str
+    record: PartRecord, cfg: MesConfig, archive_ref: str, proposals: Sequence[Any] = ()
 ) -> tuple[dict[str, str], list[tuple[str, str, bytes]]]:
     """Return (fields, files) for one inspection event.
 
     files is a list of (field_name, filename, data): one defect photo per failed
     criterion, named defectPhoto_<criterion_id>. No other images are included.
+
+    proposals (defect_proposal.ProposalRecord rows, optional): each one fails its criterion
+    and its chosen picture is the photo for that criterion (it replaces a photo chosen from
+    the model's defects for the same criterion).
     """
     if record.final_verdict not in (Verdict.GOOD, Verdict.BAD):
         raise ValueError(f"only GOOD or BAD can be posted, got {record.final_verdict!r}")
@@ -103,22 +107,40 @@ def build_request(
                 raise MappingError("BAD part has no defects and no default_criterion_id is set")
             failed.add(_check_criterion(cfg.default_criterion_id, cfg))
 
+    if proposals and not is_bad:
+        # A proposal makes the final verdict BAD (session rule); a GOOD post must never carry one.
+        raise ValueError("a part with defect proposals must be posted as BAD")
+    # criterion id -> the picture (camera, side) chosen for its photo
+    chosen: dict[str, tuple[str, Any]] = {}
+    for proposal in proposals:
+        _check_criterion(proposal.criterion_id, cfg)
+        failed.add(proposal.criterion_id)
+        chosen[proposal.criterion_id] = (proposal.camera_id, proposal.side)
+
     checklist = {cid: ("fail" if cid in failed else "pass") for cid in cfg.criteria_ids}
 
     photos: list[tuple[str, str, bytes]] = []
     for criterion_id in sorted(failed):
-        if criterion_id in best:
-            result = best[criterion_id][1]
+        if criterion_id in chosen:
+            key = chosen[criterion_id]
+            frame = frame_by_key.get(key)
+            if frame is None:
+                raise MappingError(
+                    f"no frame for {key[0]} {_side_value(key[1])} to attach as photo for {criterion_id}"
+                )
         else:
-            if not record.results:
-                raise MappingError("no image results to choose a defect photo from")
-            result = max(record.results, key=lambda r: r.score)
-        frame = frame_by_key.get((result.camera_id, result.side))
-        if frame is None:
-            raise MappingError(
-                f"no frame for {result.camera_id} {_side_value(result.side)} "
-                f"to attach as photo for {criterion_id}"
-            )
+            if criterion_id in best:
+                result = best[criterion_id][1]
+            else:
+                if not record.results:
+                    raise MappingError("no image results to choose a defect photo from")
+                result = max(record.results, key=lambda r: r.score)
+            frame = frame_by_key.get((result.camera_id, result.side))
+            if frame is None:
+                raise MappingError(
+                    f"no frame for {result.camera_id} {_side_value(result.side)} "
+                    f"to attach as photo for {criterion_id}"
+                )
         photos.append((
             f"defectPhoto_{criterion_id}",
             f"{frame.camera_id}_{_side_value(frame.side)}.{frame.ext}",
@@ -145,7 +167,8 @@ def build_request(
     }
     if is_bad:
         fields["rejectedQuantity"] = "1"
-        fields["rejectionReason"] = ", ".join(sorted(defect_classes)) or "supervisor decision"
+        reasons = sorted(defect_classes) + sorted({p.criterion_id for p in proposals})
+        fields["rejectionReason"] = ", ".join(sorted(set(reasons))) or "supervisor decision"
         fields["disposition"] = cfg.default_bad_disposition
     elif record.override is not None and record.override.new_verdict is Verdict.GOOD:
         fields["disposition"] = "released"
