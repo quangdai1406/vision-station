@@ -138,19 +138,27 @@ Every task follows the same steps: (1) write the failing tests named below, (2) 
 
 **Tests:** output lists each camera, a dead camera is reported by index, an unreachable laptop is reported as such.
 
-## Decisions (JEV One System, decision first)
+## Decisions (JEV One System)
 
-The owner asked me to decide for them from what I know about their job (quality work in an IATF 16949 plant, a Windows laptop that hosts the MES, one engineer running the project, Quality owning limits). Each row is decided; confidence says how sure I am; "revisit" says what would change it.
+JEV classification of this section:
 
-| # | Decision | Decided | Confidence | Revisit when |
-|---|---|---|---|---|
-| 1 | Where the model runs | Laptop GPU inference service, called from the Pi | 0.75 | `tools/pi_check` shows the Pi can score 8 images inside the operator wait limit `[Quality to define]` |
-| 2 | Inspector identity | One-time ticket and MES session, no second login on the Pi | 0.90 | never expected |
-| 3 | Human-proposed defect on an ML-GOOD part | Final verdict becomes BAD; only a supervisor can reverse it | 0.85 | Quality objects (the conservative direction for a quality plant) |
-| 4 | Who approves proposed defect labels | The Admin, in the MES. Built after the first release; until then labels stay "proposed" and training ignores them | 0.75 | the Admin wants it earlier |
-| 5 | Evidence storage | Laptop disk is the store the trainer reads; the Pi saves locally first, then copies over an SMB share. The owner deletes used GOOD pictures by hand after promotion (earlier decision) | 0.80 | disk fills faster than expected |
-| 6 | LAN security | Pilot on the plant LAN without TLS; TLS is required before the station is used outside the pilot. The MES session cookie is not marked secure today | 0.65 | the LAN is shared with guests or Wi-Fi: add TLS first |
-| 7 | Session length, ticket life, clock skew | 10 minutes sliding (the MES idle logout), 60 seconds single use, 5 minutes skew. Engineering defaults, not quality limits | 0.80 | operators complain about relogins |
-| 8 | Roles allowed on the Pi | `inspector` becomes operator, `supervisor` becomes supervisor; no other role | 0.85 | the plant wants Quality Engineers on the line |
+```json
+{"task_complexity": "medium", "decision_type": "judgment", "tier": 2, "confidence_bar": 0.85, "escalation_needed": true}
+```
+
+The owner asked me to decide for them from what I know about their job (quality work in an IATF 16949 plant, a Windows laptop that hosts the MES, one engineer running the project, Quality owning limits). Confidence is my judgment. Routing rule: 0.85 or higher = execute; 0.70 to 0.84 = decided, the owner approves before the dependent task starts; below 0.70 = escalate to the owner with a question.
+
+| # | Decision | Decided | Confidence | Route | Revisit when |
+|---|---|---|---|---|---|
+| 1 | Where the model runs | Laptop GPU inference service, called from the Pi | 0.75 | ask | `tools/pi_check` shows the Pi can score 8 images inside the operator wait limit `[Quality to define]` |
+| 2 | Inspector identity | One-time ticket and MES session, no second login on the Pi | 0.90 | execute | never expected |
+| 3 | Human-proposed defect on an ML-GOOD part | Final verdict becomes BAD; only a supervisor can reverse it | 0.85 | execute | Quality objects |
+| 4 | Who approves proposed defect labels | The Admin, in the MES, built after the first release; until then labels stay "proposed" and training ignores them | 0.75 | ask | the Admin wants it earlier |
+| 5 | Evidence storage | Laptop disk is the store the trainer reads; the Pi saves locally first, then copies over an SMB share; the owner deletes used GOOD pictures by hand after promotion | 0.80 | ask | the disk fills faster than expected |
+| 6 | LAN security | Pilot on the plant LAN without TLS; TLS before use outside the pilot (the MES cookie is not marked secure today) | 0.65 | escalate | the owner confirms whether the LAN is isolated from guests and Wi-Fi; if not, add TLS first |
+| 7 | Session length, ticket life, clock skew | 10 minutes sliding (the MES idle logout), 60 seconds single use, 5 minutes skew; engineering defaults, not quality limits | 0.80 | ask | operators complain about relogins |
+| 8 | Roles allowed on the Pi | `inspector` becomes operator, `supervisor` becomes supervisor; no other role | 0.85 | execute | the plant wants Quality Engineers on the line |
+
+Escalated (owner must answer): decision 6, is the plant LAN isolated from guests and Wi-Fi? Needs approval before its tasks start: decisions 1, 4, 5 and 7. Safe to execute now: decisions 2, 3 and 8.
 
 Still `[Quality to define]`: the operator wait limit, `t_img`, `t_low`, `min_good`, `min_holdout`, `holdout_fraction`, defect codes. Still `[Engineer to define]` after measuring: the `RemoteModel` timeout, the laptop LAN address, the backup folder.
