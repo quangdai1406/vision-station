@@ -33,7 +33,8 @@ as `[Quality to define]`.
      |    1. read trainer.json, refuse if any value is a placeholder
      |    2. evidence folder exists, is not empty, has no online-only files
      |    3. nvidia-smi check (warning only)
-     |    4. python -m trainer weekly  ->  CANDIDATE model in models/ + report in reports/
+     |    3b. inference service busy? then exit 4, nothing trained (laptop_services.md)
+     |    4. python -m trainer weekly at BelowNormal priority  ->  CANDIDATE model in models/ + report in reports/
      |    5. transcript log in the logs folder (last 26 kept), exit code
      v
  Monday: Quality reviews the report in reports/ (approves or rejects the candidate)
@@ -83,7 +84,9 @@ The scheduled task never promotes and never purges.
    notepad "$env:USERPROFILE\VisionStation\trainer.json"
    ```
 
-   Every value that starts with `[` must be replaced. `min_good`, `min_holdout` and
+   `inference_health_url` is optional: set it to the inference service's health URL, or delete
+   the line when there is no inference service (see `docs/laptop_services.md`).
+   Every other value that starts with `[` must be replaced. `min_good`, `min_holdout` and
    `holdout_fraction` come from Quality. `holdout_fraction` is the share of the labelled data
    kept back for testing; it must be a number strictly between 0 and 1. The trainer's
    `weekly` command requires it (no default). Do not invent any of the three. Never put a
@@ -125,7 +128,8 @@ The scheduled task never promotes and never purges.
    ```
 
    `LastTaskResult` should be `0`. A value of `3` is a preflight failure (config, evidence or
-   OneDrive). Any other value is the trainer's own exit code.
+   OneDrive). The wrapper uses a distinct code: exit code `4` means the inference service was
+   busy, so nothing was trained. Any other value is the trainer's own exit code.
 2. **Newest log.** Open the newest `weekly-*.log` in the logs folder. Check the start time,
    the evidence file count, the GPU line and the final `Trainer exit code: 0`.
 3. **Report.** Open the newest `weekly-YYYY-MM-DD.json` and `.txt` files in `reports\`. Send it to Quality. Do not summarise it
@@ -173,6 +177,8 @@ The scheduled task never promotes and never purges.
 | `CUDA out of memory` in the log | Batch or input size too large for 8 GB | Lower the batch size or `extractor.input_hw` in the trainer settings. Use a size the engineer has tested on this laptop. The value is an engineering setting, not a Quality limit. |
 | `nvidia-smi not found` warning | Driver not installed, or not on PATH | Reinstall the NVIDIA driver. The run continues only if the trainer can still use the device in the config. |
 | Exit code `3` with `FAILED:` line | A preflight check failed. Nothing was trained | Read the `FAILED:` line in the log and fix that item. |
+| Exit code `4` (`REFUSED: the inference service reports a request in progress`) | The inference service is busy. Nothing was trained | Expected during station use. Start the task again when the service is idle, or run the script by hand. |
+| Log says `inference service unreachable` | The health URL did not answer within 5 seconds | Training continues without the busy check. Check the inference service is running (`docs/laptop_services.md`). |
 | Trainer reports counts below `min_good` or `min_holdout` | Not enough labelled parts yet | Expected until Quality's minimums are met. Quality decides whether to collect more. No candidate should be produced. (Check the trainer's actual output once it exists.) |
 
 ## 7. Deleting used pictures (by the owner, by hand, after promotion)
@@ -208,6 +214,8 @@ good.
   Test it once: set a file to online-only on purpose and run the evidence check.
 - A full run on real evidence. The first run is a supervised run, not an unattended one.
 - The time a full weekly run takes. Measure it on the first two runs.
+- Whether BelowNormal priority slows the trainer too much, or leaves the inference service and
+  the MES responsive enough. Measure both on the first two runs.
 
 ## 9. Open decisions
 

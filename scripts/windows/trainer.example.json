@@ -11,6 +11,7 @@
     "weights_path": "[Engineer to define: local path of the extractor weights file]",
     "device": "[Engineer to define: cuda or cpu]"
   },
+  "inference_health_url": "[Engineer to define: health URL of the inference service on this laptop, or delete this line if there is no inference service]",
   "min_good": "[Quality to define]",
   "min_holdout": "[Quality to define]",
   "holdout_fraction": "[Quality to define]"
