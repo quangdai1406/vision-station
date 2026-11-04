@@ -133,8 +133,9 @@ unapproved or tampered model, with no fallback to an older one.
   sync only reports and models.
 - **D3. Defect names.** Do you want the operator to pick a defect type (burned, torn, short,
   slugs) when a part is BAD? That gives labelled data for later defect-type models. Not built.
-- **D4. Retention.** Quality records need a retention period. How long must GOOD pictures stay
-  before purge is allowed? `[Quality to define]`.
+- **D4. Retention. DECIDED (2026-11-04).** The owner confirmed GOOD pictures may be deleted after
+  training. The owner deletes them by hand; the weekly task never deletes. BAD, overridden and
+  held-out pictures are kept. Deleting is only safe after the candidate is promoted (section 11).
 - **D5. Training bias.** Strict GOOD leaves out parts that an operator overrode. Decide whether
   borderline parts may join training.
 - **D6. Folder permissions.** Who can read `Quality/Automotive/VisionStation`? It holds
@@ -142,3 +143,23 @@ unapproved or tampered model, with no fallback to an older one.
 - **D7. Roles.** The station has operator, supervisor and admin. Do you want a read-only role?
 - **D8. Part types.** Part number to model mapping is one model per part number. If several part
   numbers share one look, they could share a model. Not built.
+
+## 11. Decisions made (2026-11-04) and progress
+
+- **Who approves a model:** the Admin. The Admin runs `python -m trainer promote` with their own
+  name and a reason. The weekly task never promotes.
+- **Deleting pictures:** the owner deletes them by hand, not automatically. GOOD pictures may be
+  deleted. Rule: delete only after the candidate that used them is promoted, because the next weekly
+  run starts from the approved model and reads only pictures newer than it. `purge` now enforces
+  this: it refuses when the candidate is not on the approved history.
+- **Laptop role:** this laptop (i7 10th gen, 32 GB RAM, 8 GB GPU) is the weekly training station.
+
+| Item | Status |
+|---|---|
+| Part-number flow, live-view fix, model store, trainer, promote, rollback, purge, scheduler scripts, runbook | Done, merged to `main`, tested with fakes (1062 tests) |
+| Sequential capture for a USB hub, hub test | Done, merged, tested with fakes |
+| Purge refuses unapproved or rolled-back candidates | Done |
+| `python -m trainer selftest` on this laptop | Not done: first real GPU test |
+| First supervised weekly run on real pictures | Not done |
+| Hub test and 4-camera check on the station PC | Not done |
+| Quality's numbers (`min_good`, `min_holdout`, `holdout_fraction`, `t_img`, `t_low`) | Not set: `[Quality to define]` |

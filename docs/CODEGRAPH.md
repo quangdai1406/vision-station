@@ -10,12 +10,13 @@ python3 .claude/skills/code-graph/scripts/gen_codegraph_doc.py [--check]
 
 Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` tests need numpy, no camera or network). Station core is standard library only; `tools/` imports numpy/opencv lazily.
 
-42 code files, 45 test files, 233 import edges.
+43 code files, 45 test files, 233 import edges.
 
 ## Modules
 
 | File | Lines | Imported by | Tests reaching it | Purpose (first docstring/comment line) |
 |---|---:|---:|---:|---|
+| `scripts/gen_code_index.py` | 81 | 0 | 0 | Write docs/CODE_INDEX.md: every Python file and its classes and functions, one line each. |
 | `station/__init__.py` | 1 | 0 | 0 |  |
 | `station/__main__.py` | 95 | 2 | 2 | Entry point. |
 | `station/anomaly.py` | 841 | 6 | 14 | PatchCore-style anomaly detection trained on GOOD parts only. |
@@ -54,7 +55,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `trainer/__main__.py` | 193 | 3 | 3 | Command line for the weekly trainer: ``python3 -m trainer <command> ...``. |
 | `trainer/dataset.py` | 565 | 7 | 5 | Dataset reader for the weekly trainer. |
 | `trainer/promote.py` | 242 | 1 | 1 | Human-approved promotion and rollback of part models: ``python3 -m trainer promote/rollback/versions``. |
-| `trainer/purge.py` | 538 | 2 | 2 | Delete the pictures of GOOD parts that a verified training run already used. |
+| `trainer/purge.py` | 546 | 2 | 2 | Delete the pictures of GOOD parts that a verified training run already used. |
 | `trainer/scans.py` | 268 | 3 | 4 | Scan reader for the weekly trainer (Taking data mode, plan step 6). |
 | `trainer/selftest.py` | 239 | 1 | 1 | ``python3 -m trainer selftest [--extractor-config FILE]``: first run of the torch feature extractor. |
 | `trainer/weekly.py` | 916 | 4 | 4 | Weekly PatchCore candidates for the trainer: ``python3 -m trainer weekly ...``. |
@@ -72,6 +73,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 
 ## Internal imports (who imports what)
 
+- `scripts/gen_code_index.py` -> (no internal imports)
 - `station/__init__.py` -> (no internal imports)
 - `station/__main__.py` -> `station/app.py`, `station/cameras.py`, `station/inference.py`, `station/outputs.py`, `station/teach.py`, `station/users_cli.py`
 - `station/anomaly.py` -> `station/contracts.py`
@@ -165,11 +167,11 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 
 ## Code with no test reaching it
 
-None.
+`scripts/gen_code_index.py`
 
 ## External packages (code files importing each)
 
-`__future__` (35), `typing` (35), `json` (25), `pathlib` (19), `sys` (18), `argparse` (17), `datetime` (16), `dataclasses` (15), `os` (15), `time` (13), `re` (10), `numpy` (9), `threading` (9), `cv2` (8), `hashlib` (8), `math` (6), `tempfile` (6), `collections` (5), `http` (5), `urllib` (5), `contextlib` (4), `shutil` (4), `csv` (3), `enum` (3), `importlib` (3), `io` (3), `uuid` (3), `base64` (2), `hmac` (2), `random` (2), `sqlite3` (2), `statistics` (2), `torch` (2), `unicodedata` (2), `zipfile` (2), `email` (1), `getpass` (1), `mimetypes` (1), `onnxruntime` (1), `platform` (1), `secrets` (1), `signal` (1), `torchvision` (1), `traceback` (1)
+`__future__` (36), `typing` (35), `json` (25), `pathlib` (20), `sys` (19), `argparse` (17), `datetime` (16), `dataclasses` (15), `os` (15), `time` (13), `re` (10), `numpy` (9), `threading` (9), `cv2` (8), `hashlib` (8), `math` (6), `tempfile` (6), `collections` (5), `http` (5), `urllib` (5), `contextlib` (4), `shutil` (4), `csv` (3), `enum` (3), `importlib` (3), `io` (3), `uuid` (3), `base64` (2), `hmac` (2), `random` (2), `sqlite3` (2), `statistics` (2), `torch` (2), `unicodedata` (2), `zipfile` (2), `ast` (1), `email` (1), `getpass` (1), `mimetypes` (1), `onnxruntime` (1), `platform` (1), `secrets` (1), `signal` (1), `torchvision` (1), `traceback` (1)
 
 ## What the graph cannot see
 
