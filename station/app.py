@@ -24,7 +24,13 @@ import time
 from dataclasses import replace
 from typing import Any, Callable, Mapping, Optional
 
-from station.auth import SessionManager, UserStore, load_users
+from station.auth import (
+    AUTH_MODES,
+    SessionManager,
+    UserStore,
+    load_users,
+    validate_role_map,
+)
 from station.cameras import (STALE_FLUSH_FRAMES, FakeCameraSet, OpenCvCameraSet, make_blur_check,
                              utc_now_iso)
 from station.contracts import (
@@ -46,6 +52,7 @@ from station.contracts import (
 )
 from station.inference import CollectModel, MarkerModel
 from station.mes_client import MesClient, MesConfig, build_request
+from station.mes_session import MesSessionClient
 from station.modelstore import ModelError, ModelStore, load_runtime_model, register_loader
 from station.outbox import Outbox
 from station.outputs import ConsoleOutputs, SerialRelayOutputs
@@ -55,7 +62,7 @@ from station.scanstore import ScanStore
 from station.session import StationSession
 from station.storage import (COLLECTED, Store, check_criterion_id, check_reject_reason,
                              label_status)
-from station.ui import make_server
+from station.ui import MES_MODE, make_server
 
 DEFAULT_UI_PORT = 8000
 DEFAULT_SESSION_TIMEOUT_S = 900.0
@@ -79,7 +86,8 @@ _REQUIRED_KEYS = (
     "model", "outputs",
 )
 # part_number is required in 'fixed' mode only (checked in validate_config).
-_OPTIONAL_KEYS = ("part_number", "parts", "ui", "flip_timeout_s", "min_flip_s", "frame_ok", "scan")
+_OPTIONAL_KEYS = ("part_number", "parts", "ui", "flip_timeout_s", "min_flip_s", "frame_ok", "scan",
+                  "auth")
 _ALL_KEYS = _REQUIRED_KEYS + _OPTIONAL_KEYS
 _STRING_KEYS = (
     "site", "line", "station_id", "lot", "operator", "supervisor",
@@ -210,6 +218,28 @@ def _validate_mes(raw: Any) -> dict:
         "allow_partial_cameras": _bool(mes.get("allow_partial_cameras", False),
                                        "mes.allow_partial_cameras"),
     }
+
+
+def _validate_auth(raw: Any) -> dict:
+    """auth.mode 'local' (username and password) or 'mes_ticket' (one-time tickets from the MES)."""
+    if raw is None:
+        return {"mode": "local", "role_map": None}
+    auth = _obj(raw, "auth")
+    _check_keys(auth, ("mode", "role_map"), "auth", required=("mode",))
+    mode = auth["mode"]
+    if mode not in AUTH_MODES:
+        raise ConfigError("auth.mode must be 'local' or 'mes_ticket'")
+    if mode == "local":
+        if auth.get("role_map") is not None:  # None is what validate_config itself writes back
+            raise ConfigError("auth.role_map is only used when auth.mode is 'mes_ticket': remove it")
+        return {"mode": "local", "role_map": None}
+    if "role_map" not in auth:
+        raise ConfigError("auth.role_map is required when auth.mode is 'mes_ticket'")
+    try:
+        role_map = validate_role_map(auth["role_map"])
+    except ValueError as exc:
+        raise ConfigError(f"auth.{exc}") from None
+    return {"mode": mode, "role_map": role_map}
 
 
 def _validate_cameras(raw: Any) -> dict:
@@ -458,6 +488,7 @@ def validate_config(data: Any) -> dict:
         frame_ok = {"min_variance": _number(frame_ok["min_variance"], "frame_ok.min_variance", lo=0.0)}
     out["frame_ok"] = frame_ok
     out["scan"] = _validate_scan(cfg.get("scan"))
+    out["auth"] = _validate_auth(cfg.get("auth"))
     return out
 
 
@@ -593,13 +624,15 @@ class _LockedSession:
             raise StationError("part selection is not wired to a station")
         return self._app
 
-    def press(self) -> bool:
+    def press(self, by: Optional[str] = None, station_session: Optional[str] = None) -> bool:
         # The inverse of the scan start guard: no inspection press while a scan is active.
         # Refused presses return False, as the session does for an ignored press.
         with self._lock:
             if self._app is not None and self._app.scan_blocks_press():
                 return False
-            return self._session.press()
+            if by is None and station_session is None:
+                return self._session.press()
+            return self._session.press(by=by, station_session=station_session)
 
     def ack_alarm(self) -> None:
         with self._lock:
@@ -800,6 +833,8 @@ class StationApp:
 
         if demo and self._parts_mode == "mes":
             raise ConfigError("the demo station uses the demo model: set parts.mode to 'fixed' for --demo")
+        if demo and cfg["auth"]["mode"] == MES_MODE:
+            raise ConfigError("the demo station cannot use auth.mode 'mes_ticket'")
 
         # Devices and model first: a failure here leaves nothing open.
         cameras = cameras if cameras is not None else self._make_cameras(cfg)
@@ -891,6 +926,7 @@ class StationApp:
             default_bad_disposition=mes["default_bad_disposition"],
         )
         self._client = MesClient(self._mes_cfg) if self.mes_enabled else None
+        self.auth_mode: str = cfg["auth"]["mode"]
         # Part search needs the token too, whatever demo or partial rules say about posting.
         self._parts_client = (MesPartsClient(mes["base_url"], token)
                               if self._parts_mode == "mes" and token else None)
@@ -962,18 +998,42 @@ class StationApp:
             )
             self.scan = _LockedScan(self._scan_session, self._session_lock)
 
-        try:
-            users = load_users(cfg["users_file"])
-        except FileNotFoundError as exc:
-            raise StationError(
-                f"users file not found: {cfg['users_file']} "
-                "(create users with: python -m station users add <username> <role>)"
-            ) from exc
+        mes_auth: Optional[MesSessionClient] = None
+        on_expire = None
+        if self.auth_mode == MES_MODE:
+            # Inspectors log in from the MES: no local users. The MES token comes from the same
+            # environment variable as posting; an idle or expired session ends the MES session.
+            if not token:
+                raise ConfigError(
+                    f"auth.mode 'mes_ticket' needs the MES token: set the environment variable "
+                    f"{mes['token_env']}"
+                )
+            mes_auth = MesSessionClient(mes["base_url"], token)
+
+            def on_expire(_token: str, _username: str, mes_session: Optional[str]) -> None:
+                if mes_session is None:
+                    return
+                try:
+                    mes_auth.end(mes_session)
+                except Exception:  # the station session is already gone; the MES expires it
+                    pass
+
+            users = UserStore({})
+        else:
+            try:
+                users = load_users(cfg["users_file"])
+            except FileNotFoundError as exc:
+                raise StationError(
+                    f"users file not found: {cfg['users_file']} "
+                    "(create users with: python -m station users add <username> <role>)"
+                ) from exc
         self.users: UserStore = users
-        self.sessions = SessionManager(timeout_s=cfg["ui"]["session_timeout_s"])
+        self.sessions = SessionManager(timeout_s=cfg["ui"]["session_timeout_s"], on_expire=on_expire)
         self._locked = _LockedSession(self.session, self._session_lock, self)
         self.server = make_server(self._locked, users, self.sessions,
-                                  host=cfg["ui"]["host"], port=cfg["ui"]["port"], scan=self.scan)
+                                  host=cfg["ui"]["host"], port=cfg["ui"]["port"], scan=self.scan,
+                                  auth_mode=self.auth_mode, mes_auth=mes_auth,
+                                  role_map=cfg["auth"]["role_map"])
 
     # ------------------------------------------------------- Taking data
 
@@ -1017,9 +1077,14 @@ class StationApp:
             part_dir = self.store._known_path(record.session_id)
             if part_dir is None:
                 raise StationError("saved part is not in the store index")
+            station_session = self.session.station_session_for(record.part_id)
+            if self.auth_mode == MES_MODE and not station_session:
+                # mes_ticket: a part is posted only under the inspector's MES session, never anonymously
+                raise StationError("no MES session for this part: it is not sent to the MES")
             fields, files = build_request(record, self._mes_cfg_for(record.part_number),
                                           self.store.archive_ref(part_dir))
-            self._with_outbox(lambda ob: ob.enqueue(record.session_id, fields, files))
+            self._with_outbox(lambda ob: ob.enqueue(record.session_id, fields, files,
+                                                    station_session=station_session))
         except Exception as exc:
             self.store.append_event(
                 "mes_enqueue_failed",

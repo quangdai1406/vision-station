@@ -198,6 +198,10 @@ class StationSession:
         self._lot = lot
         self._operator = operator
         self._supervisor = supervisor
+        # mes_ticket mode: the inspector who pressed the top side (None: the configured operator
+        # is used) and the MES session of each part, kept until the part is handed to on_complete.
+        self._part_operator: Optional[str] = None
+        self._station_session_by_part: dict[str, str] = {}
         self._material_handler = material_handler
         self._flip_timeout_s = flip_timeout_s
         if min_flip_s < 0:
@@ -229,7 +233,10 @@ class StationSession:
 
     # ------------------------------------------------------------------ public
 
-    def press(self) -> bool:
+    def press(self, by: Optional[str] = None, station_session: Optional[str] = None) -> bool:
+        """One press. by / station_session are the logged-in inspector and their MES session
+        (mes_ticket mode); the part is recorded under the inspector who pressed the top side.
+        A different inspector at the flip faults the part: it is never recorded under their name."""
         if self.state is State.IDLE and not self.can_inspect:
             self._log("press_ignored", {"reason": "no_part_or_model", "state": self.state.value,
                                         "block_reason": self._block_reason},
@@ -251,11 +258,23 @@ class StationSession:
                       session_id=self._active_session_id())
             return False
 
+        if (self.state is State.WAIT_FLIP and by is not None and self._part_operator is not None
+                and by != self._part_operator):
+            self._station_session_by_part.pop(self._part_id, None)
+            self._fail(StationError(
+                "another inspector pressed the flip for this part, so it is not recorded under "
+                "their name. Clear the fault to discard the part."),
+                stage="inspector_changed", return_state=None)
+            return False
+
         self._last_press = now
         try:
             if self.state is State.IDLE:
                 self._outputs.clear()
                 self._begin_part()
+                self._part_operator = by
+                if by is not None and station_session is not None:
+                    self._station_session_by_part[str(self._part_id)] = station_session
                 self._log("press", {"side": Side.TOP.value, "part_id": self._part_id, **self._station_fields()},
                           session_id=self._session_id)
                 if self._run_side(Side.TOP, fail_state=State.IDLE):
@@ -695,7 +714,7 @@ class StationSession:
             station_id=self._station_id,
             part_number=self._part_number,
             lot=self._lot,
-            operator=self._operator,
+            operator=self._part_operator or self._operator,
             supervisor=self._supervisor,
             material_handler=self._material_handler,
             started_utc=self._started_utc,
@@ -718,6 +737,10 @@ class StationSession:
         self._log("fault", {"stage": stage, "error": text,
                             "return_state": return_state.value if return_state is not None else "retry_save"},
                   session_id=self._session_id)
+
+    def station_session_for(self, part_id: str) -> Optional[str]:
+        """The MES session the part was started in (mes_ticket mode), once. None otherwise."""
+        return self._station_session_by_part.pop(part_id, None)
 
     @staticmethod
     def _check_decision(by: str, new_verdict: Verdict, reason: str) -> Verdict:

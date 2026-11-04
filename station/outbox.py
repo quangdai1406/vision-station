@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS items (
     last_error    TEXT,
     mes_event_id  INTEGER,
     created_at    REAL NOT NULL,
-    sent_at       REAL
+    sent_at       REAL,
+    station_session TEXT
 )
 """
 
@@ -48,6 +49,10 @@ class Outbox:
         self._db.row_factory = sqlite3.Row
         with self._db:
             self._db.execute(_SCHEMA)
+            # Additive migration: outboxes made before the MES session column existed.
+            cols = {row["name"] for row in self._db.execute("PRAGMA table_info(items)")}
+            if "station_session" not in cols:
+                self._db.execute("ALTER TABLE items ADD COLUMN station_session TEXT")
 
     def close(self) -> None:
         self._db.close()
@@ -57,8 +62,10 @@ class Outbox:
         session_id: str,
         fields: dict[str, str],
         files: Sequence[tuple[str, str, bytes]],
+        station_session: Optional[str] = None,
     ) -> bool:
-        """Store one post. Returns False (and changes nothing) if session_id is already queued."""
+        """Store one post. Returns False (and changes nothing) if session_id is already queued.
+        station_session is the inspector's MES session, sent as the Station-Session header."""
         if not _SESSION_ID_RE.match(session_id):
             raise ValueError(f"unsafe session_id: {session_id!r}")
         if self._db.execute(
@@ -77,14 +84,16 @@ class Outbox:
         with self._db:
             cur = self._db.execute(
                 "INSERT OR IGNORE INTO items "
-                "(session_id, fields_json, files_json, status, attempts, next_attempt, created_at) "
-                "VALUES (?, ?, ?, ?, 0, 0, ?)",
+                "(session_id, fields_json, files_json, status, attempts, next_attempt, created_at, "
+                "station_session) "
+                "VALUES (?, ?, ?, ?, 0, 0, ?, ?)",
                 (
                     session_id,
                     json.dumps(dict(fields), sort_keys=True),
                     json.dumps(file_rows),
                     STATUS_PENDING,
                     time.time(),
+                    station_session,
                 ),
             )
         return cur.rowcount == 1
@@ -116,7 +125,10 @@ class Outbox:
                 continue
 
             try:
-                result: PostResult = client.post(fields, files, idempotency_key=row["session_id"])
+                # Only mes_ticket parts carry a session; other posts keep the plain call.
+                extra = {"station_session": row["station_session"]} if row["station_session"] else {}
+                result: PostResult = client.post(fields, files, idempotency_key=row["session_id"],
+                                                 **extra)
             except Exception as e:  # never lose the queue to a client bug; retry later
                 result = PostResult(
                     status=0, ok=False, replay=False, event_id=None,

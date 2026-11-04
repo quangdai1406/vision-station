@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 import urllib.error
 import urllib.request
 import uuid
@@ -18,6 +19,7 @@ from typing import Any, Mapping, Optional, Sequence
 from station.contracts import Frame, ImageResult, PartRecord, StationError, Verdict
 
 EVENTS_PATH = "/api/machine/inspection-events"
+_STATION_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 class MappingError(StationError):
@@ -207,19 +209,27 @@ class MesClient:
         fields: Mapping[str, str],
         files: Sequence[tuple[str, str, bytes]],
         idempotency_key: str,
+        station_session: Optional[str] = None,
     ) -> PostResult:
+        """POST one inspection event. station_session (the MES session id of the inspector)
+        is sent as the Station-Session header when given; the Idempotency-Key stays session_id."""
+        if station_session is not None and not _STATION_SESSION_RE.match(station_session):
+            raise ValueError("station_session is not a valid MES session id")
         boundary = uuid.uuid4().hex
         body = _encode_multipart(fields, files, boundary)
+        headers = {
+            "Authorization": f"Bearer {self.cfg.token}",
+            "Idempotency-Key": idempotency_key,
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/json",
+        }
+        if station_session is not None:
+            headers["Station-Session"] = station_session
         req = urllib.request.Request(
             self.cfg.base_url.rstrip("/") + EVENTS_PATH,
             data=body,
             method="POST",
-            headers={
-                "Authorization": f"Bearer {self.cfg.token}",
-                "Idempotency-Key": idempotency_key,
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "Accept": "application/json",
-            },
+            headers=headers,
         )
         try:
             with self._opener.open(req, timeout=self.cfg.timeout_s) as resp:

@@ -11,7 +11,7 @@ import json
 import secrets
 import threading
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 SCRYPT_N = 2**14
 SCRYPT_R = 8
@@ -90,6 +90,38 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(actual, expected)
 
 
+# Login modes. "local" is the username/password login; "mes_ticket" takes a one-time ticket
+# from the MES and never accepts a local password.
+AUTH_MODES = ("local", "mes_ticket")
+
+
+def validate_role_map(role_map: Any) -> dict[str, str]:
+    """Check an auth.role_map: MES role name -> station role. Raises ValueError."""
+    if not isinstance(role_map, Mapping) or not role_map:
+        raise ValueError("role_map must be a non-empty object")
+    out: dict[str, str] = {}
+    for mes_role, station_role in role_map.items():
+        if not isinstance(mes_role, str) or not mes_role.strip():
+            raise ValueError("role_map keys must be non-empty MES role names")
+        if station_role not in ROLES:
+            raise ValueError(f"role_map[{mes_role!r}] must be one of {', '.join(ROLES)}")
+        out[mes_role] = station_role
+    return out
+
+
+def map_role(role_map: Mapping[str, str], mes_roles: Any) -> Optional[str]:
+    """The station role for a user's MES roles, or None when no role is in the map.
+
+    When several MES roles map to station roles, the most privileged one wins.
+    """
+    if not isinstance(mes_roles, (list, tuple)):
+        return None
+    mapped = [role_map[r] for r in mes_roles if isinstance(r, str) and r in role_map]
+    if not mapped:
+        return None
+    return max(mapped, key=ROLES.index)
+
+
 def role_allows(role: str, action: str) -> bool:
     """Policy check: may a user with `role` perform `action`?"""
     allowed = _POLICY.get(role)
@@ -138,29 +170,38 @@ def load_users(path: str) -> UserStore:
 
 
 class SessionManager:
-    """Opaque tokens that expire after `timeout_s` without a `get`."""
+    """Opaque tokens that expire after `timeout_s` without a `get`.
 
-    def __init__(self, timeout_s: float, clock: Callable[[], float] = time.monotonic):
+    A session may carry the MES session id it was made from (mes_ticket mode). When a
+    session expires, `on_expire(token, username, mes_session)` is called once, outside the
+    lock, so the caller can end the MES session. It is not called for destroy().
+    """
+
+    def __init__(self, timeout_s: float, clock: Callable[[], float] = time.monotonic,
+                 on_expire: Optional[Callable[[str, str, Optional[str]], None]] = None):
         if timeout_s <= 0:
             raise ValueError("timeout_s must be positive")
         self._timeout = float(timeout_s)
         self._clock = clock
+        self._on_expire = on_expire
         self._lock = threading.Lock()
-        # token -> [username, role, last_seen]
+        # token -> [username, role, last_seen, mes_session]
         self._sessions: dict[str, list] = {}
 
-    def create(self, username: str, role: str) -> str:
+    def create(self, username: str, role: str, mes_session: Optional[str] = None) -> str:
         token = secrets.token_urlsafe(32)
         with self._lock:
             now = self._clock()
-            self._prune_locked(now)
-            self._sessions[token] = [username, role, now]
+            expired = self._prune_locked(now)
+            self._sessions[token] = [username, role, now, mes_session]
+        self._notify(expired)
         return token
 
     def get(self, token: str) -> Optional[tuple[str, str]]:
         """Return (username, role) and refresh the timer, or None if unknown or expired."""
         if not isinstance(token, str) or not token:
             return None
+        expired = []
         with self._lock:
             entry = self._sessions.get(token)
             if entry is None:
@@ -168,15 +209,37 @@ class SessionManager:
             now = self._clock()
             if now - entry[2] >= self._timeout:
                 del self._sessions[token]
-                return None
-            entry[2] = now
-            return entry[0], entry[1]
+                expired.append((token, entry[0], entry[3]))
+                result = None
+            else:
+                entry[2] = now
+                result = (entry[0], entry[1])
+        self._notify(expired)
+        return result
+
+    def mes_session(self, token: str) -> Optional[str]:
+        """The MES session id bound to a live token. Does not refresh the timer."""
+        if not isinstance(token, str) or not token:
+            return None
+        with self._lock:
+            entry = self._sessions.get(token)
+            return entry[3] if entry is not None else None
 
     def destroy(self, token: str) -> None:
         with self._lock:
             self._sessions.pop(token, None)
 
-    def _prune_locked(self, now: float) -> None:
-        expired = [t for t, entry in self._sessions.items() if now - entry[2] >= self._timeout]
-        for token in expired:
-            del self._sessions[token]
+    def _prune_locked(self, now: float) -> list:
+        expired = []
+        for token, entry in list(self._sessions.items()):
+            if now - entry[2] >= self._timeout:
+                del self._sessions[token]
+                expired.append((token, entry[0], entry[3]))
+        return expired
+
+    def _notify(self, expired: list) -> None:
+        if self._on_expire is None:
+            return
+        for token, username, mes_session in expired:
+            if mes_session is not None:
+                self._on_expire(token, username, mes_session)
