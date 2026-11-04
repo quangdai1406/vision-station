@@ -10,7 +10,7 @@
 
 **Spec:** the owner's request (2026-11-04) and answers: MES has defect criteria per part number; the cameras run on a Raspberry Pi; inspectors log in to the MES and then choose the 4-camera system; the laptop stays the ML trainer and PostgreSQL server. Existing design: `docs/PLAN_multi_part_system.md`, `aisi_mes/docs/vision-station-integration.md`.
 
-Status: plan only; nothing is built. Unproven: the Pi has never run the station, the inference service does not exist, the ticket flow is untested, and Pi-to-laptop latency and 4-camera USB power are unmeasured. The `jev-system-one` skill is not available here, so the Decisions section is written by hand.
+Status: all 11 tasks are built and tested with fakes, and the MES side was also exercised against the real MES on a scratch database (final checker, 2026-11-04). Unproven: nothing has run on a Pi, a GPU, Windows or a real hub; Pi-to-laptop latency and 4-camera USB power are unmeasured. The `jev-system-one` skill is not available here, so the Decisions section is written by hand.
 
 ## Global Constraints
 
@@ -92,7 +92,7 @@ Every task follows the same steps: (1) write the failing tests named below, (2) 
 
 **Files:** create `station/defect_proposal.py`; modify `station/ui.py`, `station/session.py`, `station/app.py`; test `tests/test_defect_proposal.py`.
 
-**Interfaces:** `DefectProposal(criterion_id: str, camera_id: str, side: Side, note: str)`; `POST /api/part/defects` adds a proposal to the part being shown (VERDICT state). The final post sets `checklistResults[criterion_id]` to fail and attaches `defectPhoto_<criterion_id>` with the chosen picture (ML boxes drawn when present). Rules: criteria come from `GET /criteria/:part` (M3); proposals on BAD and REVIEW parts only (owner decision: a defect on a part the model passed is a later task; GOOD timing and the green light are unchanged); a proposal makes the final verdict BAD (moves toward BAD only; turning BAD back to GOOD still needs the supervisor override that exists); the proposal is stored with the existing `OperatorLabel` flow (status `proposed`, approved by an Admin) so approved labels become labelled BAD examples for training (this also answers open decision D3 in the plan). Uses `OperatorLabel` as is; if its fields do not fit, stop and ask before touching `contracts.py`.
+**Interfaces:** `DefectProposal(criterion_id: str, camera_id: str, side: Side, note: str)`; `POST /api/part/defects` adds a proposal to the part being shown (VERDICT state). The final post sets `checklistResults[criterion_id]` to fail and attaches `defectPhoto_<criterion_id>` with the chosen picture (ML boxes drawn when present). Rules: criteria come from `GET /criteria/:part` (M3); proposals on BAD and REVIEW parts only (owner decision: a defect on a part the model passed is a later task; GOOD timing and the green light are unchanged); a proposal makes the final verdict BAD (moves toward BAD only; turning BAD back to GOOD still needs the supervisor override that exists); the proposal is stored in `part.json` under `defect_proposals` (storage only allows `operator_label` on collected parts), so training never sees it; Admin approval and turning approved proposals into labelled BAD examples (open decision D3 in the plan) are a later task in the MES.
 
 **Tests:** inactive or unknown criterion refused; part with no criteria refuses with a clear message; one photo per criterion; ML-GOOD plus a proposal posts BAD with the photo; the label is saved with status `proposed` and never reaches training until approved; REVIEW rules unchanged.
 

@@ -13,7 +13,7 @@ The laptop hosts four things that must not fight for the same resources:
 |---|---|---|---|
 | PostgreSQL | MES database | Windows service installed by the PostgreSQL installer; set Startup type to **Automatic** in services.msc. Service name: `[Engineer to define: service name]` | low |
 | MES (Node/Express) | inspector web app and machine API | `[Engineer to define: Windows service or scheduled task "At startup", whichever the engineer picks]` | low |
-| Inference service | scores pictures on the GPU during station use (plan task L1, not built) | `[Engineer to define: Windows service or scheduled task, once L1 exists]` | GPU, during inspections |
+| Inference service | scores pictures on the GPU during station use (plan task L1, built; not yet run on the laptop's service manager) | `[Engineer to define: Windows service or scheduled task]` | GPU, during inspections |
 | Weekly trainer | `python -m trainer weekly`, Sunday 06:00 | scheduled task `VisionStation Weekly Training` (install_weekly_task.ps1) | GPU and CPU, Sunday only |
 | Nightly backup | `pg_dump` of the MES database, 22:00 by default | scheduled task `VisionStation MES Nightly Backup` (install_backup_task.ps1) | disk and some CPU, once a day |
 

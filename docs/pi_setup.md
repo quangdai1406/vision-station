@@ -158,6 +158,8 @@ share (plan decision 5). The mount is the Pi's view of that share.
 
 Do not use a guest share, and do not put the credentials on the command line.
 
+Evidence sync: use EITHER `scripts/pi/sync_evidence.sh` OR the station's built-in sync thread (`evidence.sync` in the config), not both: both write the same queue file. `archiveRef` in the MES is the planned laptop path of the part, set when the part is queued; it is valid once the sync has copied and verified the part.
+
 ## 8. Pilot without TLS (decision 6, open)
 
 - The laptop inference service and the MES are plain HTTP. The token travels unencrypted on
