@@ -536,7 +536,7 @@ class SnapshotTests(_Base):
             {"state", "counters", "part_id", "machine_verdict", "final_verdict",
              "verdict", "results", "fault", "images", "partial_station", "camera_ids",
              "prompt", "press_ready", "flip_wait_s", "part_number", "part_selected",
-             "model_version", "can_inspect", "block_reason"},
+             "model_version", "can_inspect", "block_reason", "defect_proposals"},
         )
         self.assertEqual(snap["state"], "IDLE")
         self.assertEqual(snap["counters"], {"total": 0, "good": 0, "bad": 0})

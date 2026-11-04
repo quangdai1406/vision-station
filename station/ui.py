@@ -18,12 +18,16 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-from station.auth import ACTIONS, SessionManager, UserStore, role_allows
+from station.auth import ACTIONS, SessionManager, UserStore, map_role, role_allows
 from station.contracts import InvalidTransition, StationError, Verdict
+from station.mes_session import MesSessionError
 from station.scan import ScanError
 from station.scanstore import _component as _scan_name_check
 
 SESSION_COOKIE = "station_session"
+MES_MODE = "mes_ticket"  # auth.mode: the MES issues a one-time ticket; no local passwords
+MAX_TICKET_CHARS = 256
+ENDED_MESSAGE = "Log in again from the MES"
 MAX_BODY_BYTES = 64 * 1024
 MAX_REASON_CHARS = 500
 PREVIEW_CAMERA_RE = re.compile(r"C[1-4]")
@@ -56,6 +60,8 @@ _LABEL_STATUS_KEYS = ("session_id", "part_id", "part_number", "label_status", "v
 _PENDING_LABEL_KEYS = ("session_id", "part_id", "part_number", "verdict", "criterion_id",
                        "proposed_by", "proposed_at")
 MAX_REJECT_REASON_CHARS = 200  # keep in step with station.storage.MAX_REJECT_REASON_CHARS
+MAX_DEFECT_NOTE_CHARS = 500  # keep in step with station.defect_proposal.MAX_NOTE_CHARS
+_CRITERIA_KEYS = ("id", "name", "description")
 
 _ACTION_PATHS = {
     "/api/press": "press",
@@ -87,10 +93,11 @@ _CSP = (
 
 
 class _HttpError(Exception):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, payload: Optional[dict] = None):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.payload = payload or {}
 
 
 def _to_jsonable(value: Any) -> Any:
@@ -251,6 +258,12 @@ class _Handler(BaseHTTPRequestHandler):
     sessions: SessionManager | None = None
     # Taking data: None when disabled. Duck-typed like the session (see make_server).
     scan: Any = None
+    # mes_ticket mode (see make_server): the login mode, the MES session client and the
+    # MES role -> station role map. Unused in local mode.
+    auth_mode: str = "local"
+    mes_auth: Any = None
+    role_map: Optional[dict] = None
+    _mes_sid: Optional[str] = None  # the MES session of the request being handled
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         """No access log: nothing from a request (credentials included) is printed."""
@@ -265,7 +278,7 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             handler()
         except _HttpError as exc:
-            self._send_json(exc.status, {"error": exc.message})
+            self._send_json(exc.status, {"error": exc.message, **exc.payload})
         except InvalidTransition as exc:
             self._send_json(409, {"error": str(exc) or "action not allowed in the current state"})
         except ValueError as exc:
@@ -279,8 +292,15 @@ class _Handler(BaseHTTPRequestHandler):
     def _get(self) -> None:
         path, _, query = self.path.partition("?")
         if path == "/":
-            return self._send(200, _PAGE.encode("utf-8"), "text/html; charset=utf-8",
+            page = _PAGE_MES if self._mes() else _PAGE
+            return self._send(200, page.encode("utf-8"), "text/html; charset=utf-8",
                               extra=[("Content-Security-Policy", _CSP)])
+        if path == "/enter" and self._mes():
+            if query:
+                raise _HttpError(400, "the ticket is in the URL fragment, not the query string")
+            return self._send(200, _ENTER_PAGE.encode("utf-8"), "text/html; charset=utf-8",
+                              extra=[("Content-Security-Policy", _CSP),
+                                     ("Referrer-Policy", "no-referrer")])
         if path == "/api/state":
             return self._state(urllib.parse.parse_qs(query))
         if path == "/api/preview":
@@ -293,6 +313,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._label_last()
         if path == "/api/label/pending":
             return self._label_pending()
+        if path == "/api/part/criteria":
+            return self._part_criteria()
         if path == "/api/scan/state":
             return self._scan_state()
         if path == "/api/scan/step-picture":
@@ -304,11 +326,19 @@ class _Handler(BaseHTTPRequestHandler):
     def _post(self) -> None:
         path = self.path.partition("?")[0]
         if path == "/api/login":
+            if self._mes():
+                raise _HttpError(403, "local login is off: log in from the MES")
             return self._login()
+        if path == "/api/enter":
+            return self._enter()
         if path == "/api/logout":
             return self._logout()
         if path == "/api/part/select":
             return self._part_select()
+        if path == "/api/part/defects":
+            return self._defect_add()
+        if path == "/api/part/defects/remove":
+            return self._defect_remove()
         if path in ("/api/label/approve", "/api/label/reject"):
             return self._label_review(path.rsplit("/", 1)[1])
         if path.startswith("/api/scan/"):
@@ -371,10 +401,41 @@ class _Handler(BaseHTTPRequestHandler):
         token = self.sessions.create(username, role)
         self._send_json(200, {"role": role}, extra=[("Set-Cookie", _cookie_header(token))])
 
+    def _enter(self) -> None:
+        """mes_ticket: redeem a one-time ticket from the MES (fragment, POST body only)."""
+        if not self._mes():
+            raise _HttpError(404, "not found")
+        if self.path.partition("?")[1]:
+            raise _HttpError(400, "the ticket is in the URL fragment, not the query string")
+        data = self._read_json()
+        ticket = data.get("ticket")
+        if not isinstance(ticket, str) or not ticket or len(ticket) > MAX_TICKET_CHARS:
+            raise _HttpError(400, "ticket is required")
+        try:
+            info = self.mes_auth.redeem(ticket)
+        except MesSessionError as exc:
+            if exc.status == 409:
+                raise _HttpError(409, "this ticket was already used; start again from the MES")
+            if exc.status in (400, 401, 404, 410, 422):
+                raise _HttpError(401, "the ticket is invalid or has expired; start again from the MES")
+            raise _HttpError(503, "MES unavailable; cannot start a session")
+        role = map_role(self.role_map or {}, info.roles)
+        if role is None:
+            self._end_mes(info.session_id)
+            raise _HttpError(403, "your MES role has no access to this station")
+        old = self._cookie_token()
+        if old:
+            self.sessions.destroy(old)
+        token = self.sessions.create(info.username, role, mes_session=info.session_id)
+        self._send_json(200, {"role": role}, extra=[("Set-Cookie", _cookie_header(token))])
+
     def _logout(self) -> None:
         token = self._cookie_token()
         if token:
+            sid = self.sessions.mes_session(token) if self._mes() else None
             self.sessions.destroy(token)
+            if sid is not None:
+                self._end_mes(sid)
         self._send_json(200, {"ok": True}, extra=[("Set-Cookie", _expired_cookie_header())])
 
     def _parts_search(self, query: dict) -> None:
@@ -414,12 +475,56 @@ class _Handler(BaseHTTPRequestHandler):
             raise RuntimeError("select_part() must return a dict")
         self._send_json(200, _pick(result, _PART_KEYS))
 
+    def _part_criteria(self) -> None:
+        """Active criteria (id, name, description) of the part being shown. Any logged-in role."""
+        self._require()
+        rows = _call_parts(self.station.part_criteria)
+        if not isinstance(rows, list):
+            raise RuntimeError("part_criteria() must return a list")
+        self._send_json(200, {"criteria": [_pick(r, _CRITERIA_KEYS) for r in rows if isinstance(r, dict)]})
+
+    def _defect_add(self) -> None:
+        """Propose a defect on the part being shown. The inspector is the login, never the body."""
+        _, username, _role = self._require("propose_defect")
+        data = self._read_json()
+        criterion = data.get("criterion_id")
+        if not isinstance(criterion, str) or not 1 <= len(criterion) <= MAX_CRITERION_CHARS:
+            raise _HttpError(400, f"criterion_id must be 1 to {MAX_CRITERION_CHARS} characters")
+        camera = data.get("camera_id")
+        if not isinstance(camera, str) or not PREVIEW_CAMERA_RE.fullmatch(camera):
+            raise _HttpError(400, "camera_id must be C1, C2, C3 or C4")
+        side = data.get("side")
+        if side not in SCAN_SIDES:
+            raise _HttpError(400, "side must be TOP or BOTTOM")
+        note = data.get("note")
+        if note is None:
+            note = ""
+        if not isinstance(note, str) or len(note) > MAX_DEFECT_NOTE_CHARS:
+            raise _HttpError(400, f"note must be text up to {MAX_DEFECT_NOTE_CHARS} characters")
+        result = self.station.propose_defect(by=username, criterion_id=criterion, camera_id=camera,
+                                             side=side, note=note)
+        replaced = bool(result.get("replaced")) if isinstance(result, dict) else False
+        self._send_json(200, {"ok": True, "replaced": replaced})
+
+    def _defect_remove(self) -> None:
+        self._require("propose_defect")
+        data = self._read_json()
+        criterion = data.get("criterion_id")
+        if not isinstance(criterion, str) or not 1 <= len(criterion) <= MAX_CRITERION_CHARS:
+            raise _HttpError(400, f"criterion_id must be 1 to {MAX_CRITERION_CHARS} characters")
+        result = self.station.remove_defect(criterion)
+        removed = bool(result.get("removed")) if isinstance(result, dict) else False
+        self._send_json(200, {"ok": True, "removed": removed})
+
     def _act(self, action: str) -> None:
         _, username, _role = self._require(action)
         data = self._read_json()
         station = self.station
         if action == "press":
-            accepted = station.press()
+            if self._mes():
+                accepted = station.press(by=username, station_session=self._mes_sid)
+            else:
+                accepted = station.press()
             return self._send_json(200, {"accepted": bool(accepted)})
         if action == "ack":
             station.ack_alarm()
@@ -670,16 +775,55 @@ class _Handler(BaseHTTPRequestHandler):
         morsel = jar.get(SESSION_COOKIE)
         return morsel.value if morsel is not None else None
 
+    def _mes(self) -> bool:
+        return self.auth_mode == MES_MODE
+
+    def _end_mes(self, session_id: str) -> None:
+        """End an MES session, best effort. Nothing from the MES reply reaches the browser."""
+        try:
+            self.mes_auth.end(session_id)
+        except Exception:  # the station session is gone either way; the MES expires it
+            pass
+
     def _require(self, action: str | None = None):
-        """Return (token, username, role) or raise 401 / 403."""
+        """Return (token, username, role) or raise 401 / 403.
+
+        mes_ticket mode: every call asks the MES whether the bound session is still active.
+        The role is the one the MES gives now, mapped through role_map.
+        """
         token = self._cookie_token()
         got = self.sessions.get(token) if token else None
         if got is None:
-            raise _HttpError(401, "login required")
+            raise _HttpError(401, "login required", payload=self._ended_payload())
         username, role = got
+        if self._mes():
+            role = self._check_mes(token, username)
         if action is not None and not role_allows(role, action):
             raise _HttpError(403, "your role may not perform this action")
         return token, username, role
+
+    def _check_mes(self, token: str, username: str) -> str:
+        sid = self.sessions.mes_session(token)
+        self._mes_sid = sid
+        if sid is None:
+            self.sessions.destroy(token)
+            raise _HttpError(401, ENDED_MESSAGE, payload=self._ended_payload())
+        try:
+            info = self.mes_auth.validate(sid)
+        except MesSessionError:
+            raise _HttpError(503, "MES unavailable; cannot confirm your session")
+        if info is None or info.username != username:
+            self.sessions.destroy(token)
+            raise _HttpError(401, ENDED_MESSAGE, payload=self._ended_payload())
+        role = map_role(self.role_map or {}, info.roles)
+        if role is None:
+            self.sessions.destroy(token)
+            self._end_mes(sid)
+            raise _HttpError(401, ENDED_MESSAGE, payload=self._ended_payload())
+        return role
+
+    def _ended_payload(self) -> dict:
+        return {"reason": "mes_session_ended"} if self._mes() else {}
 
     def _read_json(self) -> dict:
         if self.headers.get("Transfer-Encoding"):
@@ -728,7 +872,9 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def make_server(session, users: UserStore, sessions: SessionManager,
-                host: str = "127.0.0.1", port: int = 0, scan=None) -> ThreadingHTTPServer:
+                host: str = "127.0.0.1", port: int = 0, scan=None, *,
+                auth_mode: str = "local", mes_auth=None,
+                role_map: Optional[dict] = None) -> ThreadingHTTPServer:
     """Build (but do not start) the UI server.
 
     `session` must provide: snapshot(include_images=False) -> dict, press() -> bool,
@@ -746,15 +892,71 @@ def make_server(session, users: UserStore, sessions: SessionManager,
     step_picture(camera_id) -> (bytes, ext) | None and snapshot() -> dict. Disabled means
     the scan routes answer 404 (after the login and role checks) and the 'scan' action is
     not listed for anyone.
+
+    auth_mode 'mes_ticket': mes_auth is a MesSessionClient (redeem, validate, end) and role_map
+    maps MES roles to station roles. Logins come from GET /enter (the ticket in the URL
+    fragment) and POST /api/enter; local passwords are refused; every call validates the MES
+    session; press passes by= and station_session= to the session.
     """
+    if auth_mode not in ("local", MES_MODE):
+        raise ValueError("auth_mode must be 'local' or 'mes_ticket'")
+    if auth_mode == MES_MODE and (mes_auth is None or not role_map):
+        raise ValueError("mes_ticket needs an MES session client and a role_map")
     handler = type("StationHandler", (_Handler,), {
         "station": session,
         "users": users,
         "sessions": sessions,
         "scan": scan,
+        "auth_mode": auth_mode,
+        "mes_auth": mes_auth,
+        "role_map": dict(role_map) if role_map else None,
     })
     return ThreadingHTTPServer((host, port), handler)
 
+
+_ENTER_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Vision Station</title>
+<style>
+body { margin: 0; font: 16px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: #f3f4f6; color: #1b1d21; }
+main { padding: 16px; max-width: 480px; margin: 40px auto; background: #fff;
+  border: 1px solid #d5d9df; border-radius: 10px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Vision Station</h1>
+  <p id="msg">Starting your session...</p>
+</main>
+<script>
+(function () {
+  "use strict";
+  var msg = document.getElementById("msg");
+  // The ticket is read from the fragment only: it is never sent to the server in a URL.
+  var m = /(?:^#|&)ticket=([^&]+)/.exec(location.hash || "");
+  if (history.replaceState) { history.replaceState(null, "", location.pathname); }
+  if (!m) { msg.textContent = "Log in again from the MES."; return; }
+  var ticket = decodeURIComponent(m[1]);
+  fetch("/api/enter", {
+    method: "POST", credentials: "same-origin", cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ticket: ticket })
+  }).then(function (res) {
+    if (res.ok) { location.replace("/"); return; }
+    return res.json().then(function (body) {
+      msg.textContent = (body && body.error) || "Could not start a session.";
+    }, function () { msg.textContent = "Could not start a session."; });
+  }, function () { msg.textContent = "Could not reach the station."; });
+})();
+</script>
+</body>
+</html>
+"""
 
 _PAGE = """<!doctype html>
 <html lang="en">
@@ -868,6 +1070,7 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
 <main>
   <section id="login-box" class="card login" hidden>
     <h2>Log in</h2>
+    <p id="mes-note" class="muted" hidden>Log in again from the MES.</p>
     <form id="login-form">
       <label for="username">Username</label>
       <input id="username" name="username" autocomplete="username" required>
@@ -968,6 +1171,21 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
       <p id="press-hint" class="muted hint">Enter key or click: start TOP scan, flip the part, press again for the BOTTOM scan.</p>
       <p id="press-status" class="status" role="status"></p>
     </div>
+    <section id="defect-panel" class="card" aria-label="Propose a defect" hidden>
+      <h2>Propose a defect</h2>
+      <p class="muted hint">Pick one criterion and the picture that shows it. A proposal makes this part BAD. It never makes a BAD part GOOD.</p>
+      <p id="defect-none" class="part-block" hidden>This part has no active criteria, so a defect cannot be proposed for it.</p>
+      <h3>Criterion</h3>
+      <ul id="defect-criteria" class="part-results"></ul>
+      <h3>Picture</h3>
+      <ul id="defect-pictures" class="part-results"></ul>
+      <label for="defect-note">Note (optional, up to 500 characters)</label>
+      <input id="defect-note" maxlength="500" autocomplete="off">
+      <button type="button" id="defect-add">Propose defect</button>
+      <p id="defect-status" class="part-note muted" role="status"></p>
+      <h3>Proposals on this part</h3>
+      <ul id="defect-pending" class="part-results"></ul>
+    </section>
     <div class="card">
       <label for="reason">Reason (required for resolve and override)</label>
       <input id="reason" maxlength="500" autocomplete="off">
@@ -1362,6 +1580,7 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
     pressAllowed = !!allowed.press;
     labelIsAdmin = !!allowed.label_approve;
     scanAllowed = !!allowed.scan;
+    proposeAllowed = !!allowed.propose_defect;
     reviewAllowed = !!allowed.label_approve;
     startReviewBanner();
     scanActiveNow = s.scan_active === true;
@@ -1375,6 +1594,7 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
     curFault = !!s.fault;
     pressReady = s.press_ready !== false;
     flipWait = typeof s.flip_wait_s === "number" && s.flip_wait_s > 0 ? s.flip_wait_s : 0;
+    renderDefects(s);
     el.prompt.textContent = typeof s.prompt === "string" ? s.prompt : "";
     el.prompt.hidden = el.prompt.textContent === "";
     renderPart(s);
@@ -1950,6 +2170,9 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
   }
 
   function showLogin() {
+    var mesMode = document.body.getAttribute("data-auth") === "mes";
+    el.form.hidden = mesMode;
+    $("mes-note").hidden = !mesMode;
     gen += 1;
     labelFetchAt = 0;
     stopPolling();
@@ -2007,6 +2230,151 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
       });
     }).then(null, function (err) { handleError(g, err); });
   }
+
+  // ----- defect proposals (shown while the part is VERDICT or SUPERVISOR_REVIEW) ----
+  // Every name and description comes from the MES: it is written with textContent only.
+  var proposeAllowed = false;
+  var defectCriteria = [];        // [{id, name, description}] of the part shown
+  var defectCriteriaPart = null;  // part_number the list was loaded for
+  var defectCriteriaBusy = false;
+  var defectPartId = null;        // part shown last: choices reset when a new part starts
+  var defectCrit = "";            // chosen criterion id
+  var defectPic = null;           // chosen {camera_id, side}
+  var defectImages = [];          // pictures of the part shown (from the snapshot)
+
+  function clearChildren(node) { while (node.firstChild) { node.removeChild(node.firstChild); } }
+  function setDefectStatus(msg) { $("defect-status").textContent = msg || ""; }
+
+  function criterionName(id) {
+    for (var i = 0; i < defectCriteria.length; i++) {
+      if (defectCriteria[i].id === id) { return String(defectCriteria[i].name || id); }
+    }
+    return String(id);
+  }
+
+  function loadDefectCriteria(part) {
+    if (defectCriteriaBusy || defectCriteriaPart === part) { return; }
+    defectCriteriaBusy = true;
+    var g = gen;
+    request("GET", "/api/part/criteria").then(function (r) {
+      defectCriteriaBusy = false;
+      if (g !== gen) { return; }
+      defectCriteria = Array.isArray(r.criteria) ? r.criteria : [];
+      defectCriteriaPart = part;
+      renderDefectCriteria();
+    }, function () { defectCriteriaBusy = false; });
+  }
+
+  function renderDefectCriteria() {
+    var list = $("defect-criteria");
+    clearChildren(list);
+    defectCriteria.forEach(function (c) {
+      var li = document.createElement("li");
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "part-choice secondary";
+      btn.disabled = !proposeAllowed;
+      btn.setAttribute("aria-pressed", c.id === defectCrit ? "true" : "false");
+      var name = document.createElement("span");
+      name.className = "part-pn";
+      name.textContent = String(c.name || c.id);
+      var desc = document.createElement("span");
+      desc.className = "part-desc";
+      desc.textContent = String(c.description || "");
+      btn.appendChild(name);
+      btn.appendChild(desc);
+      btn.addEventListener("click", function () {
+        defectCrit = String(c.id);
+        renderDefectCriteria();
+        renderDefectPictures();
+      });
+      li.appendChild(btn);
+      list.appendChild(li);
+    });
+    $("defect-add").disabled = !proposeAllowed || !defectCrit || !defectPic;
+  }
+
+  function renderDefectPictures() {
+    var list = $("defect-pictures");
+    clearChildren(list);
+    defectImages.forEach(function (img) {
+      var li = document.createElement("li");
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "part-choice secondary";
+      btn.disabled = !proposeAllowed;
+      var chosen = defectPic && defectPic.camera_id === img.camera_id && defectPic.side === img.side;
+      btn.setAttribute("aria-pressed", chosen ? "true" : "false");
+      btn.textContent = String(img.camera_id) + " " + String(img.side);
+      btn.addEventListener("click", function () {
+        defectPic = { camera_id: String(img.camera_id), side: String(img.side) };
+        renderDefectPictures();
+        renderDefectCriteria();
+      });
+      li.appendChild(btn);
+      list.appendChild(li);
+    });
+    $("defect-add").disabled = !proposeAllowed || !defectCrit || !defectPic;
+  }
+
+  function renderDefectPending(rows) {
+    var list = $("defect-pending");
+    clearChildren(list);
+    rows.forEach(function (p) {
+      var li = document.createElement("li");
+      var text = document.createElement("span");
+      var note = p.note ? " - " + String(p.note) : "";
+      text.textContent = criterionName(p.criterion_id) + ": " + String(p.camera_id) + " " +
+        String(p.side) + " (" + String(p.proposed_by || "") + ")" + note;
+      var remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "secondary";
+      remove.disabled = !proposeAllowed;
+      remove.textContent = "Remove";
+      remove.addEventListener("click", function () {
+        request("POST", "/api/part/defects/remove", { criterion_id: String(p.criterion_id) }).then(
+          function () { setDefectStatus("Proposal removed."); },
+          function (err) { setDefectStatus(err.message || "Could not remove the proposal."); });
+      });
+      li.appendChild(text);
+      li.appendChild(remove);
+      list.appendChild(li);
+    });
+  }
+
+  function renderDefects(s) {
+    // Only BAD and REVIEW parts: a part the model passed (GOOD) has no picker.
+    var shown = (s.state === "VERDICT" || s.state === "SUPERVISOR_REVIEW") && s.machine_verdict !== "GOOD";
+    $("defect-panel").hidden = !shown;
+    if (s.part_id !== defectPartId) {
+      defectPartId = s.part_id;
+      defectCrit = "";
+      defectPic = null;
+      setDefectStatus("");
+    }
+    if (!shown) { return; }
+    var part = typeof s.part_number === "string" ? s.part_number : "";
+    loadDefectCriteria(part);
+    defectImages = Array.isArray(s.images) ? s.images : [];
+    $("defect-none").hidden = !(defectCriteriaPart === part && defectCriteria.length === 0);
+    renderDefectCriteria();
+    renderDefectPictures();
+    renderDefectPending(Array.isArray(s.defect_proposals) ? s.defect_proposals : []);
+  }
+
+  function proposeDefect() {
+    if (!defectCrit || !defectPic) { setDefectStatus("Choose a criterion and a picture first."); return; }
+    setDefectStatus("Saving the proposal...");
+    request("POST", "/api/part/defects", {
+      criterion_id: defectCrit, camera_id: defectPic.camera_id, side: defectPic.side,
+      note: $("defect-note").value || ""
+    }).then(function (r) {
+      setDefectStatus(r.replaced ? "Replaced the earlier proposal for this criterion." : "Proposal added.");
+      $("defect-note").value = "";
+    }, function (err) { setDefectStatus(err.message || "The proposal was refused."); });
+  }
+
+  $("defect-add").addEventListener("click", proposeDefect);
 
   // ----- part picker (only when parts_mode is 'mes') ---------------------
   // The part may change only between parts: the picker is locked while a press is
@@ -2328,3 +2696,8 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
 </body>
 </html>
 """
+
+
+# mes_ticket: the same page, marked so the login form is replaced by "Log in again from the MES".
+_PAGE_MES = _PAGE.replace("<body>", '<body data-auth="mes">', 1)
+assert _PAGE_MES != _PAGE

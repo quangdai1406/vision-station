@@ -306,12 +306,13 @@ class Store:
             conn.close()
 
     # --------------------------------------------------------------- parts
-    def save_part(self, record: PartRecord) -> pathlib.Path:
+    def save_part(self, record: PartRecord, defect_proposals: Optional[list] = None) -> pathlib.Path:
         """Write one finished part.
 
         Default: exactly 8 frames and 8 results (4 cameras x 2 sides).
         With allow_partial: an even count from 2 to 8, where TOP and BOTTOM
         cover the same camera ids, each (camera_id, side) pair once.
+        defect_proposals: optional list of JSON-safe dicts, stored in part.json.
         """
         frames = list(record.frames)
         results = list(record.results)
@@ -369,7 +370,8 @@ class Store:
             )
             if part_dir.exists():
                 return self._adopt(part_dir, record)
-            return self._write_new(part_dir, record, frames, by_key, started)
+            return self._write_new(part_dir, record, frames, by_key, started,
+                                   defect_proposals=defect_proposals)
 
     def _known_path(self, session_id: str) -> pathlib.Path | None:
         with self._db() as conn:
@@ -399,6 +401,7 @@ class Store:
         frames: list,
         by_key: dict,
         started: datetime,
+        defect_proposals: Optional[list] = None,
     ) -> pathlib.Path:
         date_stamp = started.strftime("%Y%m%d")
         time_stamp = started.strftime("%H%M%S")
@@ -470,6 +473,10 @@ class Store:
             "partial_station": camera_count < len(CAMERA_IDS),
             "images": images,
         }
+        if defect_proposals:
+            # Human defect proposals (plan S3). Only in part.json: not an operator_label, so training
+            # never reads them as a label. The manifest lists pictures only, so it is unchanged.
+            doc["defect_proposals"] = [dict(p) for p in defect_proposals]
         manifest = "".join(
             f"{img['sha256']}  {img['file']}\n" for img in images
         ).encode("utf-8")

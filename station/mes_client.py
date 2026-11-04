@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 import urllib.error
 import urllib.request
 import uuid
@@ -18,6 +19,7 @@ from typing import Any, Mapping, Optional, Sequence
 from station.contracts import Frame, ImageResult, PartRecord, StationError, Verdict
 
 EVENTS_PATH = "/api/machine/inspection-events"
+_STATION_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 class MappingError(StationError):
@@ -66,17 +68,23 @@ def criterion_for(defect_class: str, cfg: MesConfig) -> str:
 
 
 def build_request(
-    record: PartRecord, cfg: MesConfig, archive_ref: str
+    record: PartRecord, cfg: MesConfig, archive_ref: str, proposals: Sequence[Any] = ()
 ) -> tuple[dict[str, str], list[tuple[str, str, bytes]]]:
     """Return (fields, files) for one inspection event.
 
     files is a list of (field_name, filename, data): one defect photo per failed
     criterion, named defectPhoto_<criterion_id>. No other images are included.
+
+    proposals (defect_proposal.ProposalRecord rows, optional): each one fails its criterion
+    and its chosen picture is the photo for that criterion (it replaces a photo chosen from
+    the model's defects for the same criterion).
     """
     if record.final_verdict not in (Verdict.GOOD, Verdict.BAD):
         raise ValueError(f"only GOOD or BAD can be posted, got {record.final_verdict!r}")
     if record.override is not None and record.override.new_verdict is not record.final_verdict:
         raise ValueError("override.new_verdict must equal final_verdict")
+    if not record.started_utc:
+        raise ValueError("started_utc is required: the MES checks the capture time")
     is_bad = record.final_verdict is Verdict.BAD
 
     frame_by_key: dict[tuple[str, Any], Frame] = {(f.camera_id, f.side): f for f in record.frames}
@@ -93,28 +101,49 @@ def build_request(
                 failed.add(criterion_id)
                 if criterion_id not in best or defect.score > best[criterion_id][0]:
                     best[criterion_id] = (defect.score, result)
-        if not failed:
-            # e.g. a supervisor resolved a REVIEW to BAD with no defects recorded
-            if cfg.default_criterion_id is None:
-                raise MappingError("BAD part has no defects and no default_criterion_id is set")
-            failed.add(_check_criterion(cfg.default_criterion_id, cfg))
+
+    if proposals and not is_bad:
+        # A proposal makes the final verdict BAD (session rule); a GOOD post must never carry one.
+        raise ValueError("a part with defect proposals must be posted as BAD")
+    # criterion id -> the picture (camera, side) chosen for its photo
+    chosen: dict[str, tuple[str, Any]] = {}
+    for proposal in proposals:
+        _check_criterion(proposal.criterion_id, cfg)
+        failed.add(proposal.criterion_id)
+        chosen[proposal.criterion_id] = (proposal.camera_id, proposal.side)
+
+    if is_bad and not failed:
+        # Failed criteria are the union of the model's defects and the proposals. Only when that
+        # union is empty (e.g. an anomaly model with no defect class, or a supervisor resolved a
+        # REVIEW to BAD with nothing recorded) does the default criterion apply.
+        if cfg.default_criterion_id is None:
+            raise MappingError("BAD part has no defects and no default_criterion_id is set")
+        failed.add(_check_criterion(cfg.default_criterion_id, cfg))
 
     checklist = {cid: ("fail" if cid in failed else "pass") for cid in cfg.criteria_ids}
 
     photos: list[tuple[str, str, bytes]] = []
     for criterion_id in sorted(failed):
-        if criterion_id in best:
-            result = best[criterion_id][1]
+        if criterion_id in chosen:
+            key = chosen[criterion_id]
+            frame = frame_by_key.get(key)
+            if frame is None:
+                raise MappingError(
+                    f"no frame for {key[0]} {_side_value(key[1])} to attach as photo for {criterion_id}"
+                )
         else:
-            if not record.results:
-                raise MappingError("no image results to choose a defect photo from")
-            result = max(record.results, key=lambda r: r.score)
-        frame = frame_by_key.get((result.camera_id, result.side))
-        if frame is None:
-            raise MappingError(
-                f"no frame for {result.camera_id} {_side_value(result.side)} "
-                f"to attach as photo for {criterion_id}"
-            )
+            if criterion_id in best:
+                result = best[criterion_id][1]
+            else:
+                if not record.results:
+                    raise MappingError("no image results to choose a defect photo from")
+                result = max(record.results, key=lambda r: r.score)
+            frame = frame_by_key.get((result.camera_id, result.side))
+            if frame is None:
+                raise MappingError(
+                    f"no frame for {result.camera_id} {_side_value(result.side)} "
+                    f"to attach as photo for {criterion_id}"
+                )
         photos.append((
             f"defectPhoto_{criterion_id}",
             f"{frame.camera_id}_{_side_value(frame.side)}.{frame.ext}",
@@ -131,6 +160,7 @@ def build_request(
         "materialHandler": record.material_handler,
         "verdict": record.final_verdict.value,
         "visionSessionId": record.session_id,
+        "capturedAt": record.started_utc,  # ISO 8601 UTC: the MES checks it against the session window
         "modelVersion": record.model_version,
         "archiveRef": archive_ref,
         "notes": (
@@ -140,7 +170,8 @@ def build_request(
     }
     if is_bad:
         fields["rejectedQuantity"] = "1"
-        fields["rejectionReason"] = ", ".join(sorted(defect_classes)) or "supervisor decision"
+        reasons = sorted(defect_classes) + sorted({p.criterion_id for p in proposals})
+        fields["rejectionReason"] = ", ".join(sorted(set(reasons))) or "supervisor decision"
         fields["disposition"] = cfg.default_bad_disposition
     elif record.override is not None and record.override.new_verdict is Verdict.GOOD:
         fields["disposition"] = "released"
@@ -207,19 +238,27 @@ class MesClient:
         fields: Mapping[str, str],
         files: Sequence[tuple[str, str, bytes]],
         idempotency_key: str,
+        station_session: Optional[str] = None,
     ) -> PostResult:
+        """POST one inspection event. station_session (the MES session id of the inspector)
+        is sent as the Station-Session header when given; the Idempotency-Key stays session_id."""
+        if station_session is not None and not _STATION_SESSION_RE.match(station_session):
+            raise ValueError("station_session is not a valid MES session id")
         boundary = uuid.uuid4().hex
         body = _encode_multipart(fields, files, boundary)
+        headers = {
+            "Authorization": f"Bearer {self.cfg.token}",
+            "Idempotency-Key": idempotency_key,
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/json",
+        }
+        if station_session is not None:
+            headers["Station-Session"] = station_session
         req = urllib.request.Request(
             self.cfg.base_url.rstrip("/") + EVENTS_PATH,
             data=body,
             method="POST",
-            headers={
-                "Authorization": f"Bearer {self.cfg.token}",
-                "Idempotency-Key": idempotency_key,
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "Accept": "application/json",
-            },
+            headers=headers,
         )
         try:
             with self._opener.open(req, timeout=self.cfg.timeout_s) as resp:

@@ -19,6 +19,7 @@ from station.contracts import (
     Thresholds,
     Verdict,
 )
+from station.defect_proposal import DefectProposal
 from station.mes_client import MappingError, MesClient, MesConfig, build_request
 
 TOKEN = "test-token-123"
@@ -157,6 +158,55 @@ class BuildRequestTests(unittest.TestCase):
         with self.assertRaises(MappingError):
             build_request(record, make_cfg(), archive_ref="a")
 
+    def test_bad_by_score_with_only_a_proposal_fails_the_proposed_criterion(self):
+        # The model names no defect class (anomaly model). The proposal alone is the failed criterion;
+        # the default is not used when the proposals already name one.
+        record = make_record(make_results())
+        cfg = make_cfg(default_criterion_id="crit_label")
+        proposal = DefectProposal("crit_dent", "C4", Side.BOTTOM, "dent near the edge")
+        fields, files = build_request(record, cfg, archive_ref="a", proposals=[proposal])
+
+        self.assertEqual(json.loads(fields["checklistResults"]),
+                         {"crit_scratch": "pass", "crit_dent": "fail", "crit_label": "pass"})
+        self.assertEqual(fields["rejectionReason"], "crit_dent")
+        self.assertEqual(fields["verdict"], "BAD")
+        self.assertEqual([(name, filename, data) for name, filename, data in files],
+                         [("defectPhoto_crit_dent", "C4_BOTTOM.png", b"C4-BOTTOM")])
+
+    def test_bad_part_fails_the_union_of_model_defects_and_proposals(self):
+        defects = {("C1", Side.TOP): [Defect("scratch", 0.9, (0, 0, 5, 5))]}
+        record = make_record(make_results(defects))
+        cfg = make_cfg(default_criterion_id="crit_label")
+        proposal = DefectProposal("crit_dent", "C3", Side.BOTTOM)
+        fields, files = build_request(record, cfg, archive_ref="a", proposals=[proposal])
+
+        self.assertEqual(json.loads(fields["checklistResults"]),
+                         {"crit_scratch": "fail", "crit_dent": "fail", "crit_label": "pass"})
+        self.assertEqual(fields["rejectionReason"], "crit_dent, scratch")
+        by_name = {name: (filename, data) for name, filename, data in files}
+        self.assertEqual(sorted(by_name), ["defectPhoto_crit_dent", "defectPhoto_crit_scratch"])
+        self.assertEqual(by_name["defectPhoto_crit_dent"], ("C3_BOTTOM.png", b"C3-BOTTOM"))
+        self.assertEqual(by_name["defectPhoto_crit_scratch"], ("C1_TOP.png", b"C1-TOP"))
+
+    def test_bad_part_with_no_defect_no_proposal_and_no_default_raises(self):
+        record = make_record(make_results())
+        with self.assertRaises(MappingError) as ctx:
+            build_request(record, make_cfg(), archive_ref="a", proposals=[])
+        self.assertIn("no default_criterion_id", str(ctx.exception))
+
+    def test_unknown_proposal_criterion_raises(self):
+        record = make_record(make_results())
+        proposal = DefectProposal("crit_unknown", "C1", Side.TOP)
+        with self.assertRaises(MappingError):
+            build_request(record, make_cfg(default_criterion_id="crit_label"), archive_ref="a",
+                          proposals=[proposal])
+
+    def test_good_part_with_a_proposal_is_refused(self):
+        record = make_record(make_results(), final=Verdict.GOOD, machine=Verdict.GOOD)
+        proposal = DefectProposal("crit_dent", "C1", Side.TOP)
+        with self.assertRaises(ValueError):
+            build_request(record, make_cfg(), archive_ref="a", proposals=[proposal])
+
     def test_review_is_rejected(self):
         record = make_record(make_results(), final=Verdict.REVIEW, machine=Verdict.REVIEW)
         with self.assertRaises(ValueError):
@@ -257,7 +307,7 @@ class MesClientPostTests(unittest.TestCase):
             "stationId", "partNumber", "quantityInspected", "checklistResults", "supervisor",
             "operators", "materialHandler", "verdict", "visionSessionId", "modelVersion",
             "archiveRef", "notes", "rejectedQuantity", "rejectionReason", "disposition",
-            "defectPhoto_crit_scratch",
+            "defectPhoto_crit_scratch", "capturedAt",
         ]))
 
     def test_200_is_replay(self):

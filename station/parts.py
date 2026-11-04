@@ -275,6 +275,9 @@ def build_part_config(criteria: list[dict]) -> dict[str, Any]:
         "criteria_ids": [_key(c) for c in entries if c["active"]],
         "class_to_criterion": {names[_key(c)]: _key(c) for c in visual},
         "measurement_criteria": [{"id": _key(c), "name": c["criteria_name"]} for c in measurement],
+        # Active criteria for the defect picker: name and description as the MES gives them.
+        "criteria": [{"id": _key(c), "name": c["criteria_name"],
+                      "description": c["criteria_description"]} for c in entries if c["active"]],
         "warnings": warnings,
         "inactive_count": sum(1 for c in entries if not c["active"]),
     }

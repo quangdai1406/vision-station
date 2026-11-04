@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 import urllib.request
@@ -41,6 +42,7 @@ from station.contracts import (
 )
 from station.inference import MarkerModel
 from station.mes_client import build_request
+from tests.fake_laptop import FAKE_LAPTOP_TOKEN, FakeLaptop
 from station.modelstore import ModelStore, safe_part
 from station.outputs import RecordingOutputs
 from station.parts import PartsError
@@ -56,6 +58,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 TOKEN_ENV = "VISION_TEST_APP_TOKEN"
 # A gap between the TOP and BOTTOM press that is longer than the 2.0 s default min_flip_s.
 PAST_MIN_FLIP = 2.5
+REMOTE_ENV = "VISION_TEST_LAPTOP_TOKEN"
 
 
 def base_config(tmp: str) -> dict:
@@ -1443,6 +1446,291 @@ class GoldenPartTests(PartTestCase):
         self.assertEqual(len(rows), 1)
         self.assertIn("PN-A", rows[0]["payload_json"])
         self.assertEqual(app.outbox.pending_count(), 0)
+
+
+class RemoteConfigTests(TmpCase):
+    def mes_cfg(self, remote=None) -> dict:
+        cfg = base_config(self.tmp)
+        del cfg["part_number"]
+        cfg["parts"] = {"mode": "mes", "models_dir": self.tmp}
+        cfg["model"] = {"kind": "marker", "version": "remote-1"}
+        if remote is not None:
+            cfg["model"]["remote"] = remote
+        return cfg
+
+    REMOTE = {"base_url": "http://192.168.10.5:8765", "token_env": "INFERENCE_TOKEN", "timeout_s": 5.0}
+
+    def test_valid_remote_section_is_kept_and_defaults_nothing(self) -> None:
+        out = validate_config(self.mes_cfg(dict(self.REMOTE)))
+        self.assertEqual(out["model"]["remote"], self.REMOTE)
+
+    def test_no_remote_section_keeps_local_loading(self) -> None:
+        out = validate_config(self.mes_cfg())
+        self.assertIsNone(out["model"].get("remote"))
+
+    def test_timeout_is_required_and_never_defaulted(self) -> None:
+        remote = dict(self.REMOTE)
+        del remote["timeout_s"]
+        with self.assertRaisesRegex(ConfigError, "model.remote.timeout_s"):
+            validate_config(self.mes_cfg(remote))
+
+    def test_timeout_must_be_a_positive_number(self) -> None:
+        for bad in (0, -1, "5", True):
+            with self.subTest(timeout=bad):
+                remote = dict(self.REMOTE, timeout_s=bad)
+                with self.assertRaisesRegex(ConfigError, "model.remote.timeout_s"):
+                    validate_config(self.mes_cfg(remote))
+
+    def test_placeholder_timeout_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "placeholders"):
+            validate_config(self.mes_cfg(dict(self.REMOTE, timeout_s="[Engineer to define]")))
+
+    def test_remote_needs_mes_mode(self) -> None:
+        cfg = self.mes_cfg(dict(self.REMOTE))
+        cfg["parts"] = {"mode": "fixed"}
+        cfg["part_number"] = "PN-100"
+        with self.assertRaisesRegex(ConfigError, "model.remote needs parts.mode 'mes'"):
+            validate_config(cfg)
+
+    def test_remote_excludes_local_model_path_and_extractor(self) -> None:
+        cfg = self.mes_cfg(dict(self.REMOTE))
+        cfg["model"]["path"] = os.path.join(self.tmp, "m.npz")
+        with self.assertRaisesRegex(ConfigError, "model.remote is used instead of a local model"):
+            validate_config(cfg)
+
+    def test_token_env_must_be_a_variable_name_not_a_token(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "model.remote.token_env"):
+            validate_config(self.mes_cfg(dict(self.REMOTE, token_env="abc.def-token-value")))
+
+    def test_base_url_must_be_http_and_keys_are_checked(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "model.remote.base_url"):
+            validate_config(self.mes_cfg(dict(self.REMOTE, base_url="laptop:8765")))
+        with self.assertRaisesRegex(ConfigError, "unknown key"):
+            validate_config(self.mes_cfg(dict(self.REMOTE, retries=3)))
+        with self.assertRaisesRegex(ConfigError, "model.remote.token_env is required"):
+            validate_config(self.mes_cfg({"base_url": "http://x:1", "timeout_s": 5}))
+
+
+class EvidenceConfigTests(TmpCase):
+    def cfg(self, evidence=None) -> dict:
+        cfg = base_config(self.tmp)
+        if evidence is not None:
+            cfg["evidence"] = evidence
+        return cfg
+
+    def test_absent_evidence_section_means_no_sync(self) -> None:
+        self.assertEqual(validate_config(self.cfg())["evidence"], {"sync": None})
+
+    def test_sync_section_is_validated_and_kept(self) -> None:
+        sync = {"dest_root": "/mnt/laptop-store", "queue_dir": os.path.join(self.tmp, "q")}
+        self.assertEqual(validate_config(self.cfg({"sync": sync}))["evidence"], {"sync": sync})
+
+    def test_sync_needs_both_paths_and_no_unknown_keys(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "evidence.sync"):
+            validate_config(self.cfg({"sync": {"dest_root": "/mnt/x"}}))
+        with self.assertRaisesRegex(ConfigError, "evidence.sync.dest_root must be a non-empty string"):
+            validate_config(self.cfg({"sync": {"dest_root": "", "queue_dir": "/tmp/q"}}))
+        with self.assertRaisesRegex(ConfigError, "unknown key"):
+            validate_config(self.cfg({"sync": {"dest_root": "/mnt/x", "queue_dir": "/tmp/q", "x": 1}}))
+        with self.assertRaisesRegex(ConfigError, "unknown key"):
+            validate_config(self.cfg({"sync": None, "other": {}}))
+
+    def test_relative_queue_dir_is_resolved_against_the_config_folder(self) -> None:
+        data = self.cfg({"sync": {"dest_root": "/mnt/x", "queue_dir": "evq"}})
+        data["data_dir"] = os.path.join(self.tmp, "data")
+        data["users_file"] = os.path.join(self.tmp, "users.json")
+        path = self.write_config(data)
+        out = load_config(path)
+        self.assertEqual(out["evidence"]["sync"]["queue_dir"],
+                         os.path.join(os.path.realpath(self.tmp), "evq"))
+
+
+class RemotePartTests(PartTestCase):
+    """A 'mes' station whose parts are scored on a (local stand-in) laptop service."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.laptop = FakeLaptop(models={"PN-A": "2026-11-01-a"})
+        self.addCleanup(self.laptop.close)
+        self.clock = FakeClock()
+        patcher = mock.patch.dict(os.environ, {REMOTE_ENV: FAKE_LAPTOP_TOKEN})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def remote_config(self, base_url=None) -> dict:
+        cfg = self.mes_config()
+        cfg["model"] = {"kind": "marker", "version": "remote-1", "remote": {
+            "base_url": base_url or self.laptop.base, "token_env": REMOTE_ENV, "timeout_s": 5.0}}
+        return cfg
+
+    def good_cameras(self) -> FakeCameraSet:
+        return FakeCameraSet(frame_bytes=lambda cam, side, n: b"\x89PNG-good")
+
+    def test_approved_remote_part_is_inspected_and_saved_with_the_laptop_version(self) -> None:
+        app = self.build(self.remote_config(), clock=self.clock, cameras=self.good_cameras())
+        result = app.select_part("PN-A", "op1")
+        self.assertTrue(result["can_inspect"])
+        self.assertEqual(result["model_version"], "2026-11-01-a")
+        self.assertEqual(app.current_part()["model_version"], "2026-11-01-a")
+        self.assertTrue(app.session.press())
+        self.clock.now += PAST_MIN_FLIP
+        self.assertTrue(app.session.press())
+        self.assertEqual(app.session.counters, {"total": 1, "good": 1, "bad": 0})
+        part = app.store.recent_parts(1)[0]
+        with open(os.path.join(part["path"], "part.json"), encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["model_version"], "2026-11-01-a")
+
+    def test_part_the_laptop_does_not_list_is_blocked_with_the_reason(self) -> None:
+        app = self.build(self.remote_config(), clock=self.clock)
+        result = app.select_part("PN-B", "op1")  # PN-B has no approved model on the laptop
+        self.assertFalse(result["can_inspect"])
+        self.assertIn("does not list an approved model for part PN-B", result["reason"])
+        self.assertFalse(app.session.can_inspect)
+        self.assertFalse(app.session.press())
+        self.assertEqual(app.session.counters["total"], 0)
+
+    def test_laptop_unreachable_blocks_selection_without_the_token(self) -> None:
+        app = self.build(self.remote_config(base_url="http://127.0.0.1:9"), clock=self.clock)
+        result = app.select_part("PN-A", "op1")
+        self.assertFalse(result["can_inspect"])
+        self.assertIn("could not reach the laptop", result["reason"])
+        self.assertNotIn(FAKE_LAPTOP_TOKEN, result["reason"])
+
+    def test_missing_laptop_token_variable_blocks_selection_by_name(self) -> None:
+        os.environ.pop(REMOTE_ENV, None)
+        app = self.build(self.remote_config(), clock=self.clock)
+        result = app.select_part("PN-A", "op1")
+        self.assertFalse(result["can_inspect"])
+        self.assertIn(REMOTE_ENV, result["reason"])
+
+    def test_laptop_503_during_a_part_goes_to_fault_and_never_green(self) -> None:
+        app = self.build(self.remote_config(), clock=self.clock, cameras=self.good_cameras())
+        self.assertTrue(app.select_part("PN-A", "op1")["can_inspect"])
+        self.laptop.predict_status = 503
+        self.assertTrue(app.session.press())
+        self.assertEqual(app.session.snapshot()["state"], State.FAULT.value)
+        self.assertEqual(app.session.counters, {"total": 0, "good": 0, "bad": 0})
+        self.assertIn("unavailable (503)", str(app.session.snapshot()["fault"]))
+        self.assertEqual(app.store.recent_parts(1), [])
+
+
+class CapturedAtTests(PartTestCase):
+    def test_post_carries_the_part_started_time_and_the_session_id_key(self) -> None:
+        cfg = base_config(self.tmp)
+        clock = FakeClock()
+        sent = []
+        real = build_request
+
+        def spy(record, mes_cfg, archive_ref):
+            fields, files = real(record, mes_cfg, archive_ref)
+            sent.append((record, fields))
+            return fields, files
+
+        app = build_station(cfg, cameras=FakeCameraSet(), model=MarkerModel("test-1"),
+                            outputs=RecordingOutputs(), clock=clock, token="not-a-real-token-for-tests")
+        self.addCleanup(app.stop)
+        with mock.patch("station.app.build_request", side_effect=spy):
+            app.session.press()
+            clock.now += PAST_MIN_FLIP
+            app.session.press()
+        self.assertEqual(len(sent), 1)
+        record, fields = sent[0]
+        self.assertEqual(fields["capturedAt"], record.started_utc)
+        self.assertRegex(fields["capturedAt"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        self.assertEqual(app.outbox.pending_count(), 1)
+
+
+class EvidenceSyncTests(TmpCase):
+    def setUp(self) -> None:
+        super().setUp()
+        with open(os.path.join(self.tmp, "users.json"), "w", encoding="utf-8") as fh:
+            json.dump({"op1": {"password_hash": hash_password("operator-pass-1"), "role": "operator"}}, fh)
+
+    def evidence_cfg(self, dest_exists: bool = True) -> dict:
+        cfg = base_config(self.tmp)
+        cfg["mes"]["sync_interval_s"] = 0.05
+        self.dest = os.path.join(self.tmp, "laptop-store")
+        if dest_exists:
+            os.makedirs(self.dest)
+        self.queue_dir = os.path.join(self.tmp, "evq")
+        cfg["evidence"] = {"sync": {"dest_root": self.dest, "queue_dir": self.queue_dir}}
+        return cfg
+
+    def build(self, cfg: dict, clock: FakeClock) -> StationApp:
+        app = build_station(cfg, cameras=FakeCameraSet(), model=MarkerModel("test-1"),
+                            outputs=RecordingOutputs(), clock=clock)
+        self.addCleanup(app.stop)
+        return app
+
+    def press_good(self, app: StationApp, clock: FakeClock) -> None:
+        app.session.press()
+        clock.now += PAST_MIN_FLIP
+        app.session.press()
+
+    def queue_path(self) -> str:
+        return os.path.join(self.queue_dir, "evidence_sync_queue.jsonl")
+
+    def test_saved_part_is_queued_after_save_and_copied_on_sync(self) -> None:
+        from station.evidence_sync import SyncQueue
+
+        clock = FakeClock()
+        app = self.build(self.evidence_cfg(), clock)
+        self.press_good(app, clock)
+        self.assertEqual(app.session.counters["good"], 1)
+        part_dir = app.store.recent_parts(1)[0]["path"]
+        self.assertTrue(os.path.isfile(os.path.join(part_dir, "part.json")))  # saved first
+        self.assertFalse(os.path.exists(self.queue_path()))  # not queued yet: the press never waits
+
+        app.evidence_sync_once()
+        done = SyncQueue(self.queue_dir).done()
+        self.assertEqual([i["part_dir"] for i in done], [part_dir])
+        self.assertTrue(os.path.isfile(os.path.join(done[0]["archive_ref"], "part.json")))
+
+    def test_failed_sync_never_affects_the_verdict_or_the_part(self) -> None:
+        from station.evidence_sync import SyncQueue
+
+        clock = FakeClock()
+        app = self.build(self.evidence_cfg(dest_exists=False), clock)  # the laptop share is not mounted
+        self.press_good(app, clock)
+        self.assertEqual(app.session.counters, {"total": 1, "good": 1, "bad": 0})
+        self.assertEqual(app.session.state, State.IDLE)
+        app.evidence_sync_once()  # must not raise
+        pending = SyncQueue(self.queue_dir).pending()
+        self.assertEqual(len(pending), 1)
+        self.assertIn("evidence_sync", BuildTests._event_kinds(app.store))
+        self.assertEqual(app.store.recent_parts(1)[0]["final_verdict"], "GOOD")
+
+    def test_sync_failure_inside_the_queue_is_logged_not_raised(self) -> None:
+        clock = FakeClock()
+        app = self.build(self.evidence_cfg(), clock)
+        self.press_good(app, clock)
+        with mock.patch("station.app.SyncQueue.run_once", side_effect=OSError("share gone")):
+            app.evidence_sync_once()
+        self.assertIn("evidence_sync_failed", BuildTests._event_kinds(app.store))
+
+    def test_without_evidence_config_nothing_is_queued(self) -> None:
+        cfg = base_config(self.tmp)
+        clock = FakeClock()
+        app = self.build(cfg, clock)
+        self.press_good(app, clock)
+        self.assertEqual(app.session.counters["good"], 1)
+        self.assertEqual(app.evidence_sync_once(), {})
+        self.assertNotIn("evidence_sync", BuildTests._event_kinds(app.store))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "evq")))
+
+    def test_background_thread_syncs_on_its_interval_after_start(self) -> None:
+        from station.evidence_sync import SyncQueue
+
+        cfg = self.evidence_cfg()
+        cfg["ui"]["port"] = 0
+        clock = FakeClock()
+        app = self.build(cfg, clock)
+        app.start()
+        self.press_good(app, clock)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not SyncQueue(self.queue_dir).done():
+            time.sleep(0.05)
+        self.assertEqual(len(SyncQueue(self.queue_dir).done()), 1)
 
 
 if __name__ == "__main__":

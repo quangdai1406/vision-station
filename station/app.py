@@ -18,13 +18,20 @@ import json
 import os
 import pathlib
 import re
+import queue as _queue
 import sys
 import threading
 import time
 from dataclasses import replace
 from typing import Any, Callable, Mapping, Optional
 
-from station.auth import SessionManager, UserStore, load_users
+from station.auth import (
+    AUTH_MODES,
+    SessionManager,
+    UserStore,
+    load_users,
+    validate_role_map,
+)
 from station.cameras import (STALE_FLUSH_FRAMES, FakeCameraSet, OpenCvCameraSet, make_blur_check,
                              utc_now_iso)
 from station.contracts import (
@@ -36,6 +43,7 @@ from station.contracts import (
     InvalidTransition,
     OperatorLabel,
     PartRecord,
+    Side,
     State,
     StationError,
     Thresholds,
@@ -46,16 +54,20 @@ from station.contracts import (
 )
 from station.inference import CollectModel, MarkerModel
 from station.mes_client import MesClient, MesConfig, build_request
+from station.defect_proposal import DefectProposal
+from station.evidence_sync import SyncQueue, planned_destination
+from station.mes_session import MesSessionClient
 from station.modelstore import ModelError, ModelStore, load_runtime_model, register_loader
 from station.outbox import Outbox
 from station.outputs import ConsoleOutputs, SerialRelayOutputs
 from station.parts import MesPartsClient, PartsError, build_part_config
+from station.remote_model import RemoteModel
 from station.scan import ScanSession, ScanState
 from station.scanstore import ScanStore
 from station.session import StationSession
 from station.storage import (COLLECTED, Store, check_criterion_id, check_reject_reason,
                              label_status)
-from station.ui import make_server
+from station.ui import MES_MODE, make_server
 
 DEFAULT_UI_PORT = 8000
 DEFAULT_SESSION_TIMEOUT_S = 900.0
@@ -79,7 +91,8 @@ _REQUIRED_KEYS = (
     "model", "outputs",
 )
 # part_number is required in 'fixed' mode only (checked in validate_config).
-_OPTIONAL_KEYS = ("part_number", "parts", "ui", "flip_timeout_s", "min_flip_s", "frame_ok", "scan")
+_OPTIONAL_KEYS = ("part_number", "parts", "ui", "flip_timeout_s", "min_flip_s", "frame_ok", "scan",
+                  "auth", "evidence")
 _ALL_KEYS = _REQUIRED_KEYS + _OPTIONAL_KEYS
 _STRING_KEYS = (
     "site", "line", "station_id", "lot", "operator", "supervisor",
@@ -88,6 +101,7 @@ _STRING_KEYS = (
 _EXTRACTOR_ARCHS = ("resnet18", "wide_resnet50_2")
 _EXTRACTOR_DEVICES = ("auto", "cpu", "cuda")
 _NEEDS_TORCH = "This part needs the anomaly model, which needs torch on this PC."
+_REMOTE_KEYS = ("base_url", "token_env", "timeout_s")
 
 
 class ConfigError(ValueError):
@@ -212,6 +226,28 @@ def _validate_mes(raw: Any) -> dict:
     }
 
 
+def _validate_auth(raw: Any) -> dict:
+    """auth.mode 'local' (username and password) or 'mes_ticket' (one-time tickets from the MES)."""
+    if raw is None:
+        return {"mode": "local", "role_map": None}
+    auth = _obj(raw, "auth")
+    _check_keys(auth, ("mode", "role_map"), "auth", required=("mode",))
+    mode = auth["mode"]
+    if mode not in AUTH_MODES:
+        raise ConfigError("auth.mode must be 'local' or 'mes_ticket'")
+    if mode == "local":
+        if auth.get("role_map") is not None:  # None is what validate_config itself writes back
+            raise ConfigError("auth.role_map is only used when auth.mode is 'mes_ticket': remove it")
+        return {"mode": "local", "role_map": None}
+    if "role_map" not in auth:
+        raise ConfigError("auth.role_map is required when auth.mode is 'mes_ticket'")
+    try:
+        role_map = validate_role_map(auth["role_map"])
+    except ValueError as exc:
+        raise ConfigError(f"auth.{exc}") from None
+    return {"mode": mode, "role_map": role_map}
+
+
 def _validate_cameras(raw: Any) -> dict:
     path = "cameras"
     cams = _obj(raw, path)
@@ -315,10 +351,48 @@ def _validate_extractor(raw: Any) -> Optional[dict]:
     return {"arch": arch, "input_hw": [hw[0], hw[1]], "weights_path": weights, "device": device}
 
 
+def _validate_remote(raw: Any) -> dict:
+    """model.remote: score pictures on the laptop inference service instead of a local model."""
+    path = "model.remote"
+    remote = _obj(raw, path)
+    _check_keys(remote, _REMOTE_KEYS, path)
+    for key in _REMOTE_KEYS:
+        if key not in remote:
+            raise ConfigError(f"model.remote.{key} is required")
+    base_url = remote["base_url"]
+    if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
+        raise ConfigError("model.remote.base_url must start with http:// or https://")
+    token_env = remote["token_env"]
+    if not isinstance(token_env, str) or not _ENV_NAME_RE.match(token_env):
+        raise ConfigError("model.remote.token_env must be the NAME of an environment variable "
+                          "(for example INFERENCE_TOKEN), never the token itself")
+    timeout = remote["timeout_s"]
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not timeout > 0:
+        raise ConfigError("model.remote.timeout_s must be a positive number of seconds "
+                          "(it has no default: measure the laptop round trip first)")
+    return {"base_url": base_url, "token_env": token_env, "timeout_s": float(timeout)}
+
+
+def _validate_evidence(raw: Any) -> dict:
+    """evidence: copy saved parts to the laptop evidence store (optional, off when absent)."""
+    evidence = _obj({} if raw is None else raw, "evidence")
+    _check_keys(evidence, ("sync",), "evidence")
+    sync = evidence.get("sync")
+    if sync is None:
+        return {"sync": None}
+    sync = _obj(sync, "evidence.sync")
+    _check_keys(sync, ("dest_root", "queue_dir"), "evidence.sync", required=("dest_root", "queue_dir"))
+    return {"sync": {
+        "dest_root": _str(sync, "dest_root", "evidence.sync"),
+        "queue_dir": _str(sync, "queue_dir", "evidence.sync"),
+    }}
+
+
 def _validate_model(raw: Any) -> dict:
     path = "model"
     model = _obj(raw, path)
-    _check_keys(model, ("kind", "path", "version", "extractor"), path, required=("kind", "version"))
+    _check_keys(model, ("kind", "path", "version", "extractor", "remote"), path,
+                required=("kind", "version"))
     kind = model["kind"]
     if kind not in ("marker", "onnx", "golden", "collect"):
         raise ConfigError("model.kind must be 'marker', 'onnx', 'golden' or 'collect'")
@@ -329,11 +403,18 @@ def _validate_model(raw: Any) -> dict:
         raise ConfigError(f"model.path is required when model.kind is '{kind}'")
     if model_path is not None and not isinstance(model_path, str):
         raise ConfigError("model.path must be a string")
+    remote = model.get("remote")
+    if remote is not None:
+        if model_path is not None or model.get("extractor") is not None:
+            raise ConfigError("model.remote is used instead of a local model: remove model.path and "
+                              "model.extractor")
+        remote = _validate_remote(remote)
     return {
         "kind": kind,
         "path": model_path,
         "version": _str(model, "version", path),
         "extractor": _validate_extractor(model.get("extractor")),
+        "remote": remote,
     }
 
 
@@ -446,6 +527,8 @@ def validate_config(data: Any) -> dict:
     out["model"] = _validate_model(cfg["model"])
     if out["model"]["kind"] == "collect" and parts["mode"] != "fixed":
         raise ConfigError("model.kind 'collect' needs parts.mode 'fixed': collect mode has no approved model per part")
+    if out["model"]["remote"] is not None and parts["mode"] != "mes":
+        raise ConfigError("model.remote needs parts.mode 'mes': a fixed station uses one local model")
     out["outputs"] = _validate_outputs(cfg["outputs"])
     out["flip_timeout_s"] = _number(cfg.get("flip_timeout_s", DEFAULT_FLIP_TIMEOUT_S),
                                     "flip_timeout_s", positive=True)
@@ -458,6 +541,8 @@ def validate_config(data: Any) -> dict:
         frame_ok = {"min_variance": _number(frame_ok["min_variance"], "frame_ok.min_variance", lo=0.0)}
     out["frame_ok"] = frame_ok
     out["scan"] = _validate_scan(cfg.get("scan"))
+    out["auth"] = _validate_auth(cfg.get("auth"))
+    out["evidence"] = _validate_evidence(cfg.get("evidence"))
     return out
 
 
@@ -482,6 +567,10 @@ def load_config(path: str | os.PathLike) -> dict:
             extractor = model.get("extractor")
             if isinstance(extractor, dict):
                 extractor["weights_path"] = _resolve_path(extractor.get("weights_path"), base)
+        evidence = data.get("evidence")
+        if isinstance(evidence, dict) and isinstance(evidence.get("sync"), dict):
+            for key in ("dest_root", "queue_dir"):
+                evidence["sync"][key] = _resolve_path(evidence["sync"].get(key), base)
         if data.get("parts") is None:
             data["parts"] = {}
         parts = data["parts"]
@@ -593,13 +682,15 @@ class _LockedSession:
             raise StationError("part selection is not wired to a station")
         return self._app
 
-    def press(self) -> bool:
+    def press(self, by: Optional[str] = None, station_session: Optional[str] = None) -> bool:
         # The inverse of the scan start guard: no inspection press while a scan is active.
         # Refused presses return False, as the session does for an ignored press.
         with self._lock:
             if self._app is not None and self._app.scan_blocks_press():
                 return False
-            return self._session.press()
+            if by is None and station_session is None:
+                return self._session.press()
+            return self._session.press(by=by, station_session=station_session)
 
     def ack_alarm(self) -> None:
         with self._lock:
@@ -616,6 +707,18 @@ class _LockedSession:
     def override(self, by: str, new_verdict, reason: str) -> None:
         with self._lock:
             self._session.override(by=by, new_verdict=new_verdict, reason=reason)
+
+    def part_criteria(self) -> list:
+        return self._need_app().part_criteria()
+
+    def propose_defect(self, by: str, criterion_id: str, camera_id: str, side: str,
+                       note: str = "") -> dict:
+        # The app takes the session lock itself (it reads the part's criteria first).
+        return self._need_app().propose_defect(by=by, criterion_id=criterion_id, camera_id=camera_id,
+                                               side=side, note=note)
+
+    def remove_defect(self, criterion_id: str) -> dict:
+        return self._need_app().remove_defect(criterion_id)
 
     def label_part(self, by: str, verdict, criterion_id: Optional[str] = None,
                    part_id: Optional[str] = None) -> dict:
@@ -797,9 +900,16 @@ class StationApp:
         self._sync_thread: Optional[threading.Thread] = None
         self.sync_interval_s = cfg["mes"]["sync_interval_s"]
         self._collect_only = cfg["model"]["kind"] == "collect"
+        self._remote_cfg: Optional[dict] = cfg["model"]["remote"]  # set: parts come from the laptop
+        self._evidence_cfg: Optional[dict] = None  # set in _wire when evidence sync applies
+        self._evidence_lock = threading.Lock()
+        self._evidence_inbox: "_queue.Queue[str]" = _queue.Queue()  # press thread -> sync thread
+        self._evidence_thread: Optional[threading.Thread] = None
 
         if demo and self._parts_mode == "mes":
             raise ConfigError("the demo station uses the demo model: set parts.mode to 'fixed' for --demo")
+        if demo and cfg["auth"]["mode"] == MES_MODE:
+            raise ConfigError("the demo station cannot use auth.mode 'mes_ticket'")
 
         # Devices and model first: a failure here leaves nothing open.
         cameras = cameras if cameras is not None else self._make_cameras(cfg)
@@ -871,6 +981,11 @@ class StationApp:
     def _wire(self, cfg: dict, cameras, model, outputs, *, token: Optional[str], demo: bool) -> None:
         self.session_thresholds = Thresholds(t_low=cfg["thresholds"]["t_low"],
                                              t_img=cfg["thresholds"]["t_img"])
+        # Evidence copy: full-station, non-demo parts only (a demo or partial part never goes to the
+        # laptop store that the trainer reads).
+        evidence_sync = cfg["evidence"]["sync"]
+        if evidence_sync is not None and not demo and not self.partial:
+            self._evidence_cfg = dict(evidence_sync)
 
         # MES: a missing token disables posting, not inspection. A partial station never
         # posts unless mes.allow_partial_cameras is true.
@@ -891,6 +1006,7 @@ class StationApp:
             default_bad_disposition=mes["default_bad_disposition"],
         )
         self._client = MesClient(self._mes_cfg) if self.mes_enabled else None
+        self.auth_mode: str = cfg["auth"]["mode"]
         # Part search needs the token too, whatever demo or partial rules say about posting.
         self._parts_client = (MesPartsClient(mes["base_url"], token)
                               if self._parts_mode == "mes" and token else None)
@@ -935,7 +1051,7 @@ class StationApp:
             clock=self._clock,
             now_utc=self._now_utc,
             part_id_factory=_PartIdFactory(self.store, self._now_utc),
-            on_complete=self._enqueue,
+            on_complete=self._on_part_saved,
             initial_counters=self.store.counters(),
             camera_ids=camera_ids,
             collect_only=self._collect_only,
@@ -962,18 +1078,42 @@ class StationApp:
             )
             self.scan = _LockedScan(self._scan_session, self._session_lock)
 
-        try:
-            users = load_users(cfg["users_file"])
-        except FileNotFoundError as exc:
-            raise StationError(
-                f"users file not found: {cfg['users_file']} "
-                "(create users with: python -m station users add <username> <role>)"
-            ) from exc
+        mes_auth: Optional[MesSessionClient] = None
+        on_expire = None
+        if self.auth_mode == MES_MODE:
+            # Inspectors log in from the MES: no local users. The MES token comes from the same
+            # environment variable as posting; an idle or expired session ends the MES session.
+            if not token:
+                raise ConfigError(
+                    f"auth.mode 'mes_ticket' needs the MES token: set the environment variable "
+                    f"{mes['token_env']}"
+                )
+            mes_auth = MesSessionClient(mes["base_url"], token)
+
+            def on_expire(_token: str, _username: str, mes_session: Optional[str]) -> None:
+                if mes_session is None:
+                    return
+                try:
+                    mes_auth.end(mes_session)
+                except Exception:  # the station session is already gone; the MES expires it
+                    pass
+
+            users = UserStore({})
+        else:
+            try:
+                users = load_users(cfg["users_file"])
+            except FileNotFoundError as exc:
+                raise StationError(
+                    f"users file not found: {cfg['users_file']} "
+                    "(create users with: python -m station users add <username> <role>)"
+                ) from exc
         self.users: UserStore = users
-        self.sessions = SessionManager(timeout_s=cfg["ui"]["session_timeout_s"])
+        self.sessions = SessionManager(timeout_s=cfg["ui"]["session_timeout_s"], on_expire=on_expire)
         self._locked = _LockedSession(self.session, self._session_lock, self)
         self.server = make_server(self._locked, users, self.sessions,
-                                  host=cfg["ui"]["host"], port=cfg["ui"]["port"], scan=self.scan)
+                                  host=cfg["ui"]["host"], port=cfg["ui"]["port"], scan=self.scan,
+                                  auth_mode=self.auth_mode, mes_auth=mes_auth,
+                                  role_map=cfg["auth"]["role_map"])
 
     # ------------------------------------------------------- Taking data
 
@@ -1005,6 +1145,67 @@ class StationApp:
         finally:
             ob.close()
 
+    def _on_part_saved(self, record: PartRecord) -> None:
+        """on_complete hook, run after the part is saved. Never raises and never waits on the network."""
+        self._enqueue(record)
+        self._evidence_enqueue(record)
+
+    def _evidence_enqueue(self, record: PartRecord) -> None:
+        """Hand the saved part to the evidence sync thread. Only a memory handoff: no file or network I/O."""
+        if self._evidence_cfg is None:
+            return
+        try:
+            part_dir = self.store._known_path(record.session_id)
+            if part_dir is None:
+                raise StationError("saved part is not in the store index")
+            self._evidence_inbox.put_nowait(str(part_dir))
+        except Exception as exc:
+            self._log_quietly("evidence_enqueue_failed",
+                              {"part_id": record.part_id, "error": str(exc) or type(exc).__name__})
+
+    def _evidence_drain_inbox(self, queue: SyncQueue) -> None:
+        """Write the handed-over parts into the sync queue file (one failure never stops the rest)."""
+        while True:
+            try:
+                part_dir = self._evidence_inbox.get_nowait()
+            except _queue.Empty:
+                return
+            try:
+                queue.enqueue(part_dir)
+            except Exception as exc:
+                self._log_quietly("evidence_enqueue_failed",
+                                  {"part": pathlib.Path(part_dir).name,
+                                   "error": str(exc) or type(exc).__name__})
+
+    def evidence_sync_once(self) -> dict[str, int]:
+        """Queue the parts saved since the last run, then copy the pending ones to the laptop once.
+
+        Never raises: a failed copy leaves the part queued for the next run and logs an event.
+        Returns the counts ({} when evidence sync is not configured).
+        """
+        cfg = self._evidence_cfg
+        if cfg is None:
+            return {}
+        with self._evidence_lock:
+            try:
+                queue = SyncQueue(cfg["queue_dir"])
+                self._evidence_drain_inbox(queue)
+                report = queue.run_once(cfg["dest_root"])
+            except Exception as exc:
+                self._log_quietly("evidence_sync_failed", {"error": str(exc) or type(exc).__name__})
+                return {}
+        counts = {"synced": report.synced, "failed": report.failed, "pending": report.pending}
+        if report.synced or report.failed:
+            self._log_quietly("evidence_sync", {**counts, "errors": report.errors[:5]})
+        return counts
+
+    def _evidence_loop(self) -> None:
+        while not self._stop_event.wait(self.sync_interval_s):
+            try:
+                self.evidence_sync_once()
+            except Exception as exc:  # keep the thread alive; evidence_sync_once already logs its own failures
+                self._log_quietly("evidence_sync_failed", {"error": str(exc) or type(exc).__name__})
+
     def _enqueue(self, record: PartRecord) -> None:
         """on_complete hook: queue the saved part for MES. Never raises."""
         if self._demo:
@@ -1017,15 +1218,29 @@ class StationApp:
             part_dir = self.store._known_path(record.session_id)
             if part_dir is None:
                 raise StationError("saved part is not in the store index")
+            station_session = self.session.station_session_for(record.part_id)
+            if self.auth_mode == MES_MODE and not station_session:
+                # mes_ticket: a part is posted only under the inspector's MES session, never anonymously
+                raise StationError("no MES session for this part: it is not sent to the MES")
+            proposals = self.session.proposals_for(record.part_id)
+            extra: dict[str, Any] = {"proposals": proposals} if proposals else {}
             fields, files = build_request(record, self._mes_cfg_for(record.part_number),
-                                          self.store.archive_ref(part_dir))
-            self._with_outbox(lambda ob: ob.enqueue(record.session_id, fields, files))
+                                          self._archive_ref(part_dir), **extra)
+            self._with_outbox(lambda ob: ob.enqueue(record.session_id, fields, files,
+                                                    station_session=station_session))
         except Exception as exc:
             self.store.append_event(
                 "mes_enqueue_failed",
                 {"part_id": record.part_id, "error": str(exc) or type(exc).__name__},
                 session_id=record.session_id,
             )
+
+    def _archive_ref(self, part_dir: pathlib.Path) -> str:
+        """archiveRef for the MES post: the laptop path the part will have after sync when
+        evidence.sync is configured (planned_destination), else the local folder."""
+        if self._evidence_cfg is None:
+            return self.store.archive_ref(part_dir)
+        return planned_destination(part_dir, self._evidence_cfg["dest_root"])
 
     def sync_once(self, now: Optional[float] = None) -> dict[str, int]:
         """Drain the outbox once. Logs a 'mes_sync' event when anything was attempted."""
@@ -1065,6 +1280,10 @@ class StationApp:
         if self._client is not None:
             self._sync_thread = threading.Thread(target=self._sync_loop, name="mes-sync", daemon=True)
             self._sync_thread.start()
+        if self._evidence_cfg is not None:
+            self._evidence_thread = threading.Thread(target=self._evidence_loop, name="evidence-sync",
+                                                     daemon=True)
+            self._evidence_thread.start()
 
     def _open_cameras(self) -> None:
         """Open the cameras before the UI starts. Never raises.
@@ -1142,10 +1361,29 @@ class StationApp:
             raise PartsError(f"part {pn} not found in the MES")
         part_cfg = build_part_config(client.criteria(pn))
         warnings = list(part_cfg["warnings"])
+        remote: Optional[RemoteModel] = None
+        remote_error: Optional[str] = None
+        if self._remote_cfg is not None:
+            # The laptop must list an approved model for this part before the part can be chosen.
+            try:
+                remote = RemoteModel(self._remote_cfg["base_url"], self._remote_cfg["token_env"],
+                                     self._remote_cfg["timeout_s"], pn)
+                remote.check_approved()
+            except StationError as exc:
+                remote_error = str(exc)
         with self._session_lock:
             if self.session.state is not State.IDLE:
                 raise InvalidTransition(f"a part cannot be selected while {self.session.state.value}")
             self._part_configs[pn] = part_cfg
+            if self._remote_cfg is not None:
+                if remote_error is not None or remote is None:
+                    return self._block_part(pn, remote_error or "no approved model on the laptop", warnings)
+                self.session.set_blocked(None)
+                self.session.set_part(pn, remote, remote.version)
+                self.store.append_event("part_selected",
+                                        {"part_number": pn, "model_version": remote.version, "by": by.strip()})
+                return {"part_number": pn, "model_version": remote.version, "can_inspect": True,
+                        "warnings": warnings}
             try:
                 info = ModelStore(self._models_dir).current(pn)
             except ModelError as exc:
@@ -1310,6 +1548,39 @@ class StationApp:
                  "proposed_by": r["operator_label"].get("proposed_by"),
                  "proposed_at": r["operator_label"].get("proposed_at")} for r in rows]
 
+    # ------------------------------------------------------- defect proposals
+
+    def part_criteria(self) -> list[dict]:
+        """The active criteria (id, name, description) of the part being shown; [] if none."""
+        with self._session_lock:
+            part = self._part_configs.get(self.session.part_number) if self._parts_mode == "mes" else None
+            return [dict(c) for c in part["criteria"]] if part is not None else []
+
+    def propose_defect(self, by: str, criterion_id: str, camera_id: str, side: str,
+                       note: str = "") -> dict:
+        """Add a human defect proposal to the part being shown. `by` is the logged-in inspector.
+
+        Raises ValueError (no criteria, criterion not active, picture not one of the 8, bad note),
+        InvalidTransition (the part is not shown in VERDICT or SUPERVISOR_REVIEW).
+        """
+        if not isinstance(by, str) or not by.strip():
+            raise ValueError("by is required")
+        try:
+            side_value = Side(side)
+        except ValueError:
+            raise ValueError("side must be TOP or BOTTOM") from None
+        proposal = DefectProposal(criterion_id=criterion_id, camera_id=camera_id, side=side_value, note=note)
+        with self._session_lock:
+            part = self._part_configs.get(self.session.part_number) if self._parts_mode == "mes" else None
+            criteria_ids = list(part["criteria_ids"]) if part is not None else []
+            replaced = self.session.propose_defect(proposal, by=by.strip(), criteria_ids=criteria_ids)
+        return {"replaced": replaced}
+
+    def remove_defect(self, criterion_id: str) -> dict:
+        """Remove the proposal for one criterion of the part being shown."""
+        with self._session_lock:
+            return {"removed": self.session.remove_defect(criterion_id)}
+
     def _block_part(self, part_number: str, reason: str, warnings: list[str]) -> dict:
         self.session.clear_part()
         self.session.set_blocked(reason)
@@ -1366,9 +1637,14 @@ class StationApp:
         if self._started:
             self.server.shutdown()
         self.server.server_close()
-        for thread in (self._ui_thread, self._sync_thread):
+        for thread in (self._ui_thread, self._sync_thread, self._evidence_thread):
             if thread is not None:
                 thread.join(timeout=10)
+        if self._evidence_cfg is not None:
+            try:  # keep parts handed over but not yet written to the queue file
+                self._evidence_drain_inbox(SyncQueue(self._evidence_cfg["queue_dir"]))
+            except Exception:
+                pass
         self.outbox.close()
 
 

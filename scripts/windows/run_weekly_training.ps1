@@ -7,11 +7,16 @@
 #   2. checks that the evidence folder exists, is not empty and is not online-only
 #      (OneDrive placeholder files), so it never trains on a partial set,
 #   3. checks the GPU with nvidia-smi when it is installed,
-#   4. runs the trainer: python -m trainer weekly (it writes a candidate model and a report),
+#   3b. asks the inference service (optional key inference_health_url) whether it is busy.
+#      Busy: training does not start (exit 4). Unreachable: training continues and says so.
+#   4. runs the trainer: python -m trainer weekly (it writes a candidate model and a report).
+#      The trainer runs at BelowNormal process priority, so the laptop stays usable for the
+#      inference service and the MES. Its output is written to files in the logs folder and
+#      copied into the transcript when it ends.
 #   5. writes a transcript log (the last 26 are kept) and exits with the trainer's exit code.
 #
-# Exit codes: 3 = preflight check failed (nothing was trained); any other code is the
-# trainer's own exit code.
+# Exit codes: 3 = preflight check failed (nothing was trained); 4 = inference service busy
+# (nothing was trained); any other code is the trainer's own exit code.
 #
 # This script never approves or deploys a model, and it never deletes evidence.
 # Approval is a named person's manual step, taken after Quality has reviewed the report.
@@ -167,31 +172,78 @@ try {
         }
     }
 
-    # 4. Trainer ----------------------------------------------------------------
-    Step 'Running the trainer'
-    # The trainer reads the extractor section from its own JSON file; write it to the logs folder.
-    $extractorFile = Join-Path $logs 'extractor-config.json'
-    $extractorSettings | ConvertTo-Json -Depth 4 |
-        Set-Content -LiteralPath $extractorFile -Encoding UTF8
-
-    $trainerArgs = @(
-        '-m', 'trainer', 'weekly',
-        '--store', $store,
-        '--models', $models,
-        '--reports', $reports,
-        '--min-good', $minGood,
-        '--min-holdout', $minHoldout,
-        '--holdout-fraction', $holdoutFraction,
-        '--extractor-config', $extractorFile
-    )
-    Push-Location -LiteralPath $RepoRoot
-    try {
-        & $python @trainerArgs
-        $exitCode = $LASTEXITCODE
-    } finally {
-        Pop-Location
+    # 3b. Inference service busy check ----------------------------------------
+    # Optional key. Not set (key missing or empty): the check is skipped and the transcript says so.
+    # Set: the URL is called with a short timeout. The URL is never printed (it may carry a secret).
+    Step 'Inference service check'
+    $inferenceBusy = $false
+    $healthProp = $cfg.PSObject.Properties['inference_health_url']
+    if (-not $healthProp -or [string]::IsNullOrWhiteSpace([string]$healthProp.Value)) {
+        Write-Host '  inference_health_url not set: busy check skipped'
+    } else {
+        $healthUrl = Get-RequiredValue $cfg 'inference_health_url'
+        try {
+            # /v1/health needs no token and answers busy as a JSON boolean. Anything else
+            # (no busy, or not a boolean) is not an answer: it is reported, never read as idle.
+            $health = Invoke-RestMethod -Uri $healthUrl -Method Get -TimeoutSec 5
+            if (-not $health.PSObject.Properties['busy'] -or $health.busy -isnot [bool]) {
+                Warn 'inference service answer has no boolean busy; continuing with training.'
+            } elseif ($health.busy) {
+                $inferenceBusy = $true
+                Write-Host '  inference service reports busy'
+            } else {
+                Write-Host '  inference service idle'
+            }
+        } catch {
+            Warn "inference service unreachable ($($_.Exception.GetType().Name)); continuing with training."
+        }
     }
-    Write-Host "Trainer exit code: $exitCode"
+
+    if ($inferenceBusy) {
+        Write-Host 'REFUSED: the inference service reports a request in progress. Training did not start.'
+        Write-Host 'Start the task again when the service is idle, or run the script by hand.'
+        $exitCode = 4
+    } else {
+        # 4. Trainer ------------------------------------------------------------
+        Step 'Running the trainer'
+        # The trainer reads the extractor section from its own JSON file; write it to the logs folder.
+        $extractorFile = Join-Path $logs 'extractor-config.json'
+        $extractorSettings | ConvertTo-Json -Depth 4 |
+            Set-Content -LiteralPath $extractorFile -Encoding UTF8
+
+        $trainerArgs = @(
+            '-m', 'trainer', 'weekly',
+            '--store', $store,
+            '--models', $models,
+            '--reports', $reports,
+            '--min-good', $minGood,
+            '--min-holdout', $minHoldout,
+            '--holdout-fraction', $holdoutFraction,
+            '--extractor-config', $extractorFile
+        )
+        # Start-Process joins the arguments without quoting, so quote any that contain spaces.
+        $trainerLine = ($trainerArgs | ForEach-Object {
+            $a = [string]$_
+            if ($a -match '\s') { '"' + $a + '"' } else { $a }
+        }) -join ' '
+        $stdoutFile = Join-Path $logs 'trainer-stdout.txt'
+        $stderrFile = Join-Path $logs 'trainer-stderr.txt'
+
+        $proc = Start-Process -FilePath $python -ArgumentList $trainerLine -WorkingDirectory $RepoRoot `
+            -NoNewWindow -PassThru -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+        # Below normal priority: the inference service and the MES keep their CPU and disk time.
+        $proc.PriorityClass = [Diagnostics.ProcessPriorityClass]::BelowNormal
+        $null = $proc.Handle   # cache the process handle so ExitCode can be read after exit
+        $proc.WaitForExit()
+        $exitCode = $proc.ExitCode
+
+        foreach ($f in @($stdoutFile, $stderrFile)) {
+            if (Test-Path -LiteralPath $f -PathType Leaf) {
+                Get-Content -LiteralPath $f -Encoding UTF8 | ForEach-Object { Write-Host $_ }
+            }
+        }
+        Write-Host "Trainer exit code: $exitCode"
+    }
 }
 catch {
     Write-Host "FAILED: $($_.Exception.Message)"

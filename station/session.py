@@ -78,6 +78,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
 from station.storage import COLLECTED
+from station.defect_proposal import (DefectProposal, ProposalRecord, add_proposal, check_proposal,
+                                     remove_proposal)
 from station.contracts import (
     CAMERA_IDS,
     IMAGES_PER_PART,
@@ -198,6 +200,10 @@ class StationSession:
         self._lot = lot
         self._operator = operator
         self._supervisor = supervisor
+        # mes_ticket mode: the inspector who pressed the top side (None: the configured operator
+        # is used) and the MES session of each part, kept until the part is handed to on_complete.
+        self._part_operator: Optional[str] = None
+        self._station_session_by_part: dict[str, str] = {}
         self._material_handler = material_handler
         self._flip_timeout_s = flip_timeout_s
         if min_flip_s < 0:
@@ -225,11 +231,16 @@ class StationSession:
         self._fault: Optional[str] = None
         self._fault_return: Optional[State] = None
         self._block_reason: str = ""
+        # Human defect proposals of a completed part, handed to the MES post once (see proposals_for).
+        self._completed_proposals: dict[str, list[ProposalRecord]] = {}
         self._clear_part()
 
     # ------------------------------------------------------------------ public
 
-    def press(self) -> bool:
+    def press(self, by: Optional[str] = None, station_session: Optional[str] = None) -> bool:
+        """One press. by / station_session are the logged-in inspector and their MES session
+        (mes_ticket mode); the part is recorded under the inspector who pressed the top side.
+        A different inspector at the flip faults the part: it is never recorded under their name."""
         if self.state is State.IDLE and not self.can_inspect:
             self._log("press_ignored", {"reason": "no_part_or_model", "state": self.state.value,
                                         "block_reason": self._block_reason},
@@ -251,11 +262,23 @@ class StationSession:
                       session_id=self._active_session_id())
             return False
 
+        if (self.state is State.WAIT_FLIP and by is not None and self._part_operator is not None
+                and by != self._part_operator):
+            self._station_session_by_part.pop(self._part_id, None)
+            self._fail(StationError(
+                "another inspector pressed the flip for this part, so it is not recorded under "
+                "their name. Clear the fault to discard the part."),
+                stage="inspector_changed", return_state=None)
+            return False
+
         self._last_press = now
         try:
             if self.state is State.IDLE:
                 self._outputs.clear()
                 self._begin_part()
+                self._part_operator = by
+                if by is not None and station_session is not None:
+                    self._station_session_by_part[str(self._part_id)] = station_session
                 self._log("press", {"side": Side.TOP.value, "part_id": self._part_id, **self._station_fields()},
                           session_id=self._session_id)
                 if self._run_side(Side.TOP, fail_state=State.IDLE):
@@ -268,6 +291,46 @@ class StationSession:
         finally:
             self._last_done = self._clock()  # debounce runs from the end of this press, faults included
         return True
+
+    def propose_defect(self, proposal: DefectProposal, *, by: str, criteria_ids) -> bool:
+        """Add a human defect proposal to the part being shown (VERDICT or SUPERVISOR_REVIEW).
+
+        by is the logged-in inspector (never the request body). criteria_ids: the part's
+        ACTIVE criteria. Returns True when it replaced an earlier proposal for the same criterion.
+        Proposals only ever move the verdict toward BAD (see _finish).
+        """
+        if self._machine is Verdict.GOOD or self._final is Verdict.GOOD:
+            # Owner decision: GOOD timing and the green light stay as they are. Only BAD and REVIEW parts.
+            raise ValueError("proposing a defect on a part the model passed is not supported yet")
+        if self.state not in (State.VERDICT, State.SUPERVISOR_REVIEW):
+            raise InvalidTransition(f"propose_defect is not allowed in {self.state.value}")
+        if not isinstance(by, str) or not by.strip():
+            raise ValueError("by is required")
+        check_proposal(proposal, criteria_ids=criteria_ids, image_keys=self._image_keys())
+        row = ProposalRecord(criterion_id=proposal.criterion_id, camera_id=proposal.camera_id,
+                             side=proposal.side, note=proposal.note, proposed_by=by.strip(),
+                             proposed_at=self._now_utc())
+        self._proposals, replaced = add_proposal(self._proposals, row)
+        self._log("defect_proposed", {"part_id": self._part_id, "criterion_id": row.criterion_id,
+                                      "camera_id": row.camera_id, "side": row.side.value,
+                                      "replaced": replaced, "by": row.proposed_by},
+                  session_id=self._session_id)
+        return replaced
+
+    def remove_defect(self, criterion_id: str) -> bool:
+        """Remove the proposal for one criterion (VERDICT or SUPERVISOR_REVIEW). True if one was removed."""
+        if self.state not in (State.VERDICT, State.SUPERVISOR_REVIEW):
+            raise InvalidTransition(f"remove_defect is not allowed in {self.state.value}")
+        rows, removed = remove_proposal(self._proposals, criterion_id)
+        if removed:
+            self._proposals = rows
+            self._log("defect_removed", {"part_id": self._part_id, "criterion_id": criterion_id},
+                      session_id=self._session_id)
+        return removed
+
+    def proposals_for(self, part_id: str) -> list[ProposalRecord]:
+        """The defect proposals of a completed part, once (the MES post takes them). [] otherwise."""
+        return self._completed_proposals.pop(str(part_id), [])
 
     def ack_alarm(self) -> None:
         if self.state is not State.VERDICT or self._machine != Verdict.BAD:
@@ -450,6 +513,9 @@ class StationSession:
             "model_version": self._model_version,
             "can_inspect": self.can_inspect,
             "block_reason": self._block_reason,
+            # Human defect proposals of the part being shown (none once IDLE).
+            "defect_proposals": ([] if self.state is State.IDLE
+                                 else [r.as_dict() for r in self._proposals]),
         }
 
     @property
@@ -640,7 +706,16 @@ class StationSession:
         """Save and count a completed part exactly once, then light the outputs and return to IDLE.
 
         On a save failure the session enters FAULT and keeps the decision in `_pending`.
+        A human defect proposal on the part makes a GOOD outcome BAD (quarantine, alarm); it
+        never turns a BAD back to GOOD. The override record is dropped then (the 'override'
+        event is already logged).
         """
+        if self._proposals and final is Verdict.GOOD:
+            self._log("defect_proposal_forces_bad", {"part_id": self._part_id,
+                                                     "proposals": len(self._proposals)},
+                      session_id=self._session_id)
+            final, override, disposition = Verdict.BAD, None, "quarantine"
+            lights = ("show_bad", "alarm_off")
         self._pending = _PendingCompletion(final=final, override=override,
                                            disposition=disposition, lights=lights)
         self._try_complete()
@@ -651,12 +726,18 @@ class StationSession:
         if p is None:
             return False
         record = self._build_record(p)
+        rows = list(self._proposals)
         try:
-            self._store.save_part(record)
+            if rows:
+                self._store.save_part(record, defect_proposals=[r.as_dict() for r in rows])
+            else:
+                self._store.save_part(record)
         except Exception as exc:
             self._fail(exc, stage="save", return_state=None)
             return False
 
+        if rows:
+            self._completed_proposals[str(record.part_id)] = rows
         self._pending = None
         self._fault = None
         self._fault_return = None
@@ -695,7 +776,7 @@ class StationSession:
             station_id=self._station_id,
             part_number=self._part_number,
             lot=self._lot,
-            operator=self._operator,
+            operator=self._part_operator or self._operator,
             supervisor=self._supervisor,
             material_handler=self._material_handler,
             started_utc=self._started_utc,
@@ -719,6 +800,10 @@ class StationSession:
                             "return_state": return_state.value if return_state is not None else "retry_save"},
                   session_id=self._session_id)
 
+    def station_session_for(self, part_id: str) -> Optional[str]:
+        """The MES session the part was started in (mes_ticket mode), once. None otherwise."""
+        return self._station_session_by_part.pop(part_id, None)
+
     @staticmethod
     def _check_decision(by: str, new_verdict: Verdict, reason: str) -> Verdict:
         if new_verdict not in (Verdict.GOOD, Verdict.BAD):
@@ -728,6 +813,10 @@ class StationSession:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("reason is required")
         return Verdict(new_verdict)
+
+    def _image_keys(self) -> list[tuple[str, Side]]:
+        """(camera_id, side) of each of the part's images, TOP and BOTTOM for every camera."""
+        return [(cid, side) for cid in self._camera_ids for side in (Side.TOP, Side.BOTTOM)]
 
     def _all_frames(self) -> list[Frame]:
         return list(self._top_frames) + list(self._bottom_frames)
@@ -754,6 +843,7 @@ class StationSession:
         self._override: Optional[Override] = None
         self._disposition: Optional[str] = None
         self._pending: Optional[_PendingCompletion] = None
+        self._proposals: list[ProposalRecord] = []  # cleared when the next part starts
         self._fault = None
         self._fault_return = None
 

@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy this file to %USERPROFILE%\\VisionStation\\backup.json and replace every value that starts with '['. The backup refuses to run while any value is still a placeholder. keep_last has no default: it is an engineer's choice of how many nightly dumps to keep. Never put a password in this file; PostgreSQL settings come from the environment and PGPASSFILE (see docs/laptop_services.md).",
+  "backup_folder": "[Engineer to define: backup folder]",
+  "database": "[Engineer to define: MES database name]",
+  "pg_dump": "[Engineer to define: full path to pg_dump.exe, or pg_dump if it is on PATH]",
+  "keep_last": "[Engineer to define]"
+}
