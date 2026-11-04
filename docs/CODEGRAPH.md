@@ -10,7 +10,7 @@ python3 .claude/skills/code-graph/scripts/gen_codegraph_doc.py [--check]
 
 Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` tests need numpy, no camera or network). Station core is standard library only; `tools/` imports numpy/opencv lazily.
 
-52 code files, 54 test files, 290 import edges.
+52 code files, 55 test files, 297 import edges.
 
 ## Modules
 
@@ -23,30 +23,30 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 | `scripts/gen_code_index.py` | 81 | 0 | 0 | Write docs/CODE_INDEX.md: every Python file and its classes and functions, one line each. |
 | `station/__init__.py` | 1 | 0 | 0 |  |
 | `station/__main__.py` | 95 | 2 | 2 | Entry point. |
-| `station/anomaly.py` | 841 | 7 | 16 | PatchCore-style anomaly detection trained on GOOD parts only. |
-| `station/app.py` | 1681 | 11 | 9 | Wire the station together: config, build, run, and MES sync. |
-| `station/auth.py` | 247 | 14 | 13 | Password hashing, user store, role policy and in-memory session tokens. |
-| `station/cameras.py` | 1013 | 15 | 13 | Camera sources for the inspection station. |
-| `station/contracts.py` | 202 | 55 | 42 | Shared types and interfaces for the camera inspection station. |
-| `station/defect_proposal.py` | 85 | 3 | 11 | Human defect proposals on the part being shown (plan S3). Standard library only. |
-| `station/evidence_sync.py` | 382 | 4 | 11 | Copy saved part folders from the Pi to the laptop evidence store. |
-| `station/features_torch.py` | 324 | 5 | 16 | PyTorch feature extractor and cdist backend for the PatchCore anomaly model. |
-| `station/fusion.py` | 87 | 3 | 12 | Per-image classification and per-part fusion. |
-| `station/golden.py` | 416 | 9 | 18 | Compare-with-a-good-part model for the one-camera proof of concept. |
-| `station/inference.py` | 176 | 10 | 10 | Inference models for the inspection station. |
-| `station/mes_client.py` | 316 | 8 | 14 | MES client for the camera inspection station. |
-| `station/mes_session.py` | 168 | 4 | 13 | MES session client for the station: redeem a ticket, validate and end a session. |
-| `station/modelstore.py` | 607 | 14 | 17 | Per-part model versions on disk, with human approval. |
-| `station/outbox.py` | 226 | 3 | 11 | Durable outbox for inspection events waiting to be posted to the MES. |
-| `station/outputs.py` | 122 | 10 | 10 | Output drivers for lights and the alarm (implements contracts.OutputDriver). |
-| `station/parts.py` | 284 | 4 | 11 | Client for the MES part search and per-part inspection criteria. |
-| `station/remote_model.py` | 232 | 2 | 10 | Client for the laptop inference service (inference_service/server.py, plan L1). |
-| `station/scan.py` | 568 | 5 | 13 | One "Taking data" scan: from the first press of a part to a saved scan record. |
-| `station/scanstore.py` | 826 | 12 | 20 | Scan records for "Taking data" mode: 360-degree pictures for training. |
-| `station/session.py` | 855 | 3 | 10 | One inspection session: from the first press of a part to a completed record. |
-| `station/storage.py` | 698 | 12 | 18 | Storage for finished inspection parts and the append-only event log. |
+| `station/anomaly.py` | 841 | 7 | 17 | PatchCore-style anomaly detection trained on GOOD parts only. |
+| `station/app.py` | 1681 | 12 | 10 | Wire the station together: config, build, run, and MES sync. |
+| `station/auth.py` | 247 | 14 | 14 | Password hashing, user store, role policy and in-memory session tokens. |
+| `station/cameras.py` | 1013 | 16 | 14 | Camera sources for the inspection station. |
+| `station/contracts.py` | 202 | 56 | 43 | Shared types and interfaces for the camera inspection station. |
+| `station/defect_proposal.py` | 85 | 4 | 13 | Human defect proposals on the part being shown (plan S3). Standard library only. |
+| `station/evidence_sync.py` | 382 | 5 | 12 | Copy saved part folders from the Pi to the laptop evidence store. |
+| `station/features_torch.py` | 324 | 5 | 17 | PyTorch feature extractor and cdist backend for the PatchCore anomaly model. |
+| `station/fusion.py` | 87 | 3 | 13 | Per-image classification and per-part fusion. |
+| `station/golden.py` | 416 | 9 | 19 | Compare-with-a-good-part model for the one-camera proof of concept. |
+| `station/inference.py` | 176 | 10 | 11 | Inference models for the inspection station. |
+| `station/mes_client.py` | 319 | 8 | 15 | MES client for the camera inspection station. |
+| `station/mes_session.py` | 168 | 4 | 14 | MES session client for the station: redeem a ticket, validate and end a session. |
+| `station/modelstore.py` | 607 | 14 | 18 | Per-part model versions on disk, with human approval. |
+| `station/outbox.py` | 226 | 3 | 12 | Durable outbox for inspection events waiting to be posted to the MES. |
+| `station/outputs.py` | 122 | 11 | 11 | Output drivers for lights and the alarm (implements contracts.OutputDriver). |
+| `station/parts.py` | 284 | 4 | 12 | Client for the MES part search and per-part inspection criteria. |
+| `station/remote_model.py` | 232 | 2 | 11 | Client for the laptop inference service (inference_service/server.py, plan L1). |
+| `station/scan.py` | 568 | 5 | 14 | One "Taking data" scan: from the first press of a part to a saved scan record. |
+| `station/scanstore.py` | 826 | 12 | 21 | Scan records for "Taking data" mode: 360-degree pictures for training. |
+| `station/session.py` | 855 | 3 | 11 | One inspection session: from the first press of a part to a completed record. |
+| `station/storage.py` | 698 | 12 | 19 | Storage for finished inspection parts and the append-only event log. |
 | `station/teach.py` | 179 | 2 | 2 | `python -m station teach`: learn the golden model from GOOD parts on the real cameras. |
-| `station/ui.py` | 2704 | 5 | 12 | HTTP server for the inspection station: a JSON API plus one HTML page. |
+| `station/ui.py` | 2704 | 5 | 13 | HTTP server for the inspection station: a JSON API plus one HTML page. |
 | `station/users_cli.py` | 131 | 2 | 2 | `python -m station users add <username> <role>`: create or update a station login. |
 | `tools/__init__.py` | 6 | 8 | 7 | Repeatability and threshold-selection tools. See FORMAT.md. |
 | `tools/analysis.py` | 263 | 3 | 3 | Numpy-only image repeatability metrics. Shapes and return keys: see tools/FORMAT.md. |
@@ -71,14 +71,14 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 
 ## Hubs (change with care)
 
-- `station/contracts.py`: imported by 55 files
-- `station/cameras.py`: imported by 15 files
+- `station/contracts.py`: imported by 56 files
+- `station/cameras.py`: imported by 16 files
 - `station/auth.py`: imported by 14 files
 - `station/modelstore.py`: imported by 14 files
+- `station/app.py`: imported by 12 files
 - `station/scanstore.py`: imported by 12 files
 - `station/storage.py`: imported by 12 files
-- `station/app.py`: imported by 11 files
-- `station/inference.py`: imported by 10 files
+- `station/outputs.py`: imported by 11 files
 
 ## Internal imports (who imports what)
 
@@ -148,6 +148,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 - `tests/test_collect.py` -> `station/app.py`, `station/cameras.py`, `station/contracts.py`, `station/inference.py`, `station/outputs.py`, `station/session.py`, `station/storage.py`
 - `tests/test_defect_proposal.py` -> `station/auth.py`, `station/contracts.py`, `station/defect_proposal.py`, `station/evidence_sync.py`, `station/mes_client.py`, `station/storage.py`, `station/ui.py`
 - `tests/test_e2e.py` -> `station/app.py`, `station/auth.py`, `station/cameras.py`, `station/contracts.py`, `station/inference.py`, `station/outputs.py`
+- `tests/test_e2e_mes_flow.py` -> `station/app.py`, `station/cameras.py`, `station/contracts.py`, `station/evidence_sync.py`, `station/outputs.py`
 - `tests/test_e2e_parts.py` -> `station/app.py`, `station/auth.py`, `station/cameras.py`, `station/contracts.py`, `station/golden.py`, `station/inference.py`, `station/modelstore.py`, `station/outputs.py`
 - `tests/test_evidence_sync.py` -> `station/evidence_sync.py`
 - `tests/test_features_torch.py` -> `station/anomaly.py`, `station/contracts.py`, `station/features_torch.py`
@@ -156,7 +157,7 @@ Tests: `python3 -m unittest discover -s tests` (standard library; the `tools/` t
 - `tests/test_hubtest.py` -> `station/cameras.py`, `tools/hubtest.py`
 - `tests/test_inference.py` -> `station/contracts.py`, `station/inference.py`
 - `tests/test_inference_service.py` -> `inference_service/registry.py`, `inference_service/server.py`, `station/contracts.py`, `station/modelstore.py`
-- `tests/test_mes_client.py` -> `station/contracts.py`, `station/mes_client.py`
+- `tests/test_mes_client.py` -> `station/contracts.py`, `station/defect_proposal.py`, `station/mes_client.py`
 - `tests/test_mes_session.py` -> `station/contracts.py`, `station/mes_client.py`, `station/mes_session.py`, `station/outbox.py`
 - `tests/test_modelstore.py` -> `station/contracts.py`, `station/golden.py`, `station/modelstore.py`
 - `tests/test_outbox.py` -> `station/mes_client.py`, `station/outbox.py`

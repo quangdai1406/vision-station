@@ -101,11 +101,6 @@ def build_request(
                 failed.add(criterion_id)
                 if criterion_id not in best or defect.score > best[criterion_id][0]:
                     best[criterion_id] = (defect.score, result)
-        if not failed:
-            # e.g. a supervisor resolved a REVIEW to BAD with no defects recorded
-            if cfg.default_criterion_id is None:
-                raise MappingError("BAD part has no defects and no default_criterion_id is set")
-            failed.add(_check_criterion(cfg.default_criterion_id, cfg))
 
     if proposals and not is_bad:
         # A proposal makes the final verdict BAD (session rule); a GOOD post must never carry one.
@@ -116,6 +111,14 @@ def build_request(
         _check_criterion(proposal.criterion_id, cfg)
         failed.add(proposal.criterion_id)
         chosen[proposal.criterion_id] = (proposal.camera_id, proposal.side)
+
+    if is_bad and not failed:
+        # Failed criteria are the union of the model's defects and the proposals. Only when that
+        # union is empty (e.g. an anomaly model with no defect class, or a supervisor resolved a
+        # REVIEW to BAD with nothing recorded) does the default criterion apply.
+        if cfg.default_criterion_id is None:
+            raise MappingError("BAD part has no defects and no default_criterion_id is set")
+        failed.add(_check_criterion(cfg.default_criterion_id, cfg))
 
     checklist = {cid: ("fail" if cid in failed else "pass") for cid in cfg.criteria_ids}
 
