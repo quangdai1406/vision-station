@@ -73,7 +73,8 @@ class FakeCv2:
 
 
 class _FakeLaptop(BaseHTTPRequestHandler):
-    """Localhost stand-in for the laptop inference service (GET /v1/health, POST /v1/predict)."""
+    """Localhost stand-in for the laptop inference service: GET /v1/health (no token),
+    GET /v1/status and POST /v1/predict (bearer token)."""
 
     server_version = "FakeLaptop"
     sys_version = ""
@@ -96,9 +97,13 @@ class _FakeLaptop(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/v1/health":  # unauthenticated, as in the real service
+            self.server.health_headers.append(self.headers.get("Authorization"))
+            self._send(200, {"status": "ok", "busy": False, "in_flight": 0})
+            return
         if not self._authorised():
             return
-        if self.path != "/v1/health":
+        if self.path != "/v1/status":
             self._send(404, {"error": "not found"})
             return
         self._send(200, {"status": "ok", "version": "1", "models": [{"part_number": PART, "version": "v1"}],
@@ -123,6 +128,7 @@ class FakeLaptopServer:
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _FakeLaptop)
         self.httpd.token = token
         self.httpd.predict_headers = []
+        self.httpd.health_headers = []
         self.httpd.predict_status = 200
         self.httpd.predict_error = "internal error"
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -143,6 +149,10 @@ class FakeLaptopServer:
     @property
     def predict_headers(self) -> list:
         return self.httpd.predict_headers
+
+    @property
+    def health_headers(self) -> list:
+        return self.httpd.health_headers
 
 
 def _closed_port_url() -> str:
@@ -285,7 +295,27 @@ class LaptopTests(_Base):
             headers = laptop.predict_headers
         self.assertEqual(rc, 1)
         self.assertIn("HTTP 401", self.text)
+        self.assertIn("No picture was sent", self.text)
         self.assertEqual(headers, [])
+
+    def test_reachability_check_sends_no_token_to_health(self) -> None:
+        with FakeLaptopServer() as laptop:
+            self.run_main(["--inference-url", laptop.url, "--token-env", "PI_TOKEN",
+                           "--part-number", PART, "--images", "1"], env={"PI_TOKEN": TOKEN})
+            health_auth = laptop.health_headers
+        self.assertEqual(health_auth, [None])  # GET /v1/health: no Authorization header
+        inf = self.report()["inference"]
+        self.assertTrue(inf["health"]["ok"])
+        self.assertIs(inf["health"]["busy"], False)
+
+    def test_details_come_from_the_token_protected_status(self) -> None:
+        with FakeLaptopServer() as laptop:
+            self.run_main(["--inference-url", laptop.url, "--token-env", "PI_TOKEN",
+                           "--part-number", PART, "--images", "1"], env={"PI_TOKEN": TOKEN})
+        health = self.report()["inference"]["health"]
+        self.assertEqual(health["version"], "1")
+        self.assertEqual(health["models"], 1)
+        self.assertIn("models loaded 1", self.text)
 
     def test_failing_predict_is_listed_and_exits_1(self) -> None:
         with FakeLaptopServer() as laptop:

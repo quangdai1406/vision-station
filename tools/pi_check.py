@@ -15,7 +15,8 @@ V4L2 devices (DirectShow is Windows only). Each index 0..--max-index is opened, 
 and asked for one picture. Dead indexes are reported by number. cv2 is imported lazily and
 can be injected (the tests do this).
 
-Laptop: GET /v1/health, then --images predict calls (one per picture of a part: cameras C1..C4,
+Laptop: GET /v1/health (no token: reachability and busy), GET /v1/status (with the token: version
+and model count), then --images predict calls (one per picture of a part: cameras C1..C4,
 sides TOP and BOTTOM in turn). Pictures are synthetic PNGs unless --image gives a real one.
 The token is read only from the environment variable named by --token-env and is never
 printed, written or returned in an error. Requests ignore proxy environment variables, so the
@@ -61,7 +62,8 @@ DEFAULT_TIMEOUT_S = 30.0  # socket timeout for this tool's requests; NOT the Rem
 DEFAULT_OUT = "pi_check_report.json"
 OPERATOR_WAIT_LIMIT = "[Quality to define]"
 OPERATOR_WAIT_LINE = f"Operator wait limit: {OPERATOR_WAIT_LIMIT}"
-HEALTH_PATH = "/v1/health"
+HEALTH_PATH = "/v1/health"  # no token
+STATUS_PATH = "/v1/status"  # token
 PREDICT_PATH = "/v1/predict"
 PART_MAX = 128  # same limit as the laptop service (Part-Number header)
 TOKEN_REDACTED = "[token redacted]"
@@ -283,12 +285,21 @@ def _server_detail(data: bytes) -> str:
     return text[:SERVER_DETAIL_MAX]
 
 
+def _json_object(data: bytes) -> Optional[dict]:
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def check_health(base: str, token: str, timeout: float) -> dict:
+    """Reachability and busy from GET /v1/health (no token); version and model count from
+    GET /v1/status (bearer token). A failed status call makes the check fail: nothing is sent."""
     result: dict = {"ok": False, "http_status": None, "error": None, "version": None,
                     "models": None, "busy": None}
     try:
-        status, data = _request(base + HEALTH_PATH, method="GET",
-                                headers={"Authorization": f"Bearer {token}"}, body=None, timeout=timeout)
+        status, data = _request(base + HEALTH_PATH, method="GET", headers={}, body=None, timeout=timeout)
     except _TRANSPORT_ERRORS as exc:
         result["error"] = f"laptop unreachable at {base} ({_err_text(exc)})"
         return result
@@ -296,16 +307,30 @@ def check_health(base: str, token: str, timeout: float) -> dict:
     if status != 200:
         result["error"] = f"HTTP {status}: {_server_detail(data)}"
         return result
-    try:
-        payload = json.loads(data.decode("utf-8"))
-    except ValueError:
-        result["error"] = "the health answer is not JSON"
-        return result
-    if not isinstance(payload, dict):
+    health = _json_object(data)
+    if health is None:
         result["error"] = "the health answer is not a JSON object"
         return result
-    result.update(ok=True, version=payload.get("version"),
-                  models=len(payload.get("models") or []), busy=payload.get("busy"))
+    if not isinstance(health.get("busy"), bool):
+        result["error"] = "the health answer has no boolean busy"
+        return result
+    result["busy"] = health["busy"]
+    try:
+        status, data = _request(base + STATUS_PATH, method="GET",
+                                headers={"Authorization": f"Bearer {token}"}, body=None, timeout=timeout)
+    except _TRANSPORT_ERRORS as exc:
+        result["error"] = f"laptop unreachable at {base} ({_err_text(exc)})"
+        return result
+    result["http_status"] = status
+    if status != 200:
+        result["error"] = f"status HTTP {status}: {_server_detail(data)}"
+        return result
+    details = _json_object(data)
+    if details is None:
+        result["error"] = "the status answer is not a JSON object"
+        return result
+    result.update(ok=True, version=details.get("version"),
+                  models=len(details.get("models") or []))
     return result
 
 

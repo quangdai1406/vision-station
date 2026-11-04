@@ -19,6 +19,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.parse import quote
 
 from inference_service import registry as reg
 from inference_service.server import build_server, main, parse_predict_headers
@@ -56,6 +57,11 @@ class FakeModel:
         )
 
 
+def auth(token):
+    """Headers for a bearer token; no header at all when token is None."""
+    return {} if token is None else {"Authorization": "Bearer " + token}
+
+
 class ServiceCase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="inference_service_test_"))
@@ -84,15 +90,15 @@ class ServiceCase(unittest.TestCase):
             raise self.load_faults.pop(0)
         return FakeModel(info.version, self.scores.get(info.version, 0.25), self.faults, self.gate)
 
-    def add_approved(self, version, content=b"fake model bytes", approve=True):
+    def add_approved(self, version, content=b"fake model bytes", approve=True, part=PART):
         src = self.tmp / f"{version}.npz"
         src.write_bytes(content)
-        self.store.add_candidate(PART, version, src, {"type": "patchcore"}, NOW)
+        self.store.add_candidate(part, version, src, {"type": "patchcore"}, NOW)
         if approve:
-            self.store.approve(PART, version, by="tester", reason="test", now_utc=NOW)
+            self.store.approve(part, version, by="tester", reason="test", now_utc=NOW)
 
-    def model_file(self, version):
-        return self.tmp / "models" / ms.safe_part(PART) / version / f"{version}.npz"
+    def model_file(self, version, part=PART):
+        return self.tmp / "models" / ms.safe_part(part) / version / f"{version}.npz"
 
     def request(self, method, path, body=None, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
@@ -122,8 +128,15 @@ class ServiceCase(unittest.TestCase):
     def predict(self, changes=None, body=b"\x89PNG fake picture"):
         return self.request("POST", "/v1/predict", body=body, headers=self.predict_headers(changes))
 
-    def health(self, token=TOKEN):
-        return self.request("GET", "/v1/health", headers={"Authorization": "Bearer " + token})
+    def health(self, token=None):
+        return self.request("GET", "/v1/health", headers=auth(token))
+
+    def status(self, token=TOKEN):
+        return self.request("GET", "/v1/status", headers=auth(token))
+
+    def model_lookup(self, part, token=TOKEN):
+        path = "/v1/models/" + quote(part, safe="")
+        return self.request("GET", path, headers=auth(token))
 
 
 class PredictStatusTests(ServiceCase):
@@ -224,18 +237,95 @@ class PredictStatusTests(ServiceCase):
         self.assertEqual((part, camera, side), (PART, "C2", Side.BOTTOM))
 
 
+class ModelLookupTests(ServiceCase):
+    def test_approved_model_is_reported_without_loading_it(self):
+        self.add_approved("v1")
+        status, data, _ = self.model_lookup(PART)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(data), {"part_number": PART, "approved": True, "model_version": "v1"})
+        self.assertEqual(self.loads, [])
+
+    def test_lookup_reports_the_current_version_after_a_promotion(self):
+        self.add_approved("v1")
+        self.add_approved("v2")
+        self.assertEqual(json.loads(self.model_lookup(PART)[1])["model_version"], "v2")
+        self.assertEqual(self.loads, [])
+
+    def test_no_approved_model_is_404_with_a_reason(self):
+        status, data, _ = self.model_lookup(PART)
+        self.assertEqual(status, 404)
+        body = json.loads(data)
+        self.assertIs(body["approved"], False)
+        self.assertIn("No approved model", body["reason"])
+        self.assertEqual(self.loads, [])
+
+    def test_tampered_model_is_503_and_never_loaded(self):
+        self.add_approved("v1")
+        self.model_file("v1").write_bytes(b"tampered bytes")
+        status, data, _ = self.model_lookup(PART)
+        self.assertEqual(status, 503)
+        body = json.loads(data)
+        self.assertIs(body["approved"], False)
+        self.assertNotIn("model_version", body)
+        self.assertEqual(self.loads, [])
+
+    def test_lookup_never_falls_back_to_an_older_version(self):
+        self.add_approved("v1")
+        self.add_approved("v2")
+        self.model_file("v2").write_bytes(b"tampered")
+        status, data, _ = self.model_lookup(PART)
+        self.assertEqual(status, 503)
+        self.assertNotIn(b'"v1"', data)
+        self.assertNotIn("model_version", json.loads(data))
+
+    def test_part_numbers_with_spaces_slashes_and_unicode_round_trip(self):
+        parts = ["PN 100 A", "PN/100/A", "PN-ÄÖ-100", "A+B", "PN%2F", "PNé #7?"]
+        for part in parts:
+            with self.subTest(part=part):
+                self.add_approved("v1", part=part)
+                status, data, _ = self.model_lookup(part)
+                self.assertEqual(status, 200, data)
+                self.assertEqual(json.loads(data), {"part_number": part, "approved": True, "model_version": "v1"})
+
+    def test_plus_sign_is_not_read_as_a_space(self):
+        self.add_approved("v1", part="A+B")
+        self.assertEqual(self.model_lookup("A+B")[0], 200)  # the raw '+' is the part's own character
+        self.assertEqual(self.request("GET", "/v1/models/A%20B", headers=auth(TOKEN))[0], 404)  # a space is not '+'
+
+    def test_unencoded_slash_in_the_part_is_400(self):
+        self.add_approved("v1", part="PN/100")
+        status, data, _ = self.request("GET", "/v1/models/PN/100", headers=auth(TOKEN))
+        self.assertEqual(status, 400)
+        self.assertIn("%2F", json.loads(data)["error"])
+
+    def test_empty_part_is_400(self):
+        status, _, _ = self.request("GET", "/v1/models/", headers=auth(TOKEN))
+        self.assertEqual(status, 400)
+
+    def test_lookup_needs_the_token(self):
+        self.add_approved("v1")
+        self.assertEqual(self.model_lookup(PART, token=None)[0], 401)
+        self.assertEqual(self.model_lookup(PART, token="not-the-token")[0], 401)
+        self.assertEqual(self.loads, [])
+
+
 class AuthTests(ServiceCase):
     def test_wrong_token_is_401(self):
         self.add_approved("v1")
         self.assertEqual(self.predict({"Authorization": "Bearer not-the-token"})[0], 401)
-        self.assertEqual(self.health(token="not-the-token")[0], 401)
+        self.assertEqual(self.status(token="not-the-token")[0], 401)
         self.assertEqual(self.loads, [])
 
     def test_missing_or_other_scheme_is_401(self):
         self.add_approved("v1")
         self.assertEqual(self.predict({"Authorization": None})[0], 401)
         self.assertEqual(self.predict({"Authorization": "Basic " + TOKEN})[0], 401)
-        self.assertEqual(self.request("GET", "/v1/health")[0], 401)
+        self.assertEqual(self.request("GET", "/v1/status")[0], 401)
+
+    def test_status_is_token_protected(self):
+        self.assertEqual(self.status(token=None)[0], 401)
+        self.assertEqual(self.status(token="wrong")[0], 401)
+        self.assertEqual(self.status(token=TOKEN)[0], 200)
 
     def test_token_never_appears_in_responses_or_stderr(self):
         self.add_approved("v1")
@@ -248,6 +338,10 @@ class AuthTests(ServiceCase):
             responses.append(self.predict({"Side": "MIDDLE"}))
             responses.append(self.health())
             responses.append(self.health(token="wrong"))
+            responses.append(self.status())
+            responses.append(self.status(token="wrong"))
+            responses.append(self.model_lookup(PART))
+            responses.append(self.model_lookup(PART, token="wrong"))
         for status, data, headers in responses:
             self.assertNotIn(TOKEN, data.decode("utf-8", "replace"))
             for value in headers.values():
@@ -257,16 +351,30 @@ class AuthTests(ServiceCase):
 
 
 class HealthTests(ServiceCase):
-    def test_health_lists_loaded_models_and_gpu_without_torch(self):
-        self.add_approved("v1")
-        self.assertEqual(self.predict()[0], 200)
+    def test_health_needs_no_token_and_answers_only_busy_and_status(self):
         status, data, _ = self.health()
         self.assertEqual(status, 200)
         body = json.loads(data)
-        self.assertEqual(body["models"], [{"part_number": PART, "version": "v1"}])
-        self.assertFalse(body["busy"])
-        self.assertIn("gpu", body)
-        self.assertIn("torch_loaded", body["gpu"])
+        self.assertEqual(set(body), {"status", "busy", "in_flight"})
+        self.assertEqual(body["status"], "ok")
+        self.assertIs(body["busy"], False)
+        self.assertEqual(body["in_flight"], 0)
+
+    def test_health_busy_is_a_json_boolean_for_the_weekly_script_call(self):
+        # The same call run_weekly_training.ps1 makes: GET with no Authorization header.
+        status, data, headers = self.request("GET", "/v1/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["content-type"], "application/json")
+        self.assertIn(b'"busy": false', data)
+        self.assertIs(json.loads(data)["busy"], False)
+
+    def test_health_does_not_list_models_or_gpu(self):
+        self.add_approved("v1")
+        self.assertEqual(self.predict()[0], 200)
+        body = json.loads(self.health()[1])
+        self.assertNotIn("models", body)
+        self.assertNotIn("gpu", body)
+        self.assertNotIn("version", body)
 
     def test_busy_is_true_while_a_request_is_in_progress(self):
         self.add_approved("v1")
@@ -287,6 +395,23 @@ class HealthTests(ServiceCase):
             self.gate.set()
             worker.join(10)
         self.assertFalse(json.loads(self.health()[1])["busy"])
+
+
+class StatusTests(ServiceCase):
+    def test_status_lists_loaded_models_gpu_and_version_with_the_token(self):
+        self.add_approved("v1")
+        self.assertEqual(self.predict()[0], 200)
+        status, data, _ = self.status()
+        self.assertEqual(status, 200)
+        body = json.loads(data)
+        self.assertEqual(body["models"], [{"part_number": PART, "version": "v1"}])
+        self.assertEqual(body["version"], "1")
+        self.assertFalse(body["busy"])
+        self.assertIn("gpu", body)
+        self.assertIn("torch_loaded", body["gpu"])
+
+    def test_unknown_path_with_the_token_is_404(self):
+        self.assertEqual(self.request("GET", "/v1/nope", headers=auth(TOKEN))[0], 404)
 
 
 class StartupTests(unittest.TestCase):

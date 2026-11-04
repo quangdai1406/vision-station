@@ -183,9 +183,12 @@ try {
     } else {
         $healthUrl = Get-RequiredValue $cfg 'inference_health_url'
         try {
+            # /v1/health needs no token and answers busy as a JSON boolean. Anything else
+            # (no busy, or not a boolean) is not an answer: it is reported, never read as idle.
             $health = Invoke-RestMethod -Uri $healthUrl -Method Get -TimeoutSec 5
-            $busyProp = $health.PSObject.Properties['busy']
-            if ($busyProp -and [bool]$busyProp.Value) {
+            if (-not $health.PSObject.Properties['busy'] -or $health.busy -isnot [bool]) {
+                Warn 'inference service answer has no boolean busy; continuing with training.'
+            } elseif ($health.busy) {
                 $inferenceBusy = $true
                 Write-Host '  inference service reports busy'
             } else {

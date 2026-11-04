@@ -19,11 +19,12 @@ import os
 import urllib.error
 import urllib.request
 from typing import Any
+from urllib.parse import quote
 
 from station.contracts import Defect, Frame, ImageResult, Side, StationError
 
 PREDICT_PATH = "/v1/predict"
-HEALTH_PATH = "/v1/health"
+MODEL_PREFIX = "/v1/models/"
 _CONTENT_TYPES = {"png": "image/png", "jpeg": "image/jpeg", "jpg": "image/jpeg"}
 _ERROR_TEXT_MAX = 200
 
@@ -87,8 +88,8 @@ def _defect(item: Any) -> Defect:
 class RemoteModel:
     """InferenceModel that scores pictures on the laptop inference service.
 
-    version is '' until check_approved() (GET /v1/health) or the first successful predict()
-    sets it. After that, a reply with another model_version is a StationError.
+    version is '' until check_approved() (GET /v1/models/<part>) or the first successful
+    predict() sets it. After that, a reply with another model_version is a StationError.
     """
 
     def __init__(self, base_url: str, token_env: str, timeout_s: float, part_number: str) -> None:
@@ -113,22 +114,15 @@ class RemoteModel:
 
     # ------------------------------------------------------------ HTTP
 
-    def _request(self, req: urllib.request.Request, what: str) -> bytes:
+    def _send(self, req: urllib.request.Request, what: str) -> tuple[int, bytes]:
+        """(HTTP status, body) for any answer the laptop gives. Transport failures are StationError."""
         try:
             with self._opener.open(req, timeout=self._timeout) as resp:
-                return resp.read()
+                return resp.status, resp.read()
         except urllib.error.HTTPError as exc:
-            detail = _laptop_message(_read_quietly(exc), self._token)
+            body = _read_quietly(exc)
             exc.close()
-            if exc.code == 401:
-                text = "laptop rejected the token (401)"
-            elif exc.code == 503:
-                text = "laptop inference service unavailable (503)"
-            elif exc.code >= 500:
-                text = f"laptop inference service error ({exc.code})"
-            else:
-                text = f"laptop answered {exc.code}"
-            raise StationError(f"{what}: {text}" + (f": {detail}" if detail else "")) from None
+            return exc.code, body
         except (TimeoutError, OSError, http.client.HTTPException, urllib.error.URLError) as exc:
             reason = getattr(exc, "reason", None)
             if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
@@ -137,6 +131,24 @@ class RemoteModel:
             raise StationError(f"{what}: could not reach the laptop ({name})") from None
         except ValueError:
             raise StationError(f"{what}: invalid request to the laptop") from None
+
+    def _status_error(self, status: int, raw: bytes, what: str) -> StationError:
+        detail = _laptop_message(raw, self._token)
+        if status == 401:
+            text = "laptop rejected the token (401)"
+        elif status == 503:
+            text = "laptop inference service unavailable (503)"
+        elif status >= 500:
+            text = f"laptop inference service error ({status})"
+        else:
+            text = f"laptop answered {status}"
+        return StationError(f"{what}: {text}" + (f": {detail}" if detail else ""))
+
+    def _request(self, req: urllib.request.Request, what: str) -> bytes:
+        status, raw = self._send(req, what)
+        if not 200 <= status < 300:
+            raise self._status_error(status, raw, what)
+        return raw
 
     @staticmethod
     def _json(raw: bytes, what: str) -> dict:
@@ -156,27 +168,32 @@ class RemoteModel:
     # ------------------------------------------------------------ API
 
     def check_approved(self) -> str:
-        """Ask the laptop which approved model it lists for this part (GET /v1/health).
+        """Ask the laptop for the approved model version of this part (GET /v1/models/<part>).
 
-        Sets and returns the version. StationError when the laptop is unreachable, rejects the
-        token, or does not list this part (no approved model, or not loaded yet).
+        The laptop verifies the approved version and answers without loading it, so this works
+        after a laptop restart. Sets and returns the version. StationError when the laptop is
+        unreachable, rejects the token, has no approved model for the part (404), or has an
+        approved version that fails verification (503). Never an older version.
         """
-        req = urllib.request.Request(self._base + HEALTH_PATH, headers=self._headers(), method="GET")
-        body = self._json(self._request(req, "laptop health check"), "laptop health check")
-        models = body.get("models")
-        if not isinstance(models, list):
-            raise StationError("laptop health check: reply has no model list")
-        for item in models:
-            if isinstance(item, dict) and item.get("part_number") == self.part_number:
-                version = item.get("version")
-                if not isinstance(version, str) or not version:
-                    raise StationError(f"laptop health check: no version for part {self.part_number}")
-                self.version = version
-                return version
-        raise StationError(
-            f"the laptop does not list an approved model for part {self.part_number}; "
-            "ask Quality to approve one and check that the inference service has it loaded"
-        )
+        what = "laptop approval check"
+        url = self._base + MODEL_PREFIX + quote(self.part_number, safe="")
+        req = urllib.request.Request(url, headers=self._headers(), method="GET")
+        status, raw = self._send(req, what)
+        if status == 404:
+            raise StationError(
+                f"the laptop does not list an approved model for part {self.part_number}; "
+                "ask Quality to approve one"
+            )
+        if not 200 <= status < 300:
+            raise self._status_error(status, raw, what)
+        body = self._json(raw, what)
+        if body.get("approved") is not True or body.get("part_number") != self.part_number:
+            raise StationError(f"{what}: reply is not an approval for part {self.part_number}")
+        version = body.get("model_version")
+        if not isinstance(version, str) or not version:
+            raise StationError(f"{what}: reply has no model_version for part {self.part_number}")
+        self.version = version
+        return version
 
     def predict(self, frame: Frame) -> ImageResult:
         content_type = _CONTENT_TYPES.get(str(frame.ext).lower())

@@ -1,8 +1,9 @@
 """A local stand-in for the laptop inference service (inference_service/server.py), for tests.
 
-It binds 127.0.0.1 on a free port and answers GET /v1/health and POST /v1/predict. Tests change
-its attributes to set the reply: the models it lists, the status, a raw body, a delay.
-Standard library only.
+It binds 127.0.0.1 on a free port and answers the service's endpoints: GET /v1/health (no
+token), GET /v1/status and GET /v1/models/<part> (bearer token), and POST /v1/predict (token).
+Tests change its attributes to set the reply: the models it lists, the status, a raw body, a
+delay. Standard library only.
 """
 from __future__ import annotations
 
@@ -11,8 +12,10 @@ import json
 import threading
 import time
 from typing import Any, Optional
+from urllib.parse import unquote
 
 FAKE_LAPTOP_TOKEN = "fake-laptop-token-for-tests-only-0003"
+MODEL_PREFIX = "/v1/models/"
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -36,26 +39,46 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         fake = self.server.fake  # type: ignore[attr-defined]
         return self.headers.get("Authorization") == f"Bearer {fake.token}"
 
+    def _listed(self) -> list:
+        fake = self.server.fake  # type: ignore[attr-defined]
+        return [{"part_number": pn, "version": v} for pn, v in sorted(fake.models.items())]
+
     def do_GET(self) -> None:  # noqa: N802
         fake = self.server.fake  # type: ignore[attr-defined]
         fake.requests.append(("GET", self.path, dict(self.headers)))
         if fake.delay:
             time.sleep(fake.delay)
+        path = self.path.split("?")[0]
+        if path == "/v1/health":  # unauthenticated, as in the real service
+            if fake.health_raw is not None:
+                self._send(fake.health_status, fake.health_raw)
+                return
+            payload = {"status": "ok", "busy": False, "in_flight": 0}
+            self._send(fake.health_status, json.dumps(payload).encode("utf-8"))
+            return
         if not self._authorised():
             self._send(401, b'{"error": "unauthorized"}')
             return
-        if self.path.split("?")[0] != "/v1/health":
-            self._send(404, b'{"error": "not found"}')
+        if path == "/v1/status":
+            payload = {
+                "status": "ok", "version": "1", "models": self._listed(),
+                "busy": False, "in_flight": 0, "gpu": {"torch_loaded": False, "cuda_available": None},
+            }
+            self._send(200, json.dumps(payload).encode("utf-8"))
             return
-        if fake.health_raw is not None:
-            self._send(fake.health_status, fake.health_raw)
+        if path.startswith(MODEL_PREFIX):
+            if fake.model_raw is not None:
+                self._send(fake.model_status, fake.model_raw)
+                return
+            part = unquote(path[len(MODEL_PREFIX):])
+            if part in fake.models:
+                payload = {"part_number": part, "approved": True, "model_version": fake.models[part]}
+                self._send(200, json.dumps(payload).encode("utf-8"))
+                return
+            payload = {"approved": False, "reason": f"No approved model for part {part}. Ask Quality to approve one."}
+            self._send(404, json.dumps(payload).encode("utf-8"))
             return
-        payload = {
-            "status": "ok", "version": "1",
-            "models": [{"part_number": pn, "version": v} for pn, v in sorted(fake.models.items())],
-            "busy": False, "in_flight": 0, "gpu": {"torch_loaded": False, "cuda_available": None},
-        }
-        self._send(fake.health_status, json.dumps(payload).encode("utf-8"))
+        self._send(404, b'{"error": "not found"}')
 
     def do_POST(self) -> None:  # noqa: N802
         fake = self.server.fake  # type: ignore[attr-defined]
@@ -102,6 +125,8 @@ class FakeLaptop:
         self.models: dict[str, str] = dict(models or {})
         self.health_status = 200
         self.health_raw: Optional[bytes] = None
+        self.model_status = 200
+        self.model_raw: Optional[bytes] = None  # raw reply for GET /v1/models/<part>
         self.predict_status = 200
         self.predict_error = "GPU out of memory while scoring"
         self.predict_raw: Optional[bytes] = None

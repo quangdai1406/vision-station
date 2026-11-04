@@ -5,8 +5,14 @@ POST /v1/predict
              Content-Type image/png or image/jpeg
     body: the picture bytes (raw, not multipart)
     200: {camera_id, side, score, defects:[{defect_class, score, box:[x,y,w,h]}], model_version}
-GET /v1/health
+GET /v1/health (NO token)
+    200: {status, busy, in_flight}. busy is a JSON boolean; run_weekly_training.ps1 reads it.
+GET /v1/status (token)
     200: {status, version, models:[{part_number, version}], busy, in_flight, gpu}
+GET /v1/models/<part_number> (token; the part number is percent-encoded, slashes as %2F)
+    200: {part_number, approved: true, model_version}  (sha256 verified, nothing is loaded)
+    404: {approved: false, reason} when no model is approved for the part
+    503: {approved: false, reason} when the approved version fails verification
 
 Scores are raw: the station applies t_low and t_img, never this service. The token is read from
 the environment variable named by --token-env and is never printed, logged or returned.
@@ -25,6 +31,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional, Sequence
+from urllib.parse import unquote
 
 from inference_service.registry import ModelRegistry, ModelUnavailable, free_gpu_cache, is_out_of_memory
 from station import modelstore as ms
@@ -37,6 +44,8 @@ DEFAULT_TOKEN_ENV = "INFERENCE_TOKEN"
 DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024  # largest picture accepted; an engineering limit, not a quality one
 PREDICT_PATH = "/v1/predict"
 HEALTH_PATH = "/v1/health"
+STATUS_PATH = "/v1/status"
+MODEL_PREFIX = "/v1/models/"
 _CAMERA_RE = re.compile(r"[A-Za-z0-9_-]{1,16}")
 _PART_MAX = 128
 _CONTENT_TYPES = {"image/png": "png", "image/jpeg": "jpeg"}
@@ -141,20 +150,54 @@ class _Handler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self) -> None:  # noqa: N802 - http.server name
+        path = self.path.split("?")[0]
+        service = self.server.service
+        if path == HEALTH_PATH:  # unauthenticated: reveals only whether a request is in progress
+            in_flight = service.in_flight()
+            self._json(200, {"status": "ok", "busy": in_flight > 0, "in_flight": in_flight})
+            return
         if not self._authorised():
             return
-        if self.path.split("?")[0] != HEALTH_PATH:
-            self._json(404, {"error": "not found"})
+        if path == STATUS_PATH:
+            in_flight = service.in_flight()
+            self._json(200, {
+                "status": "ok",
+                "version": SERVICE_VERSION,
+                "models": service.registry.loaded(),
+                "busy": in_flight > 0,
+                "in_flight": in_flight,
+                "gpu": gpu_info(),
+            })
+            return
+        if path.startswith(MODEL_PREFIX):
+            self._model_lookup(path[len(MODEL_PREFIX):])
+            return
+        self._json(404, {"error": "not found"})
+
+    def _model_lookup(self, raw_part: str) -> None:
+        """Which version is approved for the part. Verifies it; never loads it, never falls back."""
+        if "/" in raw_part:
+            self._json(400, {"error": "the part number must be percent-encoded (a slash is %2F)"})
+            return
+        part = unquote(raw_part).strip()  # one decoding of the path segment; '+' stays '+'
+        if not part or len(part) > _PART_MAX:
+            self._json(400, {"error": f"the part number must be 1 to {_PART_MAX} characters"})
             return
         service = self.server.service
-        self._json(200, {
-            "status": "ok",
-            "version": SERVICE_VERSION,
-            "models": service.registry.loaded(),
-            "busy": service.in_flight() > 0,
-            "in_flight": service.in_flight(),
-            "gpu": gpu_info(),
-        })
+        try:
+            info = service.registry.approved(part)
+        except ModelUnavailable as exc:
+            self._json(503, {"approved": False, "reason": str(exc)})
+            return
+        except Exception as exc:  # noqa: BLE001 - map every failure to a JSON answer
+            sys.stderr.write(f"model lookup failed: {type(exc).__name__}\n")
+            self._json(500, {"error": "internal error"})
+            return
+        if info is None:
+            self._json(404, {"approved": False,
+                             "reason": f"No approved model for part {part}. Ask Quality to approve one."})
+            return
+        self._json(200, {"part_number": part, "approved": True, "model_version": info.version})
 
     def do_POST(self) -> None:  # noqa: N802 - http.server name
         if not self._authorised():

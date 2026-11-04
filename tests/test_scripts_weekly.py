@@ -229,6 +229,15 @@ class BackupAndLoadTest(unittest.TestCase):
         self.assertRegex(text, r"\$exitCode\s*=\s*4")
         self.assertLess(text.index("Invoke-RestMethod"), text.index("Running the trainer"))
 
+    def test_busy_check_reads_busy_from_the_health_url_without_a_token(self) -> None:
+        # /v1/health is unauthenticated and carries busy; the script must read .busy from it
+        # and must not send a token (the details live behind /v1/status).
+        text = _read(RUN_PS1)
+        self.assertRegex(text, r"Invoke-RestMethod -Uri \$healthUrl")
+        self.assertRegex(text, r"\$health\.busy")
+        self.assertNotIn("v1/status", text)
+        self.assertNotIn("Authorization", text)
+
     def test_trainer_example_has_inference_health_placeholder(self) -> None:
         cfg = json.loads(_read(EXAMPLE_JSON))
         self.assertRegex(cfg["inference_health_url"], r"^\[.*\]$")

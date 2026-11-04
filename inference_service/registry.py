@@ -103,6 +103,17 @@ class ModelRegistry:
                 self._loaded[part_number] = loaded
             return loaded
 
+    def approved(self, part_number: str) -> ms.ModelInfo | None:
+        """The approved, sha256-verified version for this part, without loading it.
+
+        None when nothing is approved for the part. ModelUnavailable when the approved version
+        fails verification (never an older version in its place).
+        """
+        try:
+            return self._store.current(part_number)
+        except ms.ModelError as exc:
+            raise ModelUnavailable(str(exc)) from None
+
     def release(self, part_number: str) -> None:
         """Drop a part's loaded model and free GPU cache (after an out-of-memory error)."""
         with self._lock:

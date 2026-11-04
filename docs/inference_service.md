@@ -38,15 +38,25 @@ The service does not read any other variable. torch and cv2 may read their own s
 - Body: the picture bytes (raw, not multipart). `Content-Length` is required.
 - 200: `{"camera_id", "side", "score", "defects": [{"defect_class", "score", "box": [x, y, w, h]}], "model_version"}`.
 
-`GET /v1/health` (also needs the token)
-- 200: `{"status", "version", "models": [{"part_number", "version"}], "busy", "in_flight", "gpu"}`. `busy` is true while a predict request is in progress. The weekly training script reads it and waits.
+`GET /v1/health` (NO token: the weekly training script calls it without one)
+- 200: `{"status", "busy", "in_flight"}` only. `busy` is a JSON boolean, true while a predict request is in progress. `run_weekly_training.ps1` reads `busy` and waits (exit 4 when busy).
 
-Error answers are JSON `{"error": "..."}`:
+`GET /v1/status` (needs the token)
+- 200: `{"status", "version", "models": [{"part_number", "version"}], "busy", "in_flight", "gpu"}`. The loaded models, the service version and the GPU state. `tools/pi_check.py` reads it for its details.
+
+`GET /v1/models/<part_number>` (needs the token)
+- The part number is percent-encoded as a whole, so a space is `%20`, a slash `%2F`, and a `+` stays `+`. The station uses this to check the approved version before any picture is sent.
+- 200: `{"part_number", "approved": true, "model_version"}`. The version `ModelStore.current()` returns, sha256 verified. Nothing is loaded, so torch is not needed and this works after a laptop restart.
+- 404: `{"approved": false, "reason"}` when no model is approved for the part.
+- 503: `{"approved": false, "reason"}` when the approved version fails verification. An older version is never offered in its place.
+- 400: an empty part number, or a raw `/` (send `%2F`).
+
+Error answers are JSON `{"error": "..."}` (the lookup answers use `approved` and `reason` as above):
 
 | Status | Meaning |
 |---|---|
-| 400, 411, 413, 415 | bad headers, no length, picture too large, wrong type |
-| 401 | missing or wrong token |
+| 400, 411, 413, 415 | bad headers, no length, picture too large, wrong type, bad part number |
+| 401 | missing or wrong token (on every path except `/v1/health`) |
 | 422 | the model rejected this input (for example an unknown camera or side) |
 | 503 | no approved model, a tampered or unreadable version, torch missing, or GPU out of memory |
 | 500 | unexpected failure (details go to stderr as the exception name only) |
@@ -56,6 +66,7 @@ A 503 or any non-200 makes the station go to FAULT. It never means GOOD.
 ## Model rules
 
 - Only the version `ModelStore.current()` returns is loaded. Its sha256 is checked before loading.
+- The station's approval check (`GET /v1/models/<part_number>`) uses the same `current()` and verification, but loads nothing.
 - A version that fails verification is never replaced by an older one.
 - The model is cached per part and reloaded when `current.json` changes (a promotion or a rollback).
 - A GPU out-of-memory error unloads the model and frees the GPU cache. The next request reloads it.

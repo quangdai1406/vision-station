@@ -64,11 +64,31 @@ class PredictSuccessTests(RemoteTestCase):
         model.predict(frame())
         self.assertEqual(model.version, "2026-11-01-a")
 
-    def test_approval_check_sets_the_version_from_health(self) -> None:
+    def test_approval_check_sets_the_version_from_the_model_endpoint(self) -> None:
         model = self.model()
         self.assertEqual(model.check_approved(), "2026-11-01-a")
         self.assertEqual(model.version, "2026-11-01-a")
-        self.assertEqual(self.laptop.requests[-1][0], "GET")
+        method, path, _ = self.laptop.requests[-1]
+        self.assertEqual((method, path), ("GET", "/v1/models/PN-A"))
+
+    def test_approval_check_sends_the_token_in_the_header(self) -> None:
+        self.model().check_approved()
+        _, _, headers = self.laptop.requests[-1]
+        self.assertEqual(headers["Authorization"], f"Bearer {FAKE_LAPTOP_TOKEN}")
+
+    def test_approval_check_does_not_depend_on_health(self) -> None:
+        # The loaded-models list in /v1/health is not the approval check any more.
+        self.laptop.health_status = 503
+        self.laptop.health_raw = b'{"error": "down"}'
+        self.assertEqual(self.model().check_approved(), "2026-11-01-a")
+
+    def test_part_numbers_are_url_quoted_and_round_trip(self) -> None:
+        part = "PN 1/A ü+7"
+        self.laptop.models[part] = "v3"
+        model = self.model(part=part)
+        self.assertEqual(model.check_approved(), "v3")
+        _, path, _ = self.laptop.requests[-1]
+        self.assertEqual(path, "/v1/models/PN%201%2FA%20%C3%BC%2B7")
 
 
 class ApprovalTests(RemoteTestCase):
@@ -76,9 +96,26 @@ class ApprovalTests(RemoteTestCase):
         with self.assertRaisesRegex(StationError, "does not list an approved model for part PN-X"):
             self.model(part="PN-X").check_approved()
 
-    def test_health_error_status_raises(self) -> None:
-        self.laptop.health_status = 503
-        self.laptop.health_raw = b'{"error": "no"}'
+    def test_model_error_status_raises(self) -> None:
+        self.laptop.model_status = 503
+        self.laptop.model_raw = b'{"approved": false, "reason": "tampered"}'
+        with self.assertRaisesRegex(StationError, "503"):
+            self.model().check_approved()
+
+    def test_reply_that_is_not_approved_raises(self) -> None:
+        self.laptop.model_raw = json.dumps(
+            {"part_number": PART, "approved": False, "model_version": "2026-11-01-a"}).encode("utf-8")
+        with self.assertRaises(StationError):
+            self.model().check_approved()
+
+    def test_reply_for_another_part_raises(self) -> None:
+        self.laptop.model_raw = json.dumps(
+            {"part_number": "PN-OTHER", "approved": True, "model_version": "x"}).encode("utf-8")
+        with self.assertRaises(StationError):
+            self.model().check_approved()
+
+    def test_reply_without_a_version_raises(self) -> None:
+        self.laptop.model_raw = json.dumps({"part_number": PART, "approved": True}).encode("utf-8")
         with self.assertRaises(StationError):
             self.model().check_approved()
 
