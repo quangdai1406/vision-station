@@ -79,6 +79,8 @@ def build_request(
         raise ValueError(f"only GOOD or BAD can be posted, got {record.final_verdict!r}")
     if record.override is not None and record.override.new_verdict is not record.final_verdict:
         raise ValueError("override.new_verdict must equal final_verdict")
+    if not record.started_utc:
+        raise ValueError("started_utc is required: the MES checks the capture time")
     is_bad = record.final_verdict is Verdict.BAD
 
     frame_by_key: dict[tuple[str, Any], Frame] = {(f.camera_id, f.side): f for f in record.frames}
@@ -133,6 +135,7 @@ def build_request(
         "materialHandler": record.material_handler,
         "verdict": record.final_verdict.value,
         "visionSessionId": record.session_id,
+        "capturedAt": record.started_utc,  # ISO 8601 UTC: the MES checks it against the session window
         "modelVersion": record.model_version,
         "archiveRef": archive_ref,
         "notes": (

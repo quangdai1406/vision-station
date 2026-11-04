@@ -257,7 +257,7 @@ class MesClientPostTests(unittest.TestCase):
             "stationId", "partNumber", "quantityInspected", "checklistResults", "supervisor",
             "operators", "materialHandler", "verdict", "visionSessionId", "modelVersion",
             "archiveRef", "notes", "rejectedQuantity", "rejectionReason", "disposition",
-            "defectPhoto_crit_scratch",
+            "defectPhoto_crit_scratch", "capturedAt",
         ]))
 
     def test_200_is_replay(self):
