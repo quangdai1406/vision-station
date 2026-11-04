@@ -58,7 +58,7 @@ Every task follows the same steps: (1) write the failing tests named below, (2) 
 - Tables `vision_stations(station_id, display_name, base_url, active)` and `fgi_station_sessions(id, user_id, station_id, ticket_hash, ticket_expires_at, redeemed_at, session_expires_at, ended_at, created_at)`.
 - Browser (session auth, role `inspector` or `supervisor`): `POST /api/finished-good-inspections/vision/sessions` body `{stationId}` returns 201 `{redirectUrl}` where the ticket is in the URL fragment (`<base_url>/enter#ticket=<ticket>`), so it never reaches server logs or a Referer header. `POST .../vision/sessions/:id/end`.
 - Machine (bearer token): `POST /api/machine/sessions/redeem` `{ticket}` returns 200 `{sessionId, username, roles, expiresAt}`; a second use returns 409. `GET /api/machine/sessions/:id` returns 200 `{active, username, roles, expiresAt}` and extends a sliding expiry, or 401. `POST /api/machine/sessions/:id/end`.
-- Ticket lifetime `[Engineer to define]` (short, single use). Session expiry matches the MES idle logout (`public/idle-logout.js`, default 600000 ms) unless the plant decides otherwise.
+- Ticket lifetime 60 seconds, single use (engineering default). Session expiry slides and matches the MES idle logout (`public/idle-logout.js`, default 600000 ms = 10 minutes).
 
 **Tests:** ticket redeems once (replay returns 409); expired ticket rejected; inactive station rejected; roles outside inspector/supervisor get 403; every create, redeem and end writes `audit_trail` through `writeAudited`; the raw ticket is never stored (only its hash).
 
@@ -66,7 +66,7 @@ Every task follows the same steps: (1) write the failing tests named below, (2) 
 
 **Files:** modify `src/server/machineRoutes.ts`, `src/departments/finished_good_inspections/inspectionService.ts`, migration `0011` (column `inspector_user_id`); test `tests/core/machineInspectionSession.test.ts`.
 
-**Interfaces:** `POST /api/machine/inspection-events` accepts header `Station-Session: <id>`. When `VISION_REQUIRE_SESSION=1` and `source=vision_station`, the header is required (401 without). The event stores `inspector_user_id`. A post is accepted if the part's capture time falls inside the session window (started to ended or expired, plus a grace `[Engineer to define]`), so a queued retry after logout still succeeds. An idempotent replay returns 200 without re-checking.
+**Interfaces:** `POST /api/machine/inspection-events` accepts header `Station-Session: <id>`. When `VISION_REQUIRE_SESSION=1` and `source=vision_station`, the header is required (401 without). The event stores `inspector_user_id`. A post is accepted if the part's capture time falls inside the session window (started to ended or expired, plus 5 minutes of clock-skew allowance, an engineering default; the time of the post itself is not limited), so a queued retry after logout still succeeds. An idempotent replay returns 200 without re-checking.
 
 **Tests:** missing header returns 401 when required; unknown session 401; event outside the window rejected; retry after logout inside the window accepted; replay with the same key returns the original event; the audit row names both the machine and the inspector.
 
@@ -124,7 +124,7 @@ Every task follows the same steps: (1) write the failing tests named below, (2) 
 
 **Files:** modify `station/store.py` (or the store module the code graph names), create `scripts/pi/sync_evidence.sh`; test `tests/test_evidence_sync.py`.
 
-**Interfaces:** the station saves the 8 pictures and `part.json` on the Pi first (save before green), then a retrying sync copies the part folder to the laptop evidence store (the folder the trainer reads), and `archiveRef` is the final path on the laptop. Method: `[Engineer to define: SMB share or rsync over SSH]`.
+**Interfaces:** the station saves the 8 pictures and `part.json` on the Pi first (save before green), then a retrying sync copies the part folder to the laptop evidence store (the folder the trainer reads), and `archiveRef` is the final path on the laptop. Method: an SMB share on the laptop mounted on the Pi (decided; the laptop is Windows, so no SSH server is needed).
 
 **Tests:** green is shown only after the local save; a failed sync leaves the part queued and retried, never lost and never marked synced; `archiveRef` is set only after a verified copy (sha256).
 
@@ -142,7 +142,7 @@ Every task follows the same steps: (1) write the failing tests named below, (2) 
 
 **Files:** create `scripts/windows/backup_postgres.ps1`, update `scripts/windows/run_weekly_training.ps1` (training at below-normal priority) and `docs/weekly_training.md`; test `tests/test_scripts_weekly.py` additions.
 
-**Interfaces:** nightly `pg_dump` of the MES database to `[Engineer to define: backup folder]`, with a restore check line in the runbook; the Sunday 06:00 training runs at below-normal priority and refuses to start when the inference service reports a request in progress; MES, PostgreSQL and the inference service start at boot `[Engineer to define: Windows services or tasks]`.
+**Interfaces:** nightly `pg_dump` of the MES database to `[Engineer to define: backup folder]`, with a restore check line in the runbook; the Sunday 06:00 training runs at below-normal priority and refuses to start when the inference service reports a request in progress; MES, PostgreSQL and the inference service start at boot as Windows scheduled tasks or services (the engineer picks per service).
 
 **Tests:** scripts contain no password literal and no purge or promote call; priority flag present; the backup script fails loudly when `pg_dump` fails.
 
@@ -164,16 +164,25 @@ Every task follows the same steps: (1) write the failing tests named below, (2) 
 
 ## Decisions (JEV One System, decision first)
 
-| # | Decision | Recommendation | Confidence | Owner |
+The owner asked me to decide for them from what I know about their job (quality work in an IATF 16949 plant, a Windows laptop that hosts the MES, one engineer running the project, Quality owning limits). Each row is decided; confidence says how sure I am; "revisit" says what would change it.
+
+| # | Decision | Decided | Confidence | Revisit when |
 |---|---|---|---|---|
-| 1 | Where the model runs | On the laptop GPU, called from the Pi (the Pi is untested) | 0.75 | Engineer after the E2 measurement |
-| 2 | Inspector identity | One-time ticket and MES session, not a second login on the Pi | 0.90 | Owner |
-| 3 | Human-proposed defect on an ML-GOOD part | Final verdict becomes BAD; only a supervisor can reverse | 0.80 | Quality |
-| 4 | Who approves proposed defect labels | The Admin, in the MES (not on the Pi) | 0.70 | Owner |
-| 5 | Evidence storage | Laptop disk is the store the trainer reads; SharePoint becomes an optional copy | 0.70 | Owner |
-| 6 | LAN security | TLS between browser, MES, Pi and laptop (the MES cookie is not marked secure today) | 0.70 | Engineer |
-| 7 | Session length, ticket life, timeouts, grace | `[Engineer to define]`; session follows the MES idle logout | n/a | Plant |
-| 8 | Roles allowed on the Pi | Inspector and supervisor only; others `[Plant to define]` | 0.70 | Owner |
+| 1 | Where the model runs | Laptop GPU inference service, called from the Pi | 0.75 | `tools/pi_check` shows the Pi can score 8 images inside the operator wait limit `[Quality to define]` |
+| 2 | Inspector identity | One-time ticket and MES session, no second login on the Pi | 0.90 | never expected |
+| 3 | Human-proposed defect on an ML-GOOD part | Final verdict becomes BAD; only a supervisor can reverse it | 0.85 | Quality objects (the conservative direction for a quality plant) |
+| 4 | Who approves proposed defect labels | The Admin, in the MES. Built after the first release (task M5, below); until then labels stay "proposed" and training ignores them | 0.75 | the Admin wants it earlier |
+| 5 | Evidence storage | Laptop disk is the store the trainer reads; the Pi saves locally first, then copies over an SMB share. The owner deletes used GOOD pictures by hand after promotion (earlier decision) | 0.80 | disk fills faster than expected |
+| 6 | LAN security | Pilot on the plant LAN without TLS; TLS (task H1) is required before the station is used outside the pilot. The MES session cookie is not marked secure today | 0.65 | the LAN is shared with guests or Wi-Fi: do H1 first |
+| 7 | Session length, ticket life, clock skew | 10 minutes sliding (the MES idle logout), 60 seconds single use, 5 minutes skew. Engineering defaults, not quality limits | 0.80 | operators complain about relogins |
+| 8 | Roles allowed on the Pi | `inspector` becomes operator, `supervisor` becomes supervisor; no other role | 0.85 | the plant wants Quality Engineers on the line |
+
+Still `[Quality to define]`: the operator wait limit, `t_img`, `t_low`, `min_good`, `min_holdout`, `holdout_fraction`, defect codes. Still `[Engineer to define]` after measuring: the `RemoteModel` timeout, the laptop LAN address, the backup folder.
+
+## Later (not in the first release)
+
+- **M5 (TypeScript):** MES screen where the Admin approves or rejects proposed defect labels with a reason.
+- **H1 (PowerShell/config):** TLS in front of the MES, the Pi page and the inference service on the plant LAN.
 
 ## Unproven
 

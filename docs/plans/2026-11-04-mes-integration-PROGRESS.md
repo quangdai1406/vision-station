@@ -17,5 +17,7 @@ Plan: `docs/plans/2026-11-04-mes-integration.md`. Status values: todo / doing / 
 | L2 | Load protection and backups | PowerShell | todo | | |
 | E1 | End-to-end test | Python + TypeScript | todo | | |
 | E2 | Pi setup guide and hardware checks | Python + docs | todo | | |
+| M5 | Admin approves proposed defect labels in the MES (after first release) | TypeScript | todo | | later |
+| H1 | TLS on the plant LAN (before use outside the pilot) | config | todo | | later |
 
-Waiting on the owner: decisions 1 to 8 in the plan (section "Decisions").
+Decisions 1 to 8 were made on 2026-11-04 (plan section "Decisions"). Language per task: `docs/plans/26_1104_mes_integration_building_plan.md`.
