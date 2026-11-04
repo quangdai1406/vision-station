@@ -25,7 +25,8 @@ key set this module relies on::
 A session is protected if it appears in ANY holdout list (top level or per entry).
 Entries for other part numbers are ignored, except for their holdout lists. A report
 with no entry for --part, a malformed entry for --part, or a succeeded entry whose
-candidate is missing from the ModelStore or fails verification REFUSES the whole run
+candidate is missing from the ModelStore, fails verification, or is not on the approved
+history (never promoted, or rolled back) REFUSES the whole run
 (exit 1, nothing deleted).
 
 Eligible pictures (all must hold, else the part is kept):
@@ -232,6 +233,13 @@ def _verified_sessions(model_store: ModelStore, part_number: str, entries: list,
         if problems:
             raise PurgeRefusal(
                 f"candidate {version} for part {part_number} does not verify: " + "; ".join(problems)
+            )
+        # The next weekly run starts from the APPROVED model and reads only pictures newer
+        # than it, so pictures used by a candidate nobody approved would be lost for good.
+        if version not in model_store.history(part_number):
+            raise PurgeRefusal(
+                f"candidate {version} for part {part_number} is not approved (or was rolled back): "
+                "promote it first, then purge"
             )
         for session_id in trained:
             sessions.setdefault(session_id, version)

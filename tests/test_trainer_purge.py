@@ -72,6 +72,9 @@ class PurgeFixture(unittest.TestCase):
         model_file.write_bytes(b"model bytes v1")
         ModelStore(self.models_root).add_candidate(
             "PN-1", "cand-1", model_file, {"type": "golden"}, "2026-10-08T00:00:00Z")
+        # Purge needs the candidate to be approved (see ApprovalGateTests).
+        ModelStore(self.models_root).approve(
+            "PN-1", "cand-1", "Admin Test", "fixture approval", "2026-10-08T01:00:00Z")
         self.report = self.root / "weekly-2026-10-08.json"
         self.write_report(self.report_doc())
 
@@ -309,6 +312,44 @@ class TestArguments(PurgeFixture):
                                   "--weekly-report", "r.json"])
         self.assertFalse(args.confirm)
         self.assertEqual(args.part, "p")
+
+
+class ApprovalGateTests(PurgeFixture):
+    """Next week's training starts from the APPROVED model and only reads pictures newer than it.
+    Pictures used by a candidate nobody approved would be lost for good, so purge refuses."""
+
+    def _second_candidate(self):
+        model_file = self.root / "model2.bin"
+        model_file.write_bytes(b"model bytes v2")
+        ModelStore(self.models_root).add_candidate(
+            "PN-1", "cand-2", model_file, {"type": "golden"}, "2026-10-15T00:00:00Z")
+        doc = self.report_doc()
+        doc["parts"][0]["candidate_version"] = "cand-2"
+        self.write_report(doc)
+
+    def test_unapproved_candidate_refuses_and_deletes_nothing(self):
+        self._second_candidate()
+        plan = self.plan()
+        self.assertIsNotNone(plan.refusal)
+        self.assertIn("not approved", plan.refusal)
+        code, _out, err = self.cli("--confirm")
+        self.assertEqual(code, 1)
+        self.assertTrue(self.pictures("P-G1"))
+
+    def test_candidate_approved_later_is_accepted(self):
+        self._second_candidate()
+        ModelStore(self.models_root).approve(
+            "PN-1", "cand-2", "Admin Test", "approved", "2026-10-15T01:00:00Z")
+        self.assertIsNone(self.plan().refusal)
+
+    def test_rolled_back_candidate_refuses(self):
+        self._second_candidate()
+        store = ModelStore(self.models_root)
+        store.approve("PN-1", "cand-2", "Admin Test", "approved", "2026-10-15T01:00:00Z")
+        store.rollback("PN-1", "Admin Test", "bad week", "2026-10-16T00:00:00Z")
+        plan = self.plan()
+        self.assertIsNotNone(plan.refusal)
+        self.assertIn("not approved", plan.refusal)
 
 
 if __name__ == "__main__":

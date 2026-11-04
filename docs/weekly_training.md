@@ -175,19 +175,27 @@ The scheduled task never promotes and never purges.
 | Exit code `3` with `FAILED:` line | A preflight check failed. Nothing was trained | Read the `FAILED:` line in the log and fix that item. |
 | Trainer reports counts below `min_good` or `min_holdout` | Not enough labelled parts yet | Expected until Quality's minimums are met. Quality decides whether to collect more. No candidate should be produced. (Check the trainer's actual output once it exists.) |
 
-## 7. Purging old evidence (manual, separate, OFF by default)
+## 7. Deleting used pictures (by the owner, by hand, after promotion)
 
-Evidence is never deleted by the weekly task. Purging is a separate command that an engineer
-runs by hand, after Quality agrees which evidence may go (retention rules: `[Quality to define]`).
+The weekly task never deletes anything. The owner deletes used GOOD pictures by hand, once the
+candidate that used them has been promoted by the Admin.
 
-1. Dry run first. It lists what would be removed and deletes nothing (planned command):
+Why the order matters: next week's training starts from the approved model and reads only pictures
+newer than it. If a picture is deleted before its candidate is promoted, that picture is lost for
+good.
+
+1. Monday: Quality reads the report. The Admin promotes the candidate (section 4).
+2. Dry run, which deletes nothing and lists what would go:
 
    ```powershell
-   py -m trainer purge --help
+   py -m trainer purge --store <evidence> --models <models> --part <PN> --weekly-report <report.json>
    ```
 
-2. Only after the dry run is reviewed and approved in writing, run the confirm step that the
-   command's help text names. Never add a purge to the scheduled task.
+   It refuses when the candidate is not approved, or was rolled back, or does not verify.
+3. To delete, either add `--confirm` to the same command (it deletes only GOOD pictures that the
+   promoted candidate used, writes a `purged.json` note first, and keeps BAD, overridden and
+   held-out pictures, `part.json` and the manifest), or delete by hand using the dry-run list.
+   Never add a purge to the scheduled task.
 
 ## 8. What is UNPROVEN
 

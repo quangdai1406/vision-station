@@ -149,6 +149,10 @@ class TestWeeklyRuns(WeeklyBase):
         code, _ = self.run_quiet(self.args("--holdout-fraction", "0.25", "--min-holdout", "1"))
         self.assertEqual(code, 0)
         report = next(self.reports.glob("weekly-*.json"))
+        refused = plan_purge(self.store_root, self.models, part_number="PN-1", report_path=report)
+        self.assertIn("not approved", refused.refusal)  # a candidate nobody promoted is never purged
+        ms = ModelStore(self.models)
+        ms.approve("PN-1", ms.list_versions("PN-1")[0]["version"], "Admin Test", "test", NOW_1)
         plan = plan_purge(self.store_root, self.models, part_number="PN-1", report_path=report)
         self.assertIsNone(plan.refusal)
         self.assertEqual(len(plan.parts), 3)  # the 3 trained good parts; the held-out one is kept
