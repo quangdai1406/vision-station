@@ -198,13 +198,30 @@ class SessionProposalTests(unittest.TestCase):
         self.assertEqual(h.session.proposals_for(h.store.saved[-1].part_id), [])
         self.assertEqual(h.session.snapshot()["defect_proposals"], [])
 
-    def test_good_part_has_no_proposal_window(self):
-        # Machine GOOD parts are saved and lit at once (save before green), so a proposal is refused.
-        h = Harness(fuse_verdict=Verdict.GOOD)
+    def test_proposal_on_a_good_part_is_refused_and_changes_nothing(self):
+        # Owner decision: a defect on a part the model passed is not supported yet.
+        h = _with_proposal_store(Harness(fuse_verdict=Verdict.GOOD))
         h.complete_part(0.0)
-        self.assertEqual(h.session.state, State.IDLE)
-        with self.assertRaises(InvalidTransition):
+        before = (h.session.state, dict(h.session.counters), list(h.outputs.calls),
+                  len(h.store.saved), h.store.proposal_saves[:] if hasattr(h.store, "proposal_saves") else [],
+                  h.session.snapshot()["defect_proposals"], h.session.snapshot()["final_verdict"])
+        with self.assertRaisesRegex(ValueError, "not supported yet"):
             h.session.propose_defect(DefectProposal("C-1", "C1", Side.TOP), by="anna", criteria_ids=CRITERIA)
+        after = (h.session.state, dict(h.session.counters), list(h.outputs.calls),
+                 len(h.store.saved), h.store.proposal_saves[:] if hasattr(h.store, "proposal_saves") else [],
+                 h.session.snapshot()["defect_proposals"], h.session.snapshot()["final_verdict"])
+        self.assertEqual(before, after)
+        self.assertEqual(h.store.saved[-1].final_verdict, Verdict.GOOD)
+        self.assertEqual(h.outputs.calls[-1], "show_good")
+
+    def test_proposals_still_work_on_bad_and_review_parts(self):
+        bad = _bad_harness()
+        bad.session.propose_defect(DefectProposal("C-1", "C1", Side.TOP), by="anna", criteria_ids=CRITERIA)
+        self.assertEqual(len(bad.session.snapshot()["defect_proposals"]), 1)
+        review = _with_proposal_store(Harness(fuse_verdict=Verdict.REVIEW))
+        review.complete_part(0.0)
+        review.session.propose_defect(DefectProposal("C-2", "C3", Side.BOTTOM), by="anna", criteria_ids=CRITERIA)
+        self.assertEqual(len(review.session.snapshot()["defect_proposals"]), 1)
 
 
 class MesPostTests(unittest.TestCase):
@@ -358,6 +375,17 @@ class DefectRouteTests(tui.UiTestCase):
                 self.assertEqual(reply.status, 400, reply.body)
         self.assertEqual(self.session.proposed, [])
 
+    def test_proposal_refused_for_a_good_part_is_400_with_the_message(self):
+        def refuse(by, criterion_id, camera_id, side, note=""):
+            raise ValueError("proposing a defect on a part the model passed is not supported yet")
+
+        self.session.propose_defect = refuse
+        token = self.login(OP_USER, OP_PW)
+        reply = self.call("POST", "/api/part/defects", {"criterion_id": "C-1", "camera_id": "C1",
+                                                       "side": "TOP"}, token=token)
+        self.assertEqual(reply.status, 400)
+        self.assertIn("not supported yet", self.js(reply)["error"])
+
     def test_no_login_is_401(self):
         reply = self.call("POST", "/api/part/defects", {"criterion_id": "C-1", "camera_id": "C1",
                                                        "side": "TOP"})
@@ -402,6 +430,9 @@ class PagePropositionScanTests(unittest.TestCase):
         self.assertIn("textContent", block)
         for bad in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):
             self.assertNotIn(bad, block)
+
+    def test_picker_is_hidden_for_a_good_part(self):
+        self.assertIn('machine_verdict !== "GOOD"', self._block())
 
     def test_page_has_the_defect_panel_and_hooks(self):
         for needle in ('id="defect-panel"', 'id="defect-criteria"', 'id="defect-pictures"',

@@ -299,6 +299,9 @@ class StationSession:
         ACTIVE criteria. Returns True when it replaced an earlier proposal for the same criterion.
         Proposals only ever move the verdict toward BAD (see _finish).
         """
+        if self._machine is Verdict.GOOD or self._final is Verdict.GOOD:
+            # Owner decision: GOOD timing and the green light stay as they are. Only BAD and REVIEW parts.
+            raise ValueError("proposing a defect on a part the model passed is not supported yet")
         if self.state not in (State.VERDICT, State.SUPERVISOR_REVIEW):
             raise InvalidTransition(f"propose_defect is not allowed in {self.state.value}")
         if not isinstance(by, str) or not by.strip():

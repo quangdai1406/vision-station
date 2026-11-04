@@ -2343,7 +2343,8 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
   }
 
   function renderDefects(s) {
-    var shown = s.state === "VERDICT" || s.state === "SUPERVISOR_REVIEW";
+    // Only BAD and REVIEW parts: a part the model passed (GOOD) has no picker.
+    var shown = (s.state === "VERDICT" || s.state === "SUPERVISOR_REVIEW") && s.machine_verdict !== "GOOD";
     $("defect-panel").hidden = !shown;
     if (s.part_id !== defectPartId) {
       defectPartId = s.part_id;
