@@ -1,40 +1,32 @@
-# Superpowers Workflow (mandatory for every project)
+# Autonomous Workflow
 
-For any non-trivial task (feature, refactor, multi-step change), follow these phases in order. Invoke each named skill with the Skill tool. Do not skip or reorder phases. Trivial one-line fixes may skip phases 1-9 but still use 10-16.
+## Autonomy
+- Work until every item in `docs/plans/*-PROGRESS.md` is `done` or `blocked`. Do not stop to report between tasks.
+- Do not ask questions. Pick the simplest reasonable option and write the assumption in the PROGRESS notes.
+- Ask the user only for: missing credentials, irreversible actions, or a task `blocked` 3 times.
+- When all items are done or blocked: full test run, one review pass, then the final step below, push the branch, then print exactly `ALL_TASKS_COMPLETE`.
 
-Priority: user's direct instructions > this file > skill defaults.
+## Final step (once, after all tasks are done)
+Build the code graph for the whole project (`code-graph`) and write `docs/CODE_INDEX.md` (every file with its functions/classes, one line each). Check both match the code, commit them, then print the marker.
 
-## Planning phase
+## Resume (every session start, also after compaction)
+- Read the PROGRESS file, the last 10 `git log` lines, and `git status`. Continue the first `todo`/`doing` task. Never redo `done` tasks.
+- No PROGRESS file yet: write a plan (`docs/plans/<date>-<topic>.md`, small tasks, each with a test command), create the PROGRESS file (checkbox, status, date, notes), work in a branch, create the branch. Skip the graph and index until the final step.
 
-1. **Brainstorm** — `superpowers:brainstorming`. Clarify intent, requirements, design. No code yet.
-2. **Plan** — `superpowers:writing-plans`. Write the plan to `docs/plans/<date>-<topic>.md`.
-3. **Pick language/tooling per task** — `python-rust-task-picker`. Annotate each plan task as Python or Rust (the "Python/Rush" picker) and edit the plan accordingly.
-4. **JEV One System** — `jev-system-one`. Add the JEV One System section to the plan MD file.
-5. **Simplify the plan** — `simplify` (or `simplify-task`) applied to the plan MD. Remove redundant or over-engineered tasks.
-6. **Progress tracker** — create `docs/plans/<date>-<topic>-PROGRESS.md` with one checkbox per plan task (status: todo / doing / done / blocked, date, notes). Update it after every task. It is the source of truth for resuming work.
+## Task loop (one task at a time)
+1. Set `doing`. Write a failing test, then minimal code.
+2. Run the task test and the full suite. Show the output.
+3. On failure, find the root cause. After 3 failed tries: mark `blocked`, note why, take the next task.
+4. Commit with the PROGRESS update. Set `done`. Start the next task.
 
-## Setup phase
-
-7. **Worktree** — `superpowers:using-git-worktrees`. Do all implementation in an isolated worktree/branch.
-8. **Code map** — `code-graph`. Build the code graph before touching shared code.
-9. **Index** — write `docs/CODE_INDEX.md` listing every file and its functions/classes (one line each).
-
-## Build loop (repeat per plan task until the plan is finished)
-
-10. **Multi-agent runner** — `multi-agent-job-runner` (with `superpowers:subagent-driven-development`) to dispatch tasks.
-11. **TDD** — `superpowers:test-driven-development`. Failing test first, then minimal code.
-12. **Parallelize** — `superpowers:dispatching-parallel-agents` for independent tasks (no shared state).
-13. **Debug** — `superpowers:systematic-debugging` on any failure. Find root cause before fixing.
-14. **Verify** — `superpowers:verification-before-completion`. Run tests/build; show evidence before claiming done.
-15. **Review** — `superpowers:requesting-code-review` (and `superpowers:receiving-code-review` for feedback).
-16. **Merge** — `superpowers:finishing-a-development-branch`. Then tick the task in the PROGRESS file.
-
-**Repeat 10-16 for the next task until every item in the PROGRESS file is done.** Then do a final verify + review of the whole plan and report.
+## JEV System One (routine decisions)
+Decide these by one short JSON answer, not prose: next task, pass/fail, blocked or not, skill needed or not.
+`{"decision": "...", "confidence": 0.00-1.00, "escalate": false}`
+- 0.85 or higher: act.
+- 0.70 to 0.84: act, and add one line to the PROGRESS notes saying what is uncertain.
+- Below 0.70: think it through once in full. Still below 0.70: mark `blocked`. Do not wait for the user.
+Do not use JSON for design, debugging, or writing code. Use normal reasoning there.
 
 ## Rules
-
-- **After EVERY change** (any edit, add, rename, move or delete of code, not just per task): update the code graph (`code-graph`) AND `docs/CODE_INDEX.md` in the same commit. A change is not done until both match the code.
-- Token-efficient: be terse, read only what is needed, no repeated re-derivation.
-- Never claim success without verification output.
-- If a named skill is unavailable in the session, say so, then perform that phase manually; do not silently skip it.
-- Never skip or delete tests to get green.
+- No success claim without verification output. Never skip or delete tests to get green.
+- Read only what the task needs. Be terse. Load a skill only when its trigger applies.
