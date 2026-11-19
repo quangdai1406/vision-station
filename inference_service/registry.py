@@ -26,7 +26,7 @@ def free_gpu_cache() -> None:
         return
     try:
         torch.cuda.empty_cache()
-    except Exception:
+    except Exception:  # noqa: BLE001 - freeing is best effort; the 503 is what matters
         pass
 
 
@@ -48,7 +48,6 @@ def _current_signature(store: ms.ModelStore, part_number: str) -> tuple | None:
 
 
 class ModelRegistry:
-
     def __init__(self, store: ms.ModelStore, load_model: Callable[[ms.ModelInfo], Any]) -> None:
         self._store = store
         self._load_model = load_model
@@ -70,7 +69,7 @@ class ModelRegistry:
                 raise ModelUnavailable(f"No approved model for part {part_number}. Ask Quality to approve one.")
             try:
                 model = self._load_model(info)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - every load failure becomes a 503
                 if is_out_of_memory(exc):
                     free_gpu_cache()
                     raise ModelUnavailable(

@@ -29,9 +29,8 @@ SUPERVISOR = ("supervisor1", "supervisor-pass-1")
 GOOD_MARKER = b"SCORE:0.05"
 
 
-
 class _MesHandler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
+    def log_message(self, format, *args):  # noqa: A002 - no request logging in tests
         pass
 
     def do_POST(self) -> None:
@@ -99,7 +98,6 @@ def parse_multipart(content_type: str, body: bytes) -> tuple[dict, dict]:
     return fields, files
 
 
-
 class Ui:
     def __init__(self, app) -> None:
         self.host, self.port = app.server.server_address[:2]
@@ -149,9 +147,7 @@ def press_part(ui: Ui, token: str, clock: FakeClock) -> None:
             raise AssertionError(f"press not accepted: {status} {body}")
 
 
-
 class _StationHarness(unittest.TestCase):
-
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="station-e2e-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
@@ -275,7 +271,6 @@ class _StationHarness(unittest.TestCase):
         return sorted(p.name for p in part_dir.iterdir() if p.suffix == ".png")
 
 class StationE2E(_StationHarness):
-
     def test_good_part_is_saved_and_posted_once(self) -> None:
         self.press_part()
 
@@ -457,7 +452,6 @@ class StationE2E(_StationHarness):
 
 
 class DoubleCaptureE2E(_StationHarness):
-
     def test_one_enter_never_takes_both_sides_when_the_top_capture_is_slow(self) -> None:
         self.top_capture_delay_s = 5.0
         self.clock.now += 1.0

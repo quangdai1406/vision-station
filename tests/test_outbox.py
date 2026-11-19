@@ -9,7 +9,6 @@ from station.outbox import Outbox
 
 
 class ScriptedClient:
-
     def __init__(self, *results: PostResult):
         self.queue = list(results)
         self.calls: list[dict] = []

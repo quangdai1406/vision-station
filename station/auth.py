@@ -109,7 +109,6 @@ def role_allows(role: str, action: str) -> bool:
 
 
 class UserStore:
-
     def __init__(self, users: dict[str, dict]):
         self._users: dict[str, tuple[str, str]] = {}
         for username, entry in users.items():
@@ -146,7 +145,6 @@ def load_users(path: str) -> UserStore:
 
 
 class SessionManager:
-
     def __init__(self, timeout_s: float, clock: Callable[[], float] = time.monotonic,
                  on_expire: Optional[Callable[[str, str, Optional[str]], None]] = None):
         if timeout_s <= 0:

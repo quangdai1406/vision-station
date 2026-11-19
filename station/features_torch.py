@@ -14,7 +14,7 @@ _CHUNK_BYTES = 256 * 1024 * 1024
 
 def _np() -> Any:
     try:
-        import numpy
+        import numpy  # noqa: PLC0415 - imported lazily on purpose
     except ImportError as exc:
         raise StationError("numpy is required for the torch feature extractor; install numpy") from exc
     return numpy
@@ -24,7 +24,7 @@ def _import_torch(torch_module: Any) -> Any:
     if torch_module is not None:
         return torch_module
     try:
-        import torch
+        import torch  # noqa: PLC0415 - imported lazily on purpose
     except ImportError as exc:
         raise StationError(
             "PyTorch is not installed; the torch feature extractor needs torch "
@@ -37,7 +37,7 @@ def _import_torchvision(torchvision_module: Any) -> Any:
     if torchvision_module is not None:
         return torchvision_module
     try:
-        import torchvision
+        import torchvision  # noqa: PLC0415 - imported lazily on purpose
     except ImportError as exc:
         raise StationError(
             "torchvision is not installed; the torch feature extractor needs torchvision"
@@ -70,7 +70,6 @@ def _weights_id(weights_path: Any) -> str:
 
 
 class TorchExtractor:
-
     def __init__(
         self,
         arch: str = "resnet18",
@@ -161,7 +160,6 @@ class TorchExtractor:
 
 
 class TorchBackend:
-
     def __init__(self, device: str = "auto", *, torch_module: Any = None, max_chunk_bytes: int = _CHUNK_BYTES) -> None:
         torch = _import_torch(torch_module)
         self.device = _resolve_device(torch, device)

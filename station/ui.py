@@ -242,7 +242,7 @@ class _Handler(BaseHTTPRequestHandler):
     role_map: Optional[dict] = None
     _mes_sid: Optional[str] = None
 
-    def log_message(self, format: str, *args: Any) -> None:
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         pass
 
     def do_GET(self) -> None:
@@ -263,7 +263,6 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception:
             traceback.print_exc(file=sys.stderr)
             self._send_json(500, {"error": "internal error"})
-
 
     def _get(self) -> None:
         path, _, query = self.path.partition("?")
@@ -326,7 +325,6 @@ class _Handler(BaseHTTPRequestHandler):
         if action is None:
             raise _HttpError(404, "not found")
         return self._act(action)
-
 
     def _state(self, query: dict) -> None:
         _, username, role = self._require()
@@ -542,7 +540,6 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"pending": [_pick(r, _PENDING_LABEL_KEYS) for r in rows
                                           if isinstance(r, dict)]})
 
-
     def _scan_gate(self) -> tuple[str, str]:
         _, username, role = self._require("scan")
         if self.scan is None:
@@ -714,7 +711,6 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_empty(204)
         ctype = _SCAN_IMAGE_TYPES.get(str(ext).lower(), "application/octet-stream")
         return self._send(200, bytes(data), ctype)
-
 
     def _cookie_token(self):
         raw = self.headers.get("Cookie")

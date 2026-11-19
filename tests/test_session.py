@@ -144,7 +144,6 @@ class _Ids:
 
 
 class RecordingFuse:
-
     def __init__(self, verdict=Verdict.GOOD):
         self.verdict = verdict
         self.calls = []
@@ -160,7 +159,6 @@ KEEP_DEFAULT = object()
 
 
 class PreviewCameras(FakeCameras):
-
     def __init__(self, error=None, **kw):
         super().__init__(**kw)
         self.error = error
@@ -827,7 +825,6 @@ class SaveFailureTests(_Base):
 
 
 class RaisingOutputs(FakeOutputs):
-
     def __init__(self, raising):
         super().__init__()
         self.raising = set(raising)
@@ -934,7 +931,6 @@ class OutputFailureTests(_Base):
 
 
 class AlarmAndFaultLightFailureTests(_Base):
-
     def _harness(self, fuse_verdict, raising):
         h = self.harness(fuse_verdict=fuse_verdict)
         h.outputs = RaisingOutputs(raising)
@@ -1073,7 +1069,6 @@ def _events(h, kind):
 
 
 class PartialStationTests(_Base):
-
     def partial(self, fuse_verdict=Verdict.GOOD, **kw):
         return self.harness(fuse_verdict=fuse_verdict, camera_ids=("C1",),
                             fuse=RecordingFuse(fuse_verdict), **kw)
@@ -1210,7 +1205,6 @@ class FullStationDefaultTests(_Base):
 
 
 class FlipGapTests(_Base):
-
     def test_default_min_flip_rejects_0_5s_and_accepts_2_1s_after_top(self):
         h = self.harness(fuse_verdict=Verdict.GOOD, min_flip_s=KEEP_DEFAULT)
         s = h.session
@@ -1391,7 +1385,6 @@ class PreviewTests(_Base):
 
 
 class PartSelectionTests(_Base):
-
     def _part_model(self, version):
         m = FakeModel()
         m.version = version

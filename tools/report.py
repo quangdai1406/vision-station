@@ -1,4 +1,3 @@
-
 import argparse
 import csv
 import json
@@ -96,7 +95,6 @@ def _analysis():
     _numpy()
     from tools import analysis
     return analysis
-
 
 
 def _read_session_json(session_dir):
@@ -303,7 +301,6 @@ def summarize_session(session_dir, settings=None):
     }
 
 
-
 def _plain(obj):
     if isinstance(obj, dict):
         return {str(k): _plain(v) for k, v in obj.items()}
@@ -454,7 +451,6 @@ def build_report(summaries, settings=None):
         "noise_floor": _noise_floor(summaries),
         "limitations": list(LIMITATIONS),
     }
-
 
 
 def _f(value, digits=2):

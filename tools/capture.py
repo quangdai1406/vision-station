@@ -105,7 +105,7 @@ def _is_windows() -> bool:
 
 def _import_numpy() -> Any:
     try:
-        import numpy
+        import numpy  # noqa: PLC0415 - lazy on purpose
     except ImportError as exc:
         raise ToolDependencyError(
             f"numpy is needed for capture. Install it with: {INSTALL_HINT}"
@@ -115,7 +115,7 @@ def _import_numpy() -> Any:
 
 def _import_cv2() -> Any:
     try:
-        import cv2
+        import cv2  # noqa: PLC0415 - lazy on purpose
     except ImportError as exc:
         raise ToolDependencyError(
             f"OpenCV is needed for capture. Install it with: {INSTALL_HINT}"
@@ -174,7 +174,7 @@ def _open_device(cv2: Any, dev: int, api: Any) -> Any:
 
 
 def _configure(cv2: Any, np: Any, dev: int, cap: Any, s: _Settings) -> dict:
-    call = lambda fn, *args: _safe(dev, fn, *args)
+    call = lambda fn, *args: _safe(dev, fn, *args)  # noqa: E731
 
     buffersize_readback: Optional[float] = None
     with contextlib.suppress(Exception):
@@ -376,7 +376,7 @@ def _restore_exposure(cv2: Any, dev: int, cap: Any, requested: float, flush_fram
 
 
 def _exposure_response(np: Any, cv2: Any, dev: int, cap: Any, s: _Settings) -> tuple[bool, dict]:
-    call = lambda fn, *args: _safe(dev, fn, *args)
+    call = lambda fn, *args: _safe(dev, fn, *args)  # noqa: E731
     requested = float(s.exposure)
     primary, fallback = (requested * 2, requested / 2) if requested != 0 else (1.0, -1.0)
     alt = primary

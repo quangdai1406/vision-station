@@ -181,7 +181,6 @@ class Outbox:
                 "mes_event_id", "created_at", "sent_at")
         return [{k: r[k] for k in keys} for r in rows]
 
-
     def _load_files(self, files_json: str) -> list[tuple[str, str, bytes]]:
         out = []
         for entry in json.loads(files_json):

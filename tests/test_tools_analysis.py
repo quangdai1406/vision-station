@@ -1,4 +1,3 @@
-
 import math
 import os
 import tempfile
@@ -8,7 +7,7 @@ import unittest
 try:
     import numpy as np
     HAS_NUMPY = True
-except ImportError:
+except ImportError:  # pragma: no cover
     np = None
     HAS_NUMPY = False
 

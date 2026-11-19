@@ -195,7 +195,7 @@ class TestSavePart(StoreTestCase):
         def worker(rec):
             try:
                 self.store.save_part(rec)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - collected for the assertion
                 errors.append(exc)
 
         threads = [threading.Thread(target=worker, args=(r,)) for r in recs]
@@ -487,7 +487,6 @@ class TestOperatorLabel(StoreTestCase):
         self.assertEqual(self.store.last_collected_session_id(), "S-c2")
         self.assertEqual(self.store.collected_session_id_for_part("P-c1"), "S-c1")
         self.assertIsNone(self.store.collected_session_id_for_part("P-g4"))
-
 
     def proposal(self, verdict=Verdict.BAD, criterion="CR-1", by="op-1"):
         return OperatorLabel(verdict, by, TS_LABEL, criterion_id=criterion, status=LABEL_PROPOSED,

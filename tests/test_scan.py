@@ -42,7 +42,6 @@ def make_frames(side, cams=CAMS):
 
 
 class FakeCameras:
-
     def __init__(self):
         self.sides = []
         self.script = []
@@ -395,7 +394,6 @@ class TestFlip(ScanSessionTestCase):
 
 
 class TestFlipGap(ScanSessionTestCase):
-
     def take_top_and_done(self):
         self.h.start()
         self.take(1)
@@ -559,7 +557,6 @@ class TestSnapshot(ScanSessionTestCase):
 
 
 class TestStepPicture(ScanSessionTestCase):
-
     def test_none_before_any_step_and_for_unknown_camera(self):
         self.assertIsNone(self.s.step_picture("C1"))
         self.h.start()

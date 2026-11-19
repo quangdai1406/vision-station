@@ -19,7 +19,6 @@ SHAPE = (80, 96)
 
 
 class BlockExtractor:
-
     name = "fake-block-8-v1"
     stride = 8
     input_hw = SHAPE
@@ -338,7 +337,6 @@ def _block_feats(seed, level=120):
 
 
 class _OtherDimExtractor(BlockExtractor):
-
     def extract(self, image):
         return super().extract(image)[..., :3]
 

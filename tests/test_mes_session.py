@@ -199,7 +199,6 @@ def _record() -> PartRecord:
 
 
 class PostHeaderTests(_FakeMesCase):
-
     def _post(self, **kwargs) -> dict:
         cfg = MesConfig(base_url=self.base, token=TOKEN, criteria_ids=["CR-1"],
                         class_to_criterion={}, timeout_s=5)
@@ -228,7 +227,6 @@ class PostHeaderTests(_FakeMesCase):
 
 
 class OutboxSessionColumnTests(unittest.TestCase):
-
     def test_old_outbox_gains_the_column_and_keeps_its_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)

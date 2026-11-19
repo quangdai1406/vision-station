@@ -78,9 +78,8 @@ def sha256_of(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-
 class _MesHandler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
+    def log_message(self, format, *args):  # noqa: A002 - keep test output quiet
         pass
 
     def _send(self, status: int, payload) -> None:
@@ -242,7 +241,6 @@ class FakeMes(http.server.ThreadingHTTPServer):
         self.thread.join(5)
 
 
-
 class FakeClock:
     def __init__(self) -> None:
         self.now = 1000.0
@@ -252,7 +250,6 @@ class FakeClock:
 
 
 class LightSpy(RecordingOutputs):
-
     def __init__(self) -> None:
         super().__init__()
         self.store = None
@@ -277,7 +274,6 @@ class LightSpy(RecordingOutputs):
     def show_fault(self) -> None:
         self._mark("show_fault")
         super().show_fault()
-
 
 
 class MesFlowE2E(unittest.TestCase):
@@ -318,7 +314,6 @@ class MesFlowE2E(unittest.TestCase):
         if self.laptop_open:
             self.laptop.close()
             self.laptop_open = False
-
 
     def config(self) -> dict:
         return {
@@ -430,7 +425,6 @@ class MesFlowE2E(unittest.TestCase):
     def all_station_files(self) -> list[pathlib.Path]:
         return [pathlib.Path(dirpath, name)
                 for dirpath, _dirs, names in os.walk(self.tmp) for name in names]
-
 
     def test_ticket_login_rules(self) -> None:
         self.start()

@@ -299,7 +299,6 @@ def _scan_problems(doc: object) -> list[str]:
 
 
 class ScanWriter:
-
     def __init__(
         self,
         store: "ScanStore",
@@ -457,7 +456,6 @@ class ScanWriter:
 
 
 class ScanStore:
-
     def __init__(self, root: pathlib.Path, site: str = "SITE", line: str = "L1") -> None:
         self.root = pathlib.Path(root)
         self.site = _component(site, "site")

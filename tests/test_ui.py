@@ -29,7 +29,6 @@ JPEG_BYTES = b"\xff\xd8\xff-fake-jpeg-frame"
 
 
 class FakeSession:
-
     def __init__(self):
         self.calls = []
         self.errors = {}

@@ -36,7 +36,6 @@ def run_sequence(test, driver, observe):
 
 
 class InvariantTableTests(unittest.TestCase):
-
     def test_good_never_lights_red_or_alarm(self):
         s = expected_after("show_good", OFF)
         self.assertTrue(s["green"])

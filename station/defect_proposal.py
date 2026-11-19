@@ -18,7 +18,6 @@ class DefectProposal:
 
 @dataclass(frozen=True)
 class ProposalRecord:
-
     criterion_id: str
     camera_id: str
     side: Side

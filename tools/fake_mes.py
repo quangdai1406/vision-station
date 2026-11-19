@@ -136,7 +136,7 @@ def _parse_limit(text: str | None) -> int:
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format: str, *args: Any) -> None:
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         pass
 
     def _send_json(self, status: int, payload: Any, extra: dict[str, str] | None = None) -> None:
@@ -151,7 +151,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _authorized(self) -> bool:
         given = self.headers.get("Authorization", "").encode("utf-8")
-        expected = f"Bearer {self.server.token}".encode("utf-8")
+        expected = f"Bearer {self.server.token}".encode("utf-8")  # type: ignore[attr-defined]
         return hmac.compare_digest(given, expected)
 
     def _unauthorized(self) -> None:
@@ -160,7 +160,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if not self._authorized():
             return self._unauthorized()
-        srv: FakeMesServer = self.server
+        srv: FakeMesServer = self.server  # type: ignore[assignment]
         url = urllib.parse.urlsplit(self.path)
         if url.path == SEARCH_PATH:
             query = urllib.parse.parse_qs(url.query)
@@ -182,7 +182,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         return self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
-        srv: FakeMesServer = self.server
+        srv: FakeMesServer = self.server  # type: ignore[assignment]
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -206,7 +206,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 
 class FakeMesServer(http.server.ThreadingHTTPServer):
-
     daemon_threads = True
 
     def __init__(self, token: str, *, parts: dict[str, dict[str, Any]] | None = None,

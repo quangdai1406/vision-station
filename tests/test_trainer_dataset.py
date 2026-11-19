@@ -76,7 +76,6 @@ def make_record(session_id, part_id, part_number, started, final, *,
 
 
 class EvidenceFixture(unittest.TestCase):
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self._tmp.name)
@@ -427,7 +426,6 @@ class TestInventoryCli(EvidenceFixture):
 
 
 class CollectedLabelDatasetTests(unittest.TestCase):
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self._tmp.name)

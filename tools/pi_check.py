@@ -59,11 +59,10 @@ def _err_text(exc: BaseException) -> str:
 
 def _try_import_cv2() -> Any:
     try:
-        import cv2
+        import cv2  # noqa: PLC0415 - lazy on purpose
     except ImportError:
         return None
     return cv2
-
 
 
 def _scrub_text(text: str, token: str) -> str:
@@ -80,7 +79,6 @@ def _scrub_obj(obj: Any, token: str) -> Any:
     if isinstance(obj, list):
         return [_scrub_obj(v, token) for v in obj]
     return obj
-
 
 
 def write_report_atomic(path: Path, report: dict) -> None:
@@ -101,14 +99,12 @@ def write_report_atomic(path: Path, report: dict) -> None:
         raise
 
 
-
 def versions(cv2: Any) -> dict:
     return {
         "python": platform.python_version(),
         "platform": platform.platform(),
         "opencv": getattr(cv2, "__version__", None) if cv2 is not None else None,
     }
-
 
 
 def _backend_for(cv2: Any, platform_name: str) -> tuple[Any, str, str]:
@@ -201,7 +197,6 @@ def _cameras_without_opencv(max_index: int) -> dict:
             "not_working": [], "details": [], "error": msg}
 
 
-
 def _base_url(text: str) -> str:
     parsed = urlparse.urlsplit(text)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
@@ -222,7 +217,7 @@ def _request(url: str, *, method: str, headers: dict, body: Optional[bytes], tim
     except urlerror.HTTPError as exc:
         try:
             data = exc.read()
-        except Exception:
+        except Exception:  # noqa: BLE001 - the status is what matters
             data = b""
         return exc.code, data
 
@@ -400,7 +395,6 @@ def check_laptop(base: str, token: str, token_env: str, part: str, n: int,
     return inf
 
 
-
 def check_evidence(dest: str) -> dict:
     result: dict = {"path": dest, "writable": False, "free_bytes": None, "error": None}
     folder = Path(dest)
@@ -433,7 +427,6 @@ def check_evidence(dest: str) -> dict:
     if result["error"] is None:
         result["writable"] = True
     return result
-
 
 
 def _validate(*, max_index: int, inference_url: Optional[str], token_env: Optional[str],

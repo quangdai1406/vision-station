@@ -238,7 +238,7 @@ def parse_multipart(content_type: str, body: bytes) -> dict[str, list[tuple[str 
 
 
 class _Handler(BaseHTTPRequestHandler):
-    def do_POST(self):
+    def do_POST(self):  # noqa: N802 (http.server naming)
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
         self.server.seen.append({
@@ -254,7 +254,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def log_message(self, format, *args):
+    def log_message(self, format, *args):  # noqa: A002
         pass
 
 

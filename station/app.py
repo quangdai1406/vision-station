@@ -94,7 +94,6 @@ class ConfigError(ValueError):
     pass
 
 
-
 def _where(path: str, key: str) -> str:
     return f"{path}.{key}" if path else key
 
@@ -557,7 +556,6 @@ def _resolve_path(value: Any, base: pathlib.Path) -> Any:
     return str(p if p.is_absolute() else base / p)
 
 
-
 def _utc_datetime(text: str) -> _dt.datetime:
     dt = _dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
     if dt.tzinfo is None:
@@ -566,7 +564,6 @@ def _utc_datetime(text: str) -> _dt.datetime:
 
 
 class _PartIdFactory:
-
     def __init__(self, store: Store, now_utc: Callable[[], str]) -> None:
         self._store = store
         self._now_utc = now_utc
@@ -598,7 +595,6 @@ class _PartIdFactory:
         return folder.exists()
 
 
-
 def _need_name(by: Any) -> None:
     if not isinstance(by, str) or not by.strip():
         raise ValueError("by is required")
@@ -611,7 +607,6 @@ def _label_result(session_id: str, label: OperatorLabel, previous: Optional[dict
 
 
 class _LockedSession:
-
     def __init__(self, session: StationSession, lock: threading.RLock, app: Any = None) -> None:
         self._session = session
         self._lock = lock
@@ -713,7 +708,6 @@ class _LockedSession:
 
 
 class _LockedScan:
-
     def __init__(self, scan: ScanSession, lock: threading.RLock) -> None:
         self._scan = scan
         self._lock = lock
@@ -772,11 +766,10 @@ class _LockedScan:
             return self._scan.review(scan_id, decision, by, reason)
 
 
-
 def _grey_decoder() -> Callable[[Frame], list]:
     try:
-        import cv2
-        import numpy
+        import cv2  # noqa: PLC0415 - optional dependency
+        import numpy  # noqa: PLC0415 - optional dependency
     except ImportError as exc:
         raise StationError("frame_ok.min_variance needs opencv-python and numpy installed") from exc
 
@@ -790,7 +783,7 @@ def _grey_decoder() -> Callable[[Frame], list]:
 
 
 def _load_golden_model(model: dict) -> Any:
-    from station.golden import GoldenModel, cv2_decoder
+    from station.golden import GoldenModel, cv2_decoder  # noqa: PLC0415 - needs numpy and cv2 at run time
 
     path = model["path"]
     if not os.path.isfile(path):
@@ -802,14 +795,13 @@ def _load_golden_model(model: dict) -> Any:
 
 def _torch_importable() -> bool:
     try:
-        import torch
+        import torch  # noqa: F401,PLC0415 - optional dependency
     except ImportError:
         return False
     return True
 
 
 class StationApp:
-
     def __init__(
         self,
         config: Mapping[str, Any],
@@ -870,7 +862,6 @@ class StationApp:
         except BaseException:
             self.outbox.close()
             raise
-
 
     @staticmethod
     def _make_cameras(cfg: dict):
@@ -1040,7 +1031,6 @@ class StationApp:
                                   auth_mode=self.auth_mode, mes_auth=mes_auth,
                                   role_map=cfg["auth"]["role_map"])
 
-
     def _inspection_busy(self) -> bool:
         return self.session.state is not State.IDLE
 
@@ -1055,7 +1045,6 @@ class StationApp:
             return False
         self.store.append_event("press_ignored", {"reason": "scan_active"})
         return True
-
 
     def _with_outbox(self, fn: Callable[[Outbox], Any]) -> Any:
         ob = Outbox(self._outbox_root)
@@ -1166,7 +1155,6 @@ class StationApp:
             except Exception as exc:
                 self.store.append_event("mes_sync_failed", {"error": str(exc) or type(exc).__name__})
 
-
     @property
     def url(self) -> str:
         host, port = self.server.server_address[:2]
@@ -1218,7 +1206,6 @@ class StationApp:
         if not hasattr(cams, "is_open"):
             return {"open": True, "last_error": None}
         return {"open": bool(cams.is_open), "last_error": getattr(cams, "last_open_error", None)}
-
 
     @property
     def parts_mode(self) -> str:
@@ -1290,7 +1277,6 @@ class StationApp:
                                     {"part_number": pn, "model_version": info.version, "by": by.strip()})
             return {"part_number": pn, "model_version": info.version, "can_inspect": True,
                     "warnings": warnings}
-
 
     def _label_target(self, part_id: Optional[str]) -> tuple[str, dict]:
         if part_id is not None:
@@ -1420,7 +1406,6 @@ class StationApp:
                  "proposed_by": r["operator_label"].get("proposed_by"),
                  "proposed_at": r["operator_label"].get("proposed_at")} for r in rows]
 
-
     def part_criteria(self) -> list[dict]:
         with self._session_lock:
             part = self._part_configs.get(self.session.part_number) if self._parts_mode == "mes" else None
@@ -1451,13 +1436,13 @@ class StationApp:
         return {"part_number": part_number, "can_inspect": False, "reason": reason, "warnings": warnings}
 
     def _load_part_model(self, info: Any) -> Any:
-        from station.golden import cv2_decoder
+        from station.golden import cv2_decoder  # noqa: PLC0415 - needs cv2 and numpy at run time
 
         if info.type == "patchcore" and not _torch_importable():
             raise StationError(_NEEDS_TORCH)
         decode = cv2_decoder()
         if info.type == "patchcore":
-            from station.anomaly import cv2_rgb_decoder, register_patchcore_loader
+            from station.anomaly import cv2_rgb_decoder, register_patchcore_loader  # noqa: PLC0415 - lazy
             decode = cv2_rgb_decoder()
             register_patchcore_loader(self._make_extractor)
         model = load_runtime_model(info, decode)
@@ -1468,7 +1453,7 @@ class StationApp:
         spec = self.config["model"].get("extractor")
         if spec is None:
             raise StationError("this part needs the anomaly model, but model.extractor is not set in the config")
-        from station.features_torch import TorchExtractor
+        from station.features_torch import TorchExtractor  # noqa: PLC0415 - needs torch at run time
         return TorchExtractor(spec["arch"], device=spec["device"], input_hw=tuple(spec["input_hw"]),
                               weights_path=spec["weights_path"])
 
@@ -1510,7 +1495,7 @@ class StationApp:
 
 
 def _serial_writer(port: str) -> Callable[[bytes], None]:
-    handle = open(port, "wb", buffering=0)
+    handle = open(port, "wb", buffering=0)  # noqa: SIM115 - kept open for the station's lifetime
 
     def write(data: bytes) -> None:
         handle.write(data)

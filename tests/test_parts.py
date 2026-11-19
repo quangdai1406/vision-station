@@ -12,7 +12,7 @@ from station.contracts import StationError
 
 try:
     from tools import criteria as tools_criteria
-except Exception:
+except Exception:  # noqa: BLE001
     tools_criteria = None
 
 FAKE_TOKEN = "fake-token-for-tests-only-0001"

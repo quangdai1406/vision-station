@@ -1,4 +1,3 @@
-
 import argparse
 import csv
 import http.client
@@ -43,7 +42,6 @@ class CriteriaFetchError(CriteriaError):
 
 class CriteriaFileError(CriteriaError):
     pass
-
 
 
 def _validate(data, source):
@@ -100,9 +98,7 @@ def _safe_id(key):
     return re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_") or "x"
 
 
-
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
@@ -189,7 +185,6 @@ def load_criteria_json(path):
         raise CriteriaFileError(str(exc)) from None
 
 
-
 def slugify(name):
     if not isinstance(name, str):
         raise ValueError("criteria name must be a string")
@@ -252,7 +247,6 @@ def summarize(criteria):
         "classes": [names[_key(c)] for c in visual],
         "warnings": warnings,
     }
-
 
 
 def build_config_pieces(criteria):
@@ -324,7 +318,6 @@ def write_outputs(criteria, part, out_dir):
         writer.writeheader()
         writer.writerows(build_checklist_rows(criteria))
     return paths
-
 
 
 def _format_summary(part, source, summary, paths):

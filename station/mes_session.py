@@ -16,7 +16,6 @@ _MAX_TICKET_CHARS = 256
 
 
 class MesSessionError(StationError):
-
     def __init__(self, message: str, status: int = 0):
         super().__init__(message)
         self.status = status
@@ -31,8 +30,7 @@ class SessionInfo:
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
         return None
 
 
@@ -62,7 +60,6 @@ def _info_from(data: Any, session_id: Optional[str] = None) -> SessionInfo:
 
 
 class MesSessionClient:
-
     def __init__(self, base_url: str, token: str, *, timeout_s: float = 10.0) -> None:
         if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
             raise MesSessionError("MES base URL must start with http:// or https://")
@@ -107,7 +104,6 @@ class MesSessionClient:
         if status in (200, 204, 404):
             return
         raise MesSessionError(self._refusal("session end", status), status=status)
-
 
     @staticmethod
     def _checked_id(session_id: str) -> str:

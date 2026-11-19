@@ -77,7 +77,6 @@ class ExampleConfigTest(unittest.TestCase):
 
 
 class ExtractorContractTest(unittest.TestCase):
-
     def test_filled_example_is_accepted_by_the_trainer(self) -> None:
         import json
         import tempfile
@@ -151,7 +150,6 @@ class SafetyRulesTest(unittest.TestCase):
 
 
 class BackupAndLoadTest(unittest.TestCase):
-
     def test_new_files_exist(self) -> None:
         for path in (BACKUP_PS1, INSTALL_BACKUP_PS1, BACKUP_EXAMPLE_JSON, LAPTOP_DOC):
             with self.subTest(path=str(path)):

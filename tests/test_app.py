@@ -48,7 +48,7 @@ from station.parts import PartsError
 from station.storage import Store
 
 try:
-    import numpy
+    import numpy  # noqa: F401 - only for the golden model tests
     HAVE_NUMPY = True
 except ImportError:
     HAVE_NUMPY = False
@@ -495,7 +495,6 @@ class CameraConfigTests(TmpCase):
 
 
 class CaptureModeConfigTests(TmpCase):
-
     def _opencv(self, devices=(0, 1, 2, 3), **cams) -> dict:
         data = base_config(self.tmp)
         data["cameras"] = {"kind": "opencv", "devices": list(devices), **cams}
@@ -589,7 +588,6 @@ class KeepOpenConfigTests(TmpCase):
 
 
 class RecordingCameraFactory:
-
     CAPTURE_KWARGS = ("capture_mode", "sequential_keep_open")
 
     def __init__(self) -> None:
@@ -891,7 +889,6 @@ class PreviewWrapperTests(unittest.TestCase):
 
 
 class ScriptedCameras(FakeCameraSet):
-
     def __init__(self, open_error=None) -> None:
         super().__init__()
         self._open_error = open_error
@@ -1116,7 +1113,7 @@ class PartsConfigTests(TmpCase):
 
 class MesPartsFakeHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        fake = self.server.fake
+        fake = self.server.fake  # type: ignore[attr-defined]
         url = urllib.parse.urlsplit(self.path)
         fake.requests.append((url.path, self.headers.get("Authorization")))
         if self.headers.get("Authorization") != f"Bearer {FAKE_MES_TOKEN}":
@@ -1160,13 +1157,12 @@ FAKE_CRITERIA = {
 
 
 class FakeMes:
-
     def __init__(self) -> None:
         self.parts = copy.deepcopy(FAKE_PARTS)
         self.criteria = copy.deepcopy(FAKE_CRITERIA)
         self.requests: list[tuple[str, str]] = []
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MesPartsFakeHandler)
-        self.server.fake = self
+        self.server.fake = self  # type: ignore[attr-defined]
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -1536,7 +1532,6 @@ class EvidenceConfigTests(TmpCase):
 
 
 class RemotePartTests(PartTestCase):
-
     def setUp(self) -> None:
         super().setUp()
         self.laptop = FakeLaptop(models={"PN-A": "2026-11-01-a"})

@@ -54,7 +54,7 @@ def _validate_sides(sides: object) -> tuple[str, ...]:
     if isinstance(sides, (str, bytes)):
         raise ScanError("sides must be a list of TOP and/or BOTTOM")
     try:
-        names = tuple(_side_name(s) for s in sides)
+        names = tuple(_side_name(s) for s in sides)  # type: ignore[union-attr]
     except TypeError as exc:
         raise ScanError("sides must be a list of TOP and/or BOTTOM") from exc
     if not names:
@@ -65,7 +65,6 @@ def _validate_sides(sides: object) -> tuple[str, ...]:
 
 
 class ScanSession:
-
     def __init__(
         self,
         cameras,
@@ -106,7 +105,6 @@ class ScanSession:
         self._flip_started: Optional[float] = None
         self._saved_path: Optional[pathlib.Path] = None
         self._clear_scan()
-
 
     def start(
         self,
@@ -338,7 +336,6 @@ class ScanSession:
                 "flip_wait_s": _seconds_left(wait) if wait > 0 else 0.0,
                 "prompt": self._prompt(side, wait),
             }
-
 
     def _take_step(self) -> bool:
         side = self._current_side()

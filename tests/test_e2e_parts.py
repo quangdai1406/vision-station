@@ -54,9 +54,8 @@ CRITERIA = {
 }
 
 
-
 class _FakeMesHandler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
+    def log_message(self, format, *args):  # noqa: A002 - keep test output quiet
         pass
 
     def _send(self, status: int, payload) -> None:
@@ -163,7 +162,6 @@ def parse_multipart(content_type: str, body: bytes) -> tuple[dict, dict]:
     return fields, files
 
 
-
 class FakeClock:
     def __init__(self) -> None:
         self.now = 1000.0
@@ -173,7 +171,6 @@ class FakeClock:
 
 
 class SpyOutputs(RecordingOutputs):
-
     def __init__(self) -> None:
         super().__init__()
         self.store = None
@@ -186,7 +183,6 @@ class SpyOutputs(RecordingOutputs):
 
 
 class ClosedCameras(FakeCameraSet):
-
     @property
     def is_open(self) -> bool:
         return False
@@ -202,7 +198,6 @@ def good_bytes(camera_id: str, side: Side, n: int) -> bytes:
 
 def marker_loader(info, decode):
     return MarkerModel(version=info.version)
-
 
 
 class PartsFlowE2E(unittest.TestCase):
@@ -244,7 +239,6 @@ class PartsFlowE2E(unittest.TestCase):
         self.markers: dict[tuple[str, str], bytes] = {}
         self.app = None
         self.port = None
-
 
     def approve(self, part_number: str, version: str, model_file: str,
                 model_type: str = "golden") -> None:
@@ -363,7 +357,6 @@ class PartsFlowE2E(unittest.TestCase):
                 for name in files:
                     with open(os.path.join(dirpath, name), "rb") as fh:
                         self.assertNotIn(self.token.encode(), fh.read(), name)
-
 
     def test_full_flow_two_parts_each_with_its_own_model_and_criteria(self) -> None:
         self.approve_golden("PN-A", "2026-10-24-a")

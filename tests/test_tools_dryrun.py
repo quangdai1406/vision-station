@@ -11,7 +11,7 @@ from pathlib import Path
 
 try:
     import numpy as np
-except ImportError:
+except ImportError:  # pragma: no cover - numpy is needed only for the chained runs
     np = None
 
 from tests.test_tools_capture import FakeCv2

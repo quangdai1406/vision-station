@@ -19,7 +19,6 @@ PART = "PN-TEST-001"
 
 
 class FakeFrame:
-
     def __init__(self, value: int, h: int = 48, w: int = 64) -> None:
         self.shape = (h, w, 3)
         self._any = value != 0
@@ -70,11 +69,10 @@ class FakeCv2:
 
 
 class _FakeLaptop(BaseHTTPRequestHandler):
-
     server_version = "FakeLaptop"
     sys_version = ""
 
-    def log_message(self, format, *args) -> None:
+    def log_message(self, format, *args) -> None:  # noqa: A002
         return
 
     def _send(self, status: int, payload: dict) -> None:
@@ -91,7 +89,7 @@ class _FakeLaptop(BaseHTTPRequestHandler):
         self._send(401, {"error": "unauthorized"})
         return False
 
-    def do_GET(self) -> None:
+    def do_GET(self) -> None:  # noqa: N802
         if self.path == "/v1/health":
             self.server.health_headers.append(self.headers.get("Authorization"))
             self._send(200, {"status": "ok", "busy": False, "in_flight": 0})
@@ -104,7 +102,7 @@ class _FakeLaptop(BaseHTTPRequestHandler):
         self._send(200, {"status": "ok", "version": "1", "models": [{"part_number": PART, "version": "v1"}],
                          "busy": False, "in_flight": 0, "gpu": {}})
 
-    def do_POST(self) -> None:
+    def do_POST(self) -> None:  # noqa: N802
         if not self._authorised():
             return
         length = int(self.headers.get("Content-Length", "0"))

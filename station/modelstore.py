@@ -45,7 +45,6 @@ class ModelInfo:
     reason: str
 
 
-
 def safe_part(part_number: str) -> str:
     if not isinstance(part_number, str) or not part_number.strip():
         raise ValueError("part number must be a non-empty string")
@@ -159,9 +158,7 @@ def _load_manifest(vdir: Path) -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
-
 class ModelStore:
-
     def __init__(self, root: Any) -> None:
         self.root = Path(root)
 
@@ -354,7 +351,6 @@ class ModelStore:
     def history(self, part_number: str) -> list[str]:
         return self._stack(part_number)
 
-
     def _stack(self, part_number: str) -> list[str]:
         stack = _replay(self.approvals(part_number))
         current = self._read_current_raw(part_number)
@@ -504,7 +500,6 @@ def _info(part_number: str, version: str, vdir: Path, manifest: dict,
     )
 
 
-
 LOADERS: dict[str, Loader] = {}
 
 
@@ -514,7 +509,7 @@ def register_loader(type_name: str, fn: Loader) -> None:
 
 
 def _load_golden(info: ModelInfo, decode: Any) -> Any:
-    from station.golden import GoldenModel
+    from station.golden import GoldenModel  # noqa: PLC0415 - lazy import, keeps this module light
 
     return GoldenModel.load(str(info.path), decode)
 

@@ -10,7 +10,6 @@ _MARKER_KEYS = ("SCORE", "CLASS", "BOX")
 
 
 class ScriptedModel:
-
     def __init__(
         self,
         version: str,
@@ -69,11 +68,10 @@ def _parse_box(text: str) -> tuple[int, int, int, int]:
         raise StationError(f"malformed marker BOX {text!r}") from exc
     if any(v < 0 for v in values):
         raise StationError(f"marker BOX has negative values: {text!r}")
-    return values
+    return values  # type: ignore[return-value]
 
 
 class MarkerModel:
-
     def __init__(self, version: str) -> None:
         self.version = version
 
@@ -97,7 +95,6 @@ class MarkerModel:
 
 
 class CollectModel:
-
     def __init__(self, version: str) -> None:
         self.version = version
 
@@ -107,7 +104,7 @@ class CollectModel:
 
 def _import_onnxruntime() -> Any:
     try:
-        import onnxruntime
+        import onnxruntime  # noqa: PLC0415 - imported lazily on purpose
     except ImportError as exc:
         raise StationError(
             "onnxruntime is not installed; install it or inject session/ort_module"
@@ -116,7 +113,6 @@ def _import_onnxruntime() -> Any:
 
 
 class OnnxModel:
-
     def __init__(
         self,
         path: Any,

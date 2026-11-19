@@ -41,7 +41,6 @@ def make_record(session_id, part_id, part_number, started, final, *, machine=Non
 
 
 class PurgeFixture(unittest.TestCase):
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self._tmp.name)
@@ -305,7 +304,6 @@ class TestArguments(PurgeFixture):
 
 
 class ApprovalGateTests(PurgeFixture):
-
     def _second_candidate(self):
         model_file = self.root / "model2.bin"
         model_file.write_bytes(b"model bytes v2")

@@ -47,7 +47,6 @@ def _default_frame_bytes(camera_id: str, side: Side, n: int) -> bytes:
 
 
 class FakeCameraSet:
-
     def __init__(
         self,
         fail_sides: Sequence[Side | str] = (),
@@ -122,7 +121,7 @@ class FakeCameraSet:
 
 def _import_cv2() -> Any:
     try:
-        import cv2
+        import cv2  # noqa: PLC0415 - imported lazily on purpose
     except ImportError as exc:
         raise CameraError(
             "OpenCV (cv2) is not installed; install opencv-python or inject cv2_module"
@@ -131,7 +130,6 @@ def _import_cv2() -> Any:
 
 
 class OpenCvCameraSet:
-
     def __init__(
         self,
         device_indexes: Sequence[int],
@@ -792,7 +790,6 @@ def make_blur_check(
     decode: Callable[[Frame], Sequence[Sequence[float]]],
     min_variance: float,
 ) -> Callable[[Frame], bool]:
-
     def blur_ok(frame: Frame) -> bool:
         variance = _laplacian_variance(decode(frame))
         if variance is None:

@@ -13,7 +13,7 @@ from unittest import mock
 
 try:
     import numpy as np
-except ImportError:
+except ImportError:  # pragma: no cover - numpy is required only for these tests
     np = None
 
 from tools import ToolDependencyError
@@ -34,7 +34,6 @@ SETTLE_KEYS = {"checked", "settled", "seconds", "frames_used", "last_means", "to
 
 
 class FakeClock:
-
     def __init__(self) -> None:
         self.t = 0.0
 
@@ -46,7 +45,6 @@ class FakeClock:
 
 
 class FakeCapture:
-
     def __init__(self, cv2: "FakeCv2", index: int, api: object) -> None:
         self._cv2 = cv2
         self.index = index
@@ -500,7 +498,6 @@ class CaptureTests(unittest.TestCase):
             {"index", "device", "stamp", "mean", "laplacian_var"},
         )
 
-
     def test_flush_grabs_happen_before_each_placement_capture(self) -> None:
         cv2 = FakeCv2()
         self.run_capture(cv2=cv2, mode="placement", count=2, no_prompt=False,
@@ -541,7 +538,6 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(cv2.events, [("grab", 0), ("retrieve", 0)] * 2)
 
-
     def test_buffersize_is_set_to_one_and_read_back_recorded(self) -> None:
         cv2 = FakeCv2()
         self.run_capture(cv2=cv2, count=1)
@@ -565,7 +561,6 @@ class CaptureTests(unittest.TestCase):
         cam = self.load_session()["cameras"]["0"]
         self.assertEqual(cam["buffersize_readback"], 4.0)
         self.assertTrue(any("buffer size" in w for w in cam["warnings"]))
-
 
     def test_exposure_that_changes_the_picture_is_responding(self) -> None:
         cv2 = FakeCv2(profiles={0: {"image_follows_exposure": True}})
@@ -644,7 +639,6 @@ class CaptureTests(unittest.TestCase):
         self.assertIn("grab failed", summary["aborted"])
         self.assertEqual(cv2.created[0].props[FakeCv2.CAP_PROP_EXPOSURE], -4.0)
         self.assertTrue(cv2.created[0].released)
-
 
     def test_settle_waits_for_brightness_then_records_only_settled_frames(self) -> None:
         self.run_capture(cv2=FakeCv2(), name="ref", count=3)
@@ -796,7 +790,6 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(params["settle_max_s"].default, 30.0)
         self.assertEqual(params["settle_frames"].default, 5)
         self.assertEqual(params["settle_tol_gray"].default, 1.0)
-
 
     def test_invalid_session_names_exit_2_with_a_message(self) -> None:
         bad = [

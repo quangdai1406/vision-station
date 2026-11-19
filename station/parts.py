@@ -24,7 +24,6 @@ class PartsError(StationError):
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
@@ -63,7 +62,6 @@ def _expect_list_of_dicts(data: Any, what: str) -> list[dict]:
 
 
 class MesPartsClient:
-
     def __init__(self, base_url: str, token: str, *, timeout_s: float = 10.0,
                  use_env_proxy: bool = False) -> None:
         if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
@@ -137,7 +135,6 @@ class MesPartsClient:
         path = "/api/machine/criteria/" + urllib.parse.quote(part, safe="")
         data = self._get_json(path, what=f"criteria for part {part}")
         return _expect_list_of_dicts(data, f"criteria for part {part}")
-
 
 
 def _validate(data: Any, source: str) -> list[dict]:

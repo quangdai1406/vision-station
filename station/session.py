@@ -161,7 +161,6 @@ class StationSession:
         self._completed_proposals: dict[str, list[ProposalRecord]] = {}
         self._clear_part()
 
-
     def press(self, by: Optional[str] = None, station_session: Optional[str] = None) -> bool:
         if self.state is State.IDLE and not self.can_inspect:
             self._log("press_ignored", {"reason": "no_part_or_model", "state": self.state.value,
@@ -418,7 +417,6 @@ class StationSession:
             return fn(camera_id)
         except Exception:
             return None
-
 
     def _debounce_ok(self, now: float) -> bool:
         return self._last_done is None or now - self._last_done >= self._debounce_s

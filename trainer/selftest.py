@@ -117,7 +117,7 @@ def run(
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     if features is None:
-        from station import features_torch as features
+        from station import features_torch as features  # noqa: PLC0415 - lazy on purpose
 
     rep = _Report()
     cuda = torch.cuda

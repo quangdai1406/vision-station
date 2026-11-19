@@ -56,7 +56,6 @@ class FakeBuf:
 
 
 class FakeImage:
-
     def __init__(self, name, width, height):
         self.name = name
         self.shape = (height, width, 3)
@@ -658,7 +657,6 @@ class BlurCheckTests(unittest.TestCase):
 
 
 def _recorded(make):
-
     def video_capture(cv2, index):
         cap = make(cv2, index)
         cv2.captures.append(cap)
@@ -925,7 +923,6 @@ class StatusTests(unittest.TestCase):
 
 
 def _logged_opens(cv2, make=_working):
-
     def video_capture(index):
         cv2.log.append(("open", index))
         return make(cv2, index)
@@ -953,7 +950,6 @@ def _opens_of(log, index):
 
 
 class _Ticker:
-
     def __init__(self):
         self.n = -1
 
@@ -1197,7 +1193,6 @@ class FakeCaptureModeTests(unittest.TestCase):
 
 
 class SequentialOpenPerShotTests(unittest.TestCase):
-
     def _cams(self, make=_working, indexes=(0, 1, 2, 3), **kwargs):
         cv2 = FakeCv2()
         cv2.VideoCapture = _logged_opens(cv2, make)
@@ -1385,7 +1380,6 @@ class Mjpg4Cv2(FakeCv2):
 
 
 class KeepOpenSessionTests(unittest.TestCase):
-
     def _set(self, cv2=None, **kw):
         return OpenCvCameraSet([0, 2, 4, 6], cv2_module=cv2 or Mjpg4Cv2(), **kw)
 

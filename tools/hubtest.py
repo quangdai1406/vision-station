@@ -63,7 +63,7 @@ class ReportWriteError(Exception):
 
 def _import_numpy() -> Any:
     try:
-        import numpy
+        import numpy  # noqa: PLC0415 - lazy on purpose
     except ImportError as exc:
         raise ToolDependencyError(f"numpy is needed for the hub test; {NOT_INSTALLED_NOTE}") from exc
     return numpy
@@ -71,7 +71,7 @@ def _import_numpy() -> Any:
 
 def _import_cv2() -> Any:
     try:
-        import cv2
+        import cv2  # noqa: PLC0415 - lazy on purpose
     except ImportError as exc:
         raise ToolDependencyError(f"OpenCV (cv2) is needed for the hub test; {NOT_INSTALLED_NOTE}") from exc
     return cv2

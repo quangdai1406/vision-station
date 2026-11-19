@@ -38,7 +38,6 @@ BLOB_BOX = (BLOB_X, BLOB_Y, BLOB_W, BLOB_H)
 GOLDEN_FRAMES = 5
 
 
-
 def image_bytes(seed: int, blob: bool = False) -> bytes:
     rng = np.random.default_rng(seed)
     img = (128 + rng.integers(-1, 2, size=(H, W))).astype(np.uint8)
@@ -68,7 +67,6 @@ def _overlap_area(a, b) -> int:
     w = min(ax + aw, bx + bw) - max(ax, bx)
     h = min(ay + ah, by + bh) - max(ay, by)
     return max(0, w) * max(0, h)
-
 
 
 @unittest.skipIf(np is None, "numpy not installed")
@@ -189,7 +187,6 @@ class _Harness(unittest.TestCase):
             return resp.status, resp.read()
         finally:
             conn.close()
-
 
 
 @unittest.skipIf(np is None, "numpy not installed")
@@ -321,7 +318,6 @@ class OneCameraPocE2E(_Harness):
         self.assertIn(b'"Enter"', body)
 
 
-
 @unittest.skipIf(np is None, "numpy not installed")
 class FourCameraDefaultE2E(_Harness):
 
@@ -354,10 +350,8 @@ class FourCameraDefaultE2E(_Harness):
         self.assertEqual(self.mes.requests[0]["key"], session_id)
 
 
-
 @unittest.skipIf(np is None, "numpy not installed")
 class OneCameraLiveViewE2E(_Harness):
-
     def preview_get(self, camera: str, token: str | None):
         conn = http.client.HTTPConnection(self.ui.host, self.ui.port, timeout=10)
         try:

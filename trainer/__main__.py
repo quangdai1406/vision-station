@@ -119,7 +119,6 @@ def _first_callable(module: Any, names: Sequence[str]) -> Optional[Callable[...,
 
 def _lazy_command(command: str, module_name: str, add_names: Sequence[str],
                   run_names: Sequence[str]) -> tuple[Callable[[Any], None], Callable[[argparse.Namespace], int]]:
-
     def add_arguments(sub: Any) -> None:
         module, _reason = _lazy_module(module_name)
         add = _first_callable(module, add_names)

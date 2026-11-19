@@ -242,7 +242,6 @@ class CollectAppTests(unittest.TestCase):
 
 
 class TwoStepLabelAppTests(unittest.TestCase):
-
     setUp = CollectAppTests.setUp
     _restore_env = CollectAppTests._restore_env
     _collected_app = CollectAppTests._collected_app

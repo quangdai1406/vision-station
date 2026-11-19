@@ -104,7 +104,6 @@ LABEL_STATUSES = (LABEL_PROPOSED, LABEL_OFFICIAL, LABEL_REJECTED)
 
 @dataclass(frozen=True)
 class OperatorLabel:
-
     verdict: Verdict
     labelled_by: str
     labelled_at: str
@@ -119,7 +118,6 @@ class OperatorLabel:
 
 @dataclass
 class PartRecord:
-
     part_id: str
     session_id: str
     station_id: str
@@ -164,7 +162,6 @@ class InferenceModel(Protocol):
 
 
 class OutputDriver(Protocol):
-
     def show_good(self) -> None: ...
     def show_bad(self) -> None: ...
     def show_review(self) -> None: ...

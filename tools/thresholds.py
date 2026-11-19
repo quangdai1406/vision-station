@@ -24,7 +24,6 @@ class ThresholdInputError(ValueError):
     pass
 
 
-
 def load_scores(path) -> list[dict]:
     p = Path(path)
     try:
@@ -88,7 +87,6 @@ def load_scores(path) -> list[dict]:
     return rows
 
 
-
 def wilson_interval(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     if n < 0 or k < 0 or k > n:
         raise ValueError(f"need 0 <= k <= n, got k={k} n={n}")
@@ -124,7 +122,6 @@ def t_low_candidate(good_scores: Sequence[float], percentile: float, t_img: floa
     if raw > t_img:
         return (t_img, True)
     return (raw, False)
-
 
 
 def candidate_table(good: Sequence[float], bad: Sequence[float]) -> list[dict]:
@@ -281,7 +278,6 @@ def _verdict_counts(scores: Sequence[float], t_low: float, t_img: float) -> dict
     return counts
 
 
-
 def _attach_evaluation(result: dict, good_scores, bad_rows, t_img) -> dict:
     if t_img is not None:
         result["evaluation"] = evaluate_threshold(good_scores, bad_rows, t_img)
@@ -393,7 +389,6 @@ def suggest(good, bad, *, min_good, min_bad, review_from_good_percentile, t_img=
         ),
     }
     return _attach_evaluation(result, g_scores, bad, chosen)
-
 
 
 LIMITS = [
@@ -588,7 +583,6 @@ def render_report(result: dict, *, source, model_version: Optional[str], n_rows:
     lines += [f"- {item}" for item in LIMITS]
     lines.append("")
     return "\n".join(lines)
-
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

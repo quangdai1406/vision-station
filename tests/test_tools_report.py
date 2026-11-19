@@ -13,7 +13,7 @@ from unittest import mock
 try:
     import numpy as np
     HAS_NUMPY = True
-except ImportError:
+except ImportError:  # pragma: no cover - depends on the environment
     np = None
     HAS_NUMPY = False
 

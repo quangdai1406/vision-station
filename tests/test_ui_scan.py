@@ -36,7 +36,6 @@ ROUTES = [
 
 
 class FakeCams:
-
     def __init__(self):
         self.script = []
         self.count = 0
@@ -702,7 +701,6 @@ PROPOSED_GOOD = {"verdict": "GOOD", "defects": [], "status": "proposed",
 
 
 class ScanReviewSessionTests(unittest.TestCase):
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)

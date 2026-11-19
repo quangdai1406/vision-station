@@ -191,7 +191,7 @@ def _make_runtime(args: argparse.Namespace, extractor_factory, decoder_factory) 
             raise UsageError("--extractor-config is required for a real run (not needed with --dry-run)")
         cfg = _load_config(args.extractor_config)
         try:
-            from station.features_torch import TorchExtractor
+            from station.features_torch import TorchExtractor  # noqa: PLC0415 - needs torch, lazily
             extractor = TorchExtractor(cfg["arch"], device=cfg["device"], input_hw=cfg["input_hw"],
                                        weights_path=cfg["weights_path"])
         except ImportError as exc:
@@ -419,7 +419,6 @@ def _manifest(*, model: Any, mode: str, note: str, parent_version: Optional[str]
 
 
 class _Context:
-
     def __init__(self, args: argparse.Namespace, ms: ModelStore, runtime: Optional[_Runtime],
                  now: datetime, dry_run: bool, scans: Optional[ScanSet] = None,
                  holdout_toys: Optional[list] = None) -> None:

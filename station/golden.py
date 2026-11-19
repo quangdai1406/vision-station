@@ -23,7 +23,7 @@ Key = tuple[str, str]
 
 def _np() -> Any:
     try:
-        import numpy
+        import numpy  # noqa: PLC0415 - imported lazily on purpose
     except ImportError as exc:
         raise StationError("numpy is required for the golden-image model; install numpy") from exc
     return numpy
@@ -31,7 +31,7 @@ def _np() -> Any:
 
 def _import_cv2() -> Any:
     try:
-        import cv2
+        import cv2  # noqa: PLC0415 - imported lazily on purpose
     except ImportError as exc:
         raise StationError(
             "OpenCV (cv2) is not installed; install opencv-python or inject cv2_module"
@@ -126,7 +126,6 @@ class _Running:
 
 
 class GoldenBuilder:
-
     def __init__(
         self,
         decode: Decode,
@@ -194,7 +193,6 @@ class GoldenBuilder:
 
 
 class GoldenModel:
-
     def __init__(
         self,
         version: str,
@@ -322,7 +320,7 @@ class GoldenModel:
                     expected = (shape[0] // block, shape[1] // block)
                     if mean.shape != expected or std.shape != expected:
                         raise StationError(f"golden arrays for {_key_text(key)} have the wrong shape")
-                    keys[key] = LearnedKey(mean, std, block, frames, shape)
+                    keys[key] = LearnedKey(mean, std, block, frames, shape)  # type: ignore[arg-type]
                 return cls(
                     str(meta["version"]),
                     keys,

@@ -16,7 +16,6 @@ if HAS_NUMPY:
 
 
 class FakeTensor:
-
     def __init__(self, data, rec=None):
         self.data = np.asarray(data)
         self.rec = rec
@@ -65,7 +64,6 @@ class Recorder:
 
 
 class FakeLayer:
-
     def __init__(self, rec, name, stride, channels):
         self.rec, self.name, self.stride, self.channels = rec, name, stride, channels
 

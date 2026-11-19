@@ -58,12 +58,11 @@ def gpu_info() -> dict:
         cuda = bool(torch.cuda.is_available())
         return {"torch_loaded": True, "cuda_available": cuda,
                 "device": torch.cuda.get_device_name(0) if cuda else None}
-    except Exception:
+    except Exception:  # noqa: BLE001 - health must not fail because of the GPU
         return {"torch_loaded": True, "cuda_available": None, "error": "unavailable"}
 
 
 class Service:
-
     def __init__(self, registry: ModelRegistry, token: str, max_body_bytes: int) -> None:
         if not isinstance(token, str) or not token:
             raise ValueError("an access token is required")
@@ -106,7 +105,7 @@ class _Handler(BaseHTTPRequestHandler):
     server_version = "InferenceService"
     sys_version = ""
 
-    def log_message(self, format: str, *args: Any) -> None:
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - base class signature
         return
 
     def log_request(self, code: Any = "-", size: Any = "-") -> None:
@@ -127,7 +126,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(401, {"error": "unauthorized"})
         return False
 
-    def do_GET(self) -> None:
+    def do_GET(self) -> None:  # noqa: N802 - http.server name
         path = self.path.split("?")[0]
         service = self.server.service
         if path == HEALTH_PATH:
@@ -166,7 +165,7 @@ class _Handler(BaseHTTPRequestHandler):
         except ModelUnavailable as exc:
             self._json(503, {"approved": False, "reason": str(exc)})
             return
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - map every failure to a JSON answer
             sys.stderr.write(f"model lookup failed: {type(exc).__name__}\n")
             self._json(500, {"error": "internal error"})
             return
@@ -176,7 +175,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._json(200, {"part_number": part, "approved": True, "model_version": info.version})
 
-    def do_POST(self) -> None:
+    def do_POST(self) -> None:  # noqa: N802 - http.server name
         if not self._authorised():
             return
         if self.path.split("?")[0] != PREDICT_PATH:
@@ -219,7 +218,7 @@ class _Handler(BaseHTTPRequestHandler):
             except ModelUnavailable as exc:
                 self._json(503, {"error": str(exc)})
                 return
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - map every failure to a JSON answer
                 if is_out_of_memory(exc):
                     service.registry.release(part)
                     self._json(503, {"error": "GPU out of memory while scoring; the model was unloaded "
@@ -254,7 +253,7 @@ def _extractor_factory(spec: Optional[dict]) -> Callable[[], Any]:
     def factory() -> Any:
         if spec is None:
             raise StationError("no extractor config: start the service with --extractor-config FILE")
-        from station.features_torch import TorchExtractor
+        from station.features_torch import TorchExtractor  # noqa: PLC0415 - needs torch at run time
 
         return TorchExtractor(spec["arch"], device=spec.get("device", "auto"),
                               input_hw=tuple(spec["input_hw"]), weights_path=spec.get("weights_path"))
@@ -263,11 +262,10 @@ def _extractor_factory(spec: Optional[dict]) -> Callable[[], Any]:
 
 
 def default_loader(extractor_spec: Optional[dict]) -> Callable[[ms.ModelInfo], Any]:
-
     def load(info: ms.ModelInfo) -> Any:
         if info.type != "patchcore":
             raise ModelUnavailable(f"this service serves patchcore models, not {info.type}")
-        from station.anomaly import cv2_rgb_decoder, register_patchcore_loader
+        from station.anomaly import cv2_rgb_decoder, register_patchcore_loader  # noqa: PLC0415 - lazy
 
         decode = cv2_rgb_decoder()
         register_patchcore_loader(_extractor_factory(extractor_spec))

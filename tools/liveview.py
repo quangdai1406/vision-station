@@ -1,12 +1,3 @@
-DOC_TEXT = """Live view of the 4 station cameras in a browser, for aiming and lighting.
-
-Run:   python -m tools.liveview            (needs opencv-python; imported lazily)
-Open:  http://127.0.0.1:8090/   (on the Pi screen)
-
-Stop the station first: only one program can hold a camera at a time.
-Binds to 127.0.0.1 by default (no login). Use --host only on a network you trust.
-Nothing is saved. The 'Save snapshot' link writes 4 PNGs to ~/Pictures/vision-liveview/.
-"""
 import argparse
 import os
 import signal
@@ -16,6 +7,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from tools import ToolDependencyError
 
+DOC_TEXT = """Live view of the 4 station cameras in a browser, for aiming and lighting.
+
+Run:   python -m tools.liveview            (needs opencv-python; imported lazily)
+Open:  http://127.0.0.1:8090/   (on the Pi screen)
+
+Stop the station first: only one program can hold a camera at a time.
+Binds to 127.0.0.1 by default (no login). Use --host only on a network you trust.
+Nothing is saved. The 'Save snapshot' link writes 4 PNGs to ~/Pictures/vision-liveview/.
+"""
+
 cv2 = None
 
 
@@ -23,7 +24,7 @@ def _require_cv2():
     global cv2
     if cv2 is None:
         try:
-            import cv2 as _cv2
+            import cv2 as _cv2  # noqa: PLC0415 - lazy on purpose
         except ImportError as exc:
             raise ToolDependencyError("OpenCV (cv2) is needed for the live view") from exc
         cv2 = _cv2

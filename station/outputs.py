@@ -14,7 +14,6 @@ _OFF = {lamp: False for lamp in LAMPS}
 
 
 class _OutputBase:
-
     def __init__(self) -> None:
         self.green = False
         self.red = False
@@ -50,7 +49,6 @@ class _OutputBase:
 
 
 class RecordingOutputs(_OutputBase):
-
     def __init__(self) -> None:
         super().__init__()
         self.history: list[str] = []
@@ -60,7 +58,6 @@ class RecordingOutputs(_OutputBase):
 
 
 class ConsoleOutputs(_OutputBase):
-
     def __init__(self, write: Optional[Callable[[str], None]] = None) -> None:
         super().__init__()
         self._write = write if write is not None else print
@@ -76,7 +73,6 @@ DEFAULT_CHANNEL_MAP: dict[str, int] = {"green": 1, "red": 2, "alarm": 3, "amber"
 
 
 class SerialRelayOutputs(_OutputBase):
-
     def __init__(
         self,
         write: Callable[[bytes], None],

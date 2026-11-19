@@ -1,4 +1,18 @@
 from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Iterator, Optional, Sequence
+
+from station.scanstore import verify_scan
+
 DOC_TEXT = """Export saved evidence from the Pi station to a destination folder.
 
 Standard library only. Read-only at the source. Nothing is ever deleted at the
@@ -52,19 +66,6 @@ Exit codes: 0 no corrupt or failed part or scan, 1 some part or scan is corrupt 
 2 bad arguments or unusable source/destination.
 """
 
-import argparse
-import hashlib
-import json
-import os
-import re
-import sys
-from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
-from pathlib import Path
-from typing import Iterator, Optional, Sequence
-
-from station.scanstore import verify_scan
-
 PART_JSON = "part.json"
 MANIFEST = "manifest.sha256"
 PURGED_FILE = "purged.json"
@@ -102,7 +103,6 @@ class PartCheck:
     problems: list = field(default_factory=list)
     manifest_bytes: Optional[bytes] = None
     entries: list = field(default_factory=list)
-
 
 
 def _sha256_file(path: Path) -> str:
@@ -211,7 +211,6 @@ def check_part(part_dir: Path) -> PartCheck:
     return PartCheck("ok", [], manifest_bytes, entries)
 
 
-
 def _copy_verified(src: Path, dst: Path, expected: str) -> None:
     with open(src, "rb") as fin, open(dst, "wb") as fout:
         for chunk in iter(lambda: fin.read(1 << 20), b""):
@@ -249,7 +248,6 @@ def _export_part(check: PartCheck, src: Path, dst: Path, dry_run: bool) -> tuple
     except OSError as exc:
         return "failed", f"copy error: {exc}"
     return "copied", ""
-
 
 
 def check_scan(scan_dir: Path) -> PartCheck:
@@ -309,7 +307,6 @@ def _export_scan(check: PartCheck, src: Path, dst: Path, dry_run: bool) -> tuple
     except OSError as exc:
         return "failed", f"copy error: {exc}"
     return "copied", ""
-
 
 
 def _resolve_sources(source) -> tuple[Optional[Path], Optional[Path]]:
@@ -407,7 +404,6 @@ def _write_report(dest: Path, report: dict) -> Path:
     return path
 
 
-
 def export(source, dest, since: Optional[date] = None, dry_run: bool = False) -> dict:
     store, scans = _resolve_sources(source)
     dest = Path(dest)
@@ -490,7 +486,6 @@ def export(source, dest, since: Optional[date] = None, dry_run: bool = False) ->
     if not dry_run:
         _write_report(dest, report)
     return report
-
 
 
 def build_parser() -> argparse.ArgumentParser:

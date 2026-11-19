@@ -29,15 +29,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             pass
 
     def _authorised(self) -> bool:
-        fake = self.server.fake
+        fake = self.server.fake  # type: ignore[attr-defined]
         return self.headers.get("Authorization") == f"Bearer {fake.token}"
 
     def _listed(self) -> list:
-        fake = self.server.fake
+        fake = self.server.fake  # type: ignore[attr-defined]
         return [{"part_number": pn, "version": v} for pn, v in sorted(fake.models.items())]
 
-    def do_GET(self) -> None:
-        fake = self.server.fake
+    def do_GET(self) -> None:  # noqa: N802
+        fake = self.server.fake  # type: ignore[attr-defined]
         fake.requests.append(("GET", self.path, dict(self.headers)))
         if fake.delay:
             time.sleep(fake.delay)
@@ -73,8 +73,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         self._send(404, b'{"error": "not found"}')
 
-    def do_POST(self) -> None:
-        fake = self.server.fake
+    def do_POST(self) -> None:  # noqa: N802
+        fake = self.server.fake  # type: ignore[attr-defined]
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length)
         fake.requests.append(("POST", self.path, dict(self.headers)))
@@ -111,7 +111,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 
 class FakeLaptop:
-
     def __init__(self, models: Optional[dict] = None, token: str = FAKE_LAPTOP_TOKEN) -> None:
         self.token = token
         self.models: dict[str, str] = dict(models or {})
@@ -130,7 +129,7 @@ class FakeLaptop:
         self.last_predict_body: bytes = b""
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self.server.daemon_threads = True
-        self.server.fake = self
+        self.server.fake = self  # type: ignore[attr-defined]
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

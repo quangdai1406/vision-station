@@ -306,7 +306,6 @@ class EvidencePlannedDestinationTests(tes.EvidenceSyncTestCase):
 
 
 class DefectSession(FakeSession):
-
     def __init__(self):
         super().__init__()
         self.proposed = []

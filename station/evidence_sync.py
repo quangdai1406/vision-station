@@ -47,7 +47,6 @@ class SyncReport:
     errors: list = field(default_factory=list)
 
 
-
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -168,7 +167,6 @@ def _adopt_existing(final: pathlib.Path, src: _Source) -> str:
     return str(final)
 
 
-
 def planned_destination(part_dir, dest_root) -> str:
     return str(pathlib.Path(dest_root) / _layout(pathlib.Path(part_dir)))
 
@@ -208,7 +206,6 @@ def sync_part(part_dir, dest_root) -> str:
     return str(final)
 
 
-
 def _write_atomic(path: pathlib.Path, data: bytes) -> None:
     fd, tmp_name = tempfile.mkstemp(prefix=f"{_TMP_PREFIX}queue-", dir=str(path.parent))
     try:
@@ -224,7 +221,6 @@ def _write_atomic(path: pathlib.Path, data: bytes) -> None:
 
 
 class SyncQueue:
-
     def __init__(self, folder) -> None:
         self.folder = pathlib.Path(folder)
         self.path = self.folder / QUEUE_NAME
@@ -295,7 +291,6 @@ class SyncQueue:
             self._save(items)
         report.pending = sum(1 for item in items if item["state"] == PENDING)
         return report
-
 
 
 def _status(queue: SyncQueue) -> int:

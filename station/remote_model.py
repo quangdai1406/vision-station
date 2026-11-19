@@ -18,8 +18,7 @@ _ERROR_TEXT_MAX = 200
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
         return None
 
 
@@ -30,7 +29,7 @@ def _scrub(text: str, token: str) -> str:
 def _read_quietly(exc: urllib.error.HTTPError) -> bytes:
     try:
         return exc.read(4096)
-    except Exception:
+    except Exception:  # noqa: BLE001 - the body is only used for a short message
         return b""
 
 
@@ -72,7 +71,6 @@ def _defect(item: Any) -> Defect:
 
 
 class RemoteModel:
-
     def __init__(self, base_url: str, token_env: str, timeout_s: float, part_number: str) -> None:
         if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
             raise ValueError("laptop base URL must start with http:// or https://")
@@ -92,7 +90,6 @@ class RemoteModel:
 
     def __repr__(self) -> str:
         return f"RemoteModel(part_number={self.part_number!r}, version={self.version!r})"
-
 
     def _send(self, req: urllib.request.Request, what: str) -> tuple[int, bytes]:
         try:
@@ -143,7 +140,6 @@ class RemoteModel:
         headers = {"Authorization": f"Bearer {self._token}", "Accept": "application/json"}
         headers.update(extra or {})
         return headers
-
 
     def check_approved(self) -> str:
         what = "laptop approval check"

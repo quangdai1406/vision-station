@@ -1,4 +1,13 @@
 from __future__ import annotations
+
+import argparse
+import statistics
+import sys
+import time
+from typing import Any, Callable, Optional, Sequence
+
+from tools import ToolDependencyError
+
 DOC_TEXT = """Timing probe for the keep-open camera session: N rounds of one picture per camera.
 
     python -m tools.capture_speed --devices 0 2 4 6 --width 1280 --height 720 \\
@@ -14,19 +23,11 @@ period means the grab waited for a fresh frame. No threshold is applied here.
 The wall clock cannot tell the true age of a frame.
 """
 
-import argparse
-import statistics
-import sys
-import time
-from typing import Any, Callable, Optional, Sequence
-
-from tools import ToolDependencyError
-
 
 def _decode_mean(data: bytes) -> float:
     try:
-        import cv2
-        import numpy as np
+        import cv2  # noqa: PLC0415
+        import numpy as np  # noqa: PLC0415
     except ImportError as exc:
         raise ToolDependencyError("numpy and OpenCV (cv2) are needed for the capture-speed probe") from exc
     img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -119,7 +120,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--threaded", action="store_true")
     ap.add_argument("--flush", type=int, default=1)
     args = ap.parse_args(argv)
-    from station.cameras import OpenCvCameraSet
+    from station.cameras import OpenCvCameraSet  # noqa: PLC0415
 
     cams = OpenCvCameraSet(args.devices, width=args.width, height=args.height,
                            session_mode="keep_open", mjpg=args.mjpg, threaded=args.threaded,

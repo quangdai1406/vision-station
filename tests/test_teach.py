@@ -24,7 +24,6 @@ def _decode(frame):
 
 
 class _Inputs:
-
     def __init__(self, fail_at=None, exc=EOFError):
         self.calls = 0
         self.fail_at = fail_at
@@ -65,7 +64,6 @@ class _TeachCase(unittest.TestCase):
 
 
 class TeachArgumentTests(_TeachCase):
-
     def test_model_kind_not_golden_exits_2(self):
         path = self.write_config(kind="marker")
         err = io.StringIO()

@@ -30,7 +30,6 @@ Decode = Callable[[Frame], Any]
 
 
 class FeatureExtractor(Protocol):
-
     name: str
     stride: int
     input_hw: tuple[int, int]
@@ -45,7 +44,7 @@ class Backend(Protocol):
 
 def _np() -> Any:
     try:
-        import numpy
+        import numpy  # noqa: PLC0415 - imported lazily on purpose
     except ImportError as exc:
         raise StationError("numpy is required for the PatchCore anomaly model; install numpy") from exc
     return numpy
@@ -84,7 +83,6 @@ def _input_hw_of(extractor: Any) -> Optional[tuple[int, int]]:
 
 
 class NumpyBackend:
-
     def __init__(self, max_chunk_bytes: int = CHUNK_BYTES) -> None:
         self.max_chunk_bytes = _positive_int(max_chunk_bytes, "max_chunk_bytes")
         if self.max_chunk_bytes < 4:
@@ -238,7 +236,6 @@ class PatchCoreKey:
 
 
 class PatchCoreBuilder:
-
     def __init__(
         self,
         extractor: Any,
@@ -449,7 +446,6 @@ class PatchCoreBuilder:
 
 
 class PatchCoreModel:
-
     def __init__(
         self,
         version: str,
@@ -719,7 +715,7 @@ def _write_npz(np: Any, path: Any, arrays: Mapping[str, Any]) -> None:
 def cv2_rgb_decoder(cv2_module: Any = None) -> Decode:
     if cv2_module is None:
         try:
-            import cv2 as imported
+            import cv2 as imported  # noqa: PLC0415 - imported lazily on purpose
         except ImportError as exc:
             raise StationError("opencv (cv2) is required to decode camera images; install opencv-python") from exc
         cv2_module = imported
@@ -736,7 +732,6 @@ def cv2_rgb_decoder(cv2_module: Any = None) -> Decode:
 
 
 def register_patchcore_loader(extractor_factory: Callable[[], Any]) -> Callable[..., PatchCoreModel]:
-
     def loader(source: Any, decode: Decode, backend: Any = None) -> PatchCoreModel:
         path = getattr(source, "path", source)
         return PatchCoreModel.load(path, decode, extractor_factory(), backend=backend)

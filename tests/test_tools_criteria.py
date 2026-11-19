@@ -1,4 +1,3 @@
-
 import contextlib
 import csv
 import io
@@ -287,7 +286,6 @@ def _dead_port():
 
 
 class ProxyModeTests(_MESTestCase):
-
     def setUp(self):
         super().setUp()
         self.dead_proxy = f"http://127.0.0.1:{_dead_port()}"

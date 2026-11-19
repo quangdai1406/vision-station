@@ -18,7 +18,6 @@ INFO = SessionInfo(session_id=SID, username="anna.k", roles=("inspector",),
 
 
 class FakeMesSessions:
-
     def __init__(self):
         self.redeem_result = INFO
         self.redeem_error = None
@@ -45,7 +44,6 @@ class FakeMesSessions:
 
 
 class RecordingSession(FakeSession):
-
     def __init__(self):
         super().__init__()
         self.press_kwargs = []
@@ -245,7 +243,6 @@ class LocalModeTests(unittest.TestCase):
 
 
 class SessionIdentityTests(unittest.TestCase):
-
     def start_part(self, h, by="anna.k", sid="sess-anna-1"):
         self.assertTrue(h.session.press(by=by, station_session=sid))
         self.assertEqual(h.session.state, State.WAIT_FLIP)

@@ -11,7 +11,7 @@ from unittest import mock
 
 try:
     import numpy as np
-except ImportError:
+except ImportError:  # pragma: no cover - numpy is required only for these tests
     np = None
 
 from station import cameras as station_cameras
@@ -23,7 +23,6 @@ FLUSH = station_cameras.STALE_FLUSH_FRAMES
 
 
 class FakeClock:
-
     def __init__(self) -> None:
         self.t = 0.0
 
