@@ -1,15 +1,3 @@
-"""Client for the laptop inference service (inference_service/server.py, plan L1).
-
-RemoteModel implements the InferenceModel protocol: predict(frame) posts the raw picture to
-POST /v1/predict and maps the reply to an ImageResult. Standard library only.
-
-Any timeout, HTTP error, bad JSON, missing or malformed field, or a model version that changed
-mid-session raises StationError, so the session goes to FAULT and never to GOOD.
-
-The bearer token is read once from the environment variable named in config. It is sent only in
-the Authorization header and never appears in an error message. Redirects are not followed, and
-environment proxies are bypassed, so the token goes straight to the laptop.
-"""
 from __future__ import annotations
 
 import http.client
@@ -30,8 +18,6 @@ _ERROR_TEXT_MAX = 200
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Do not follow redirects: the token must not be sent to another host."""
-
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
         return None
 
@@ -48,7 +34,6 @@ def _read_quietly(exc: urllib.error.HTTPError) -> bytes:
 
 
 def _laptop_message(raw: bytes, token: str) -> str:
-    """The laptop's own {"error": ...} text, short and without the token; '' when absent."""
     try:
         body = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
@@ -86,12 +71,6 @@ def _defect(item: Any) -> Defect:
 
 
 class RemoteModel:
-    """InferenceModel that scores pictures on the laptop inference service.
-
-    version is '' until check_approved() (GET /v1/models/<part>) or the first successful
-    predict() sets it. After that, a reply with another model_version is a StationError.
-    """
-
     def __init__(self, base_url: str, token_env: str, timeout_s: float, part_number: str) -> None:
         if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
             raise ValueError("laptop base URL must start with http:// or https://")
@@ -109,13 +88,10 @@ class RemoteModel:
         self.version = ""
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
-    def __repr__(self) -> str:  # never show the token
+    def __repr__(self) -> str:
         return f"RemoteModel(part_number={self.part_number!r}, version={self.version!r})"
 
-    # ------------------------------------------------------------ HTTP
-
     def _send(self, req: urllib.request.Request, what: str) -> tuple[int, bytes]:
-        """(HTTP status, body) for any answer the laptop gives. Transport failures are StationError."""
         try:
             with self._opener.open(req, timeout=self._timeout) as resp:
                 return resp.status, resp.read()
@@ -165,16 +141,7 @@ class RemoteModel:
         headers.update(extra or {})
         return headers
 
-    # ------------------------------------------------------------ API
-
     def check_approved(self) -> str:
-        """Ask the laptop for the approved model version of this part (GET /v1/models/<part>).
-
-        The laptop verifies the approved version and answers without loading it, so this works
-        after a laptop restart. Sets and returns the version. StationError when the laptop is
-        unreachable, rejects the token, has no approved model for the part (404), or has an
-        approved version that fails verification (503). Never an older version.
-        """
         what = "laptop approval check"
         url = self._base + MODEL_PREFIX + quote(self.part_number, safe="")
         req = urllib.request.Request(url, headers=self._headers(), method="GET")

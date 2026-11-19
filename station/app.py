@@ -1,16 +1,3 @@
-"""Wire the station together: config, build, run, and MES sync.
-
-Plan reference: 26_1023_inspection_system_plan.md (sections 3, 5, 7).
-Standard library only. The config schema is documented in README.md and
-config.example.json.
-
-Thread model:
-  - UI server thread: HTTP requests. Every call into the session goes through
-    _LockedSession, so one request at a time touches the session state.
-  - MES sync thread: calls sync_once() every sync_interval_s.
-  - Outbox: sqlite3 connections are opened per call (see _with_outbox), because
-    a connection created on one thread cannot be used from another.
-"""
 from __future__ import annotations
 
 import datetime as _dt
@@ -74,7 +61,7 @@ DEFAULT_SESSION_TIMEOUT_S = 900.0
 DEFAULT_SYNC_INTERVAL_S = 5.0
 DEFAULT_FLIP_TIMEOUT_S = 60.0
 DEFAULT_MIN_FLIP_S = 2.0
-DEFAULT_SCAN_MIN_FLIP_S = 2.0  # engineering setting for Taking data, not a quality limit
+DEFAULT_SCAN_MIN_FLIP_S = 2.0
 DEFAULT_CAMERA_WIDTH = 2560
 DEFAULT_CAMERA_HEIGHT = 1440
 DEFAULT_BAD_DISPOSITION = "quarantine"
@@ -90,7 +77,6 @@ _REQUIRED_KEYS = (
     "material_handler", "thresholds", "data_dir", "users_file", "mes", "cameras",
     "model", "outputs",
 )
-# part_number is required in 'fixed' mode only (checked in validate_config).
 _OPTIONAL_KEYS = ("part_number", "parts", "ui", "flip_timeout_s", "min_flip_s", "frame_ok", "scan",
                   "auth", "evidence")
 _ALL_KEYS = _REQUIRED_KEYS + _OPTIONAL_KEYS
@@ -105,10 +91,8 @@ _REMOTE_KEYS = ("base_url", "token_env", "timeout_s")
 
 
 class ConfigError(ValueError):
-    """The config file cannot be read, is not JSON, or breaks the schema. The message says where."""
+    pass
 
-
-# --------------------------------------------------------------------- config
 
 def _where(path: str, key: str) -> str:
     return f"{path}.{key}" if path else key
@@ -227,7 +211,6 @@ def _validate_mes(raw: Any) -> dict:
 
 
 def _validate_auth(raw: Any) -> dict:
-    """auth.mode 'local' (username and password) or 'mes_ticket' (one-time tickets from the MES)."""
     if raw is None:
         return {"mode": "local", "role_map": None}
     auth = _obj(raw, "auth")
@@ -236,7 +219,7 @@ def _validate_auth(raw: Any) -> dict:
     if mode not in AUTH_MODES:
         raise ConfigError("auth.mode must be 'local' or 'mes_ticket'")
     if mode == "local":
-        if auth.get("role_map") is not None:  # None is what validate_config itself writes back
+        if auth.get("role_map") is not None:
             raise ConfigError("auth.role_map is only used when auth.mode is 'mes_ticket': remove it")
         return {"mode": "local", "role_map": None}
     if "role_map" not in auth:
@@ -307,11 +290,9 @@ def _validate_cameras(raw: Any) -> dict:
         "capture_mode": capture_mode,
     }
     if capture_mode == "sequential":
-        # Only written for sequential mode, so a validated config validates again to the same value.
         out["sequential_keep_open"] = _bool(cams.get("sequential_keep_open", False),
                                             "cameras.sequential_keep_open")
     if session_mode == "keep_open":
-        # Only written for keep_open, so the default config validates to the same value as before.
         cap_raw = _obj(cams.get("capture", {}), "cameras.capture")
         _check_keys(cap_raw, ("mjpg", "threaded", "flush_frames"), "cameras.capture")
         out["session_mode"] = "keep_open"
@@ -322,12 +303,11 @@ def _validate_cameras(raw: Any) -> dict:
                                  "cameras.capture.flush_frames", lo=0, hi=100),
         }
     if kind == "fake":
-        out["camera_count"] = count  # kept so a validated config validates again to the same value
+        out["camera_count"] = count
     return out
 
 
 def _validate_extractor(raw: Any) -> Optional[dict]:
-    """model.extractor: the feature extractor for a PatchCore part model. Optional."""
     if raw is None:
         return None
     path = "model.extractor"
@@ -352,7 +332,6 @@ def _validate_extractor(raw: Any) -> Optional[dict]:
 
 
 def _validate_remote(raw: Any) -> dict:
-    """model.remote: score pictures on the laptop inference service instead of a local model."""
     path = "model.remote"
     remote = _obj(raw, path)
     _check_keys(remote, _REMOTE_KEYS, path)
@@ -374,7 +353,6 @@ def _validate_remote(raw: Any) -> dict:
 
 
 def _validate_evidence(raw: Any) -> dict:
-    """evidence: copy saved parts to the laptop evidence store (optional, off when absent)."""
     evidence = _obj({} if raw is None else raw, "evidence")
     _check_keys(evidence, ("sync",), "evidence")
     sync = evidence.get("sync")
@@ -419,7 +397,6 @@ def _validate_model(raw: Any) -> dict:
 
 
 def _validate_parts(raw: Any) -> dict:
-    """parts: 'fixed' (one configured part, the default) or 'mes' (the operator picks a part)."""
     parts = _obj({} if raw is None else raw, "parts")
     _check_keys(parts, ("mode", "models_dir"), "parts")
     mode = parts.get("mode", "fixed")
@@ -456,7 +433,6 @@ def _validate_outputs(raw: Any) -> dict:
 
 
 def _validate_scan(raw: Any) -> dict:
-    """scan: 'Taking data' mode (optional, off by default). Validated even when disabled."""
     path = "scan"
     scan = _obj({} if raw is None else raw, path)
     _check_keys(scan, ("enabled", "min_flip_s", "debounce_s"), path)
@@ -464,16 +440,11 @@ def _validate_scan(raw: Any) -> dict:
     return {
         "enabled": _bool(scan.get("enabled", False), "scan.enabled"),
         "min_flip_s": _number(scan.get("min_flip_s", DEFAULT_SCAN_MIN_FLIP_S), "scan.min_flip_s", lo=0.0),
-        # None means "use the ScanSession default" (0.3 s); it is passed on only when a number is given.
         "debounce_s": None if debounce is None else _number(debounce, "scan.debounce_s", lo=0.0),
     }
 
 
 def validate_config(data: Any) -> dict:
-    """Check a config dict against the schema and return a normalised copy with defaults filled.
-
-    Paths are used as given. load_config() resolves them against the config file's folder first.
-    """
     cfg = _obj(data, "config")
     _check_keys(cfg, _ALL_KEYS, "")
     placeholders = _find_placeholders(cfg)
@@ -485,7 +456,7 @@ def validate_config(data: Any) -> dict:
     parts = _validate_parts(cfg.get("parts"))
     missing = [k for k in _REQUIRED_KEYS if k not in cfg]
     if parts["mode"] == "fixed" and "part_number" not in cfg:
-        missing.append("part_number")  # a fixed station names its part; a 'mes' station picks one
+        missing.append("part_number")
     if missing:
         raise ConfigError(f"config: missing required key(s) {missing}")
 
@@ -547,7 +518,6 @@ def validate_config(data: Any) -> dict:
 
 
 def load_config(path: str | os.PathLike) -> dict:
-    """Read, resolve and validate a JSON config file. Relative paths are relative to the file."""
     cfg_path = pathlib.Path(path)
     try:
         text = cfg_path.read_text(encoding="utf-8")
@@ -586,8 +556,6 @@ def _resolve_path(value: Any, base: pathlib.Path) -> Any:
     return str(p if p.is_absolute() else base / p)
 
 
-# ---------------------------------------------------------------- part ids
-
 def _utc_datetime(text: str) -> _dt.datetime:
     dt = _dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
     if dt.tzinfo is None:
@@ -596,12 +564,6 @@ def _utc_datetime(text: str) -> _dt.datetime:
 
 
 class _PartIdFactory:
-    """P<YYYYMMDDHHMMSS><nnnn>. nnnn counts from 0001 within each second.
-
-    An id is never issued twice in this run, and an id whose part folder already
-    exists (from an earlier run in the same second) is skipped.
-    """
-
     def __init__(self, store: Store, now_utc: Callable[[], str]) -> None:
         self._store = store
         self._now_utc = now_utc
@@ -633,8 +595,6 @@ class _PartIdFactory:
         return folder.exists()
 
 
-# ----------------------------------------------------------- session wrapper
-
 def _need_name(by: Any) -> None:
     if not isinstance(by, str) or not by.strip():
         raise ValueError("by is required")
@@ -647,11 +607,6 @@ def _label_result(session_id: str, label: OperatorLabel, previous: Optional[dict
 
 
 class _LockedSession:
-    """Serialises every UI call into the session.
-
-    app (optional) supplies the parts mode, the camera state and the part calls.
-    """
-
     def __init__(self, session: StationSession, lock: threading.RLock, app: Any = None) -> None:
         self._session = session
         self._lock = lock
@@ -666,11 +621,9 @@ class _LockedSession:
             return data
 
     def search_parts(self, q: str, limit: int = 20) -> list:
-        # A network call: not under the session lock, so a slow MES does not freeze the station.
         return self._need_app().search_parts(q, limit)
 
     def select_part(self, part_number: str, by: str) -> dict:
-        # No lock here: StationApp.select_part does its MES calls unlocked, then takes the lock.
         return self._need_app().select_part(part_number, by)
 
     def current_part(self) -> dict:
@@ -683,8 +636,6 @@ class _LockedSession:
         return self._app
 
     def press(self, by: Optional[str] = None, station_session: Optional[str] = None) -> bool:
-        # The inverse of the scan start guard: no inspection press while a scan is active.
-        # Refused presses return False, as the session does for an ignored press.
         with self._lock:
             if self._app is not None and self._app.scan_blocks_press():
                 return False
@@ -713,7 +664,6 @@ class _LockedSession:
 
     def propose_defect(self, by: str, criterion_id: str, camera_id: str, side: str,
                        note: str = "") -> dict:
-        # The app takes the session lock itself (it reads the part's criteria first).
         return self._need_app().propose_defect(by=by, criterion_id=criterion_id, camera_id=camera_id,
                                                side=side, note=note)
 
@@ -722,7 +672,6 @@ class _LockedSession:
 
     def label_part(self, by: str, verdict, criterion_id: Optional[str] = None,
                    part_id: Optional[str] = None) -> dict:
-        # Stored parts only: the store locks itself, so the session lock is not needed.
         return self._need_app().label_part(by=by, verdict=verdict, criterion_id=criterion_id,
                                            part_id=part_id)
 
@@ -748,11 +697,6 @@ class _LockedSession:
             return self._session.tick()
 
     def preview(self, camera_id: str) -> Optional[bytes]:
-        """Latest live frame for one camera, or None. Never blocks and never raises.
-
-        A press holds the lock while it captures, so a preview request that cannot
-        get the lock at once gets None instead of waiting for the press to finish.
-        """
         if not self._lock.acquire(blocking=False):
             return None
         try:
@@ -764,12 +708,6 @@ class _LockedSession:
 
 
 class _LockedScan:
-    """Serialises every Taking-data call with the inspection session's lock.
-
-    Lock order is always the session lock first, then the scan's own lock, so the
-    press guard in _LockedSession and the busy() check in ScanSession.start cannot deadlock.
-    """
-
     def __init__(self, scan: ScanSession, lock: threading.RLock) -> None:
         self._scan = scan
         self._lock = lock
@@ -828,8 +766,6 @@ class _LockedScan:
             return self._scan.review(scan_id, decision, by, reason)
 
 
-# --------------------------------------------------------------- the app
-
 def _grey_decoder() -> Callable[[Frame], list]:
     try:
         import cv2  # noqa: PLC0415 - optional dependency
@@ -847,19 +783,17 @@ def _grey_decoder() -> Callable[[Frame], list]:
 
 
 def _load_golden_model(model: dict) -> Any:
-    """Load a golden .npz made by `python -m station teach`. station.golden is imported here, lazily."""
     from station.golden import GoldenModel, cv2_decoder  # noqa: PLC0415 - needs numpy and cv2 at run time
 
     path = model["path"]
     if not os.path.isfile(path):
         raise StationError(f"golden model file not found: {path}; run python -m station teach first")
     golden = GoldenModel.load(path, cv2_decoder())
-    golden.version = model["version"]  # stored records show the config version, not the file's
+    golden.version = model["version"]
     return golden
 
 
 def _torch_importable() -> bool:
-    """True when torch can be imported. Checked only; the extractor itself imports it when built."""
     try:
         import torch  # noqa: F401,PLC0415 - optional dependency
     except ImportError:
@@ -868,8 +802,6 @@ def _torch_importable() -> bool:
 
 
 class StationApp:
-    """A fully wired station. Build with build_station(); call start() to run it."""
-
     def __init__(
         self,
         config: Mapping[str, Any],
@@ -886,24 +818,24 @@ class StationApp:
         self.config = cfg
         self._parts_mode = cfg["parts"]["mode"]
         self._models_dir = cfg["parts"]["models_dir"]
-        self._part_configs: dict[str, dict] = {}  # part number -> criteria config from the MES
+        self._part_configs: dict[str, dict] = {}
         self._parts_client: Optional[MesPartsClient] = None
         self._now_utc = now_utc or utc_now_iso
         self._clock = clock or time.monotonic
         self._stop_event = threading.Event()
         self._sync_lock = threading.Lock()
         self._session_lock = threading.RLock()
-        self._label_lock = threading.Lock()  # one label write at a time: check, then write
+        self._label_lock = threading.Lock()
         self._started = False
         self._closed = False
         self._ui_thread: Optional[threading.Thread] = None
         self._sync_thread: Optional[threading.Thread] = None
         self.sync_interval_s = cfg["mes"]["sync_interval_s"]
         self._collect_only = cfg["model"]["kind"] == "collect"
-        self._remote_cfg: Optional[dict] = cfg["model"]["remote"]  # set: parts come from the laptop
-        self._evidence_cfg: Optional[dict] = None  # set in _wire when evidence sync applies
+        self._remote_cfg: Optional[dict] = cfg["model"]["remote"]
+        self._evidence_cfg: Optional[dict] = None
         self._evidence_lock = threading.Lock()
-        self._evidence_inbox: "_queue.Queue[str]" = _queue.Queue()  # press thread -> sync thread
+        self._evidence_inbox: "_queue.Queue[str]" = _queue.Queue()
         self._evidence_thread: Optional[threading.Thread] = None
 
         if demo and self._parts_mode == "mes":
@@ -911,18 +843,15 @@ class StationApp:
         if demo and cfg["auth"]["mode"] == MES_MODE:
             raise ConfigError("the demo station cannot use auth.mode 'mes_ticket'")
 
-        # Devices and model first: a failure here leaves nothing open.
         cameras = cameras if cameras is not None else self._make_cameras(cfg)
         self._cameras = cameras
         self._camera_ids = tuple(cfg["cameras"]["camera_ids"])
         if self._parts_mode == "mes":
-            model = None  # the session starts with no part and no model; an injected model is ignored
+            model = None
         else:
             model = model if model is not None else self._make_model(cfg)
         outputs = outputs if outputs is not None else self._make_outputs(cfg)
 
-        # A partial station (fewer than the 4 cameras) is proof-of-concept only: it is the
-        # only kind of station allowed to store fewer than 8 images.
         self.partial = not is_full_station(cfg["cameras"]["camera_ids"])
         self.store = Store(pathlib.Path(cfg["data_dir"]), site=cfg["site"], line=cfg["line"],
                            allow_partial=self.partial)
@@ -934,15 +863,11 @@ class StationApp:
             self.outbox.close()
             raise
 
-    # ----------------------------------------------------------- wiring
-
     @staticmethod
     def _make_cameras(cfg: dict):
         cams = cfg["cameras"]
         if cams["kind"] == "fake":
             return FakeCameraSet(camera_ids=cams["camera_ids"])
-        # The capture kwargs are passed only in sequential mode, so the default
-        # (simultaneous) construction is unchanged.
         mode_kwargs: dict[str, Any] = {}
         if cams.get("capture_mode") == "sequential":
             mode_kwargs = {"capture_mode": "sequential",
@@ -981,14 +906,10 @@ class StationApp:
     def _wire(self, cfg: dict, cameras, model, outputs, *, token: Optional[str], demo: bool) -> None:
         self.session_thresholds = Thresholds(t_low=cfg["thresholds"]["t_low"],
                                              t_img=cfg["thresholds"]["t_img"])
-        # Evidence copy: full-station, non-demo parts only (a demo or partial part never goes to the
-        # laptop store that the trainer reads).
         evidence_sync = cfg["evidence"]["sync"]
         if evidence_sync is not None and not demo and not self.partial:
             self._evidence_cfg = dict(evidence_sync)
 
-        # MES: a missing token disables posting, not inspection. A partial station never
-        # posts unless mes.allow_partial_cameras is true.
         mes = cfg["mes"]
         self._demo = demo
         camera_ids = tuple(cfg["cameras"]["camera_ids"])
@@ -1007,7 +928,6 @@ class StationApp:
         )
         self._client = MesClient(self._mes_cfg) if self.mes_enabled else None
         self.auth_mode: str = cfg["auth"]["mode"]
-        # Part search needs the token too, whatever demo or partial rules say about posting.
         self._parts_client = (MesPartsClient(mes["base_url"], token)
                               if self._parts_mode == "mes" and token else None)
         if self._collect_only:
@@ -1057,8 +977,6 @@ class StationApp:
             collect_only=self._collect_only,
         )
 
-        # Taking data (optional): same cameras as the inspection session, scans under data_dir/scans.
-        # Built only when enabled, so a disabled station creates no folders and changes nothing.
         self._scan_session: Optional[ScanSession] = None
         self.scan: Optional[_LockedScan] = None
         scan_cfg = cfg["scan"]
@@ -1081,8 +999,6 @@ class StationApp:
         mes_auth: Optional[MesSessionClient] = None
         on_expire = None
         if self.auth_mode == MES_MODE:
-            # Inspectors log in from the MES: no local users. The MES token comes from the same
-            # environment variable as posting; an idle or expired session ends the MES session.
             if not token:
                 raise ConfigError(
                     f"auth.mode 'mes_ticket' needs the MES token: set the environment variable "
@@ -1095,7 +1011,7 @@ class StationApp:
                     return
                 try:
                     mes_auth.end(mes_session)
-                except Exception:  # the station session is already gone; the MES expires it
+                except Exception:
                     pass
 
             users = UserStore({})
@@ -1115,30 +1031,22 @@ class StationApp:
                                   auth_mode=self.auth_mode, mes_auth=mes_auth,
                                   role_map=cfg["auth"]["role_map"])
 
-    # ------------------------------------------------------- Taking data
-
     def _inspection_busy(self) -> bool:
-        """busy() for the scan: any inspection state except IDLE blocks a scan start."""
         return self.session.state is not State.IDLE
 
     def scan_active(self) -> bool:
-        """True while a scan holds the cameras (any scan state except IDLE and DONE)."""
         scan = self._scan_session
         if scan is None:
             return False
         return scan.snapshot()["state"] not in (ScanState.IDLE.value, ScanState.DONE.value)
 
     def scan_blocks_press(self) -> bool:
-        """True (and logged) when an inspection press must be refused because a scan is active."""
         if not self.scan_active():
             return False
         self.store.append_event("press_ignored", {"reason": "scan_active"})
         return True
 
-    # ------------------------------------------------------------ MES
-
     def _with_outbox(self, fn: Callable[[Outbox], Any]) -> Any:
-        """Run fn on a fresh Outbox connection, closed afterwards (safe from any thread)."""
         ob = Outbox(self._outbox_root)
         try:
             return fn(ob)
@@ -1146,12 +1054,10 @@ class StationApp:
             ob.close()
 
     def _on_part_saved(self, record: PartRecord) -> None:
-        """on_complete hook, run after the part is saved. Never raises and never waits on the network."""
         self._enqueue(record)
         self._evidence_enqueue(record)
 
     def _evidence_enqueue(self, record: PartRecord) -> None:
-        """Hand the saved part to the evidence sync thread. Only a memory handoff: no file or network I/O."""
         if self._evidence_cfg is None:
             return
         try:
@@ -1164,7 +1070,6 @@ class StationApp:
                               {"part_id": record.part_id, "error": str(exc) or type(exc).__name__})
 
     def _evidence_drain_inbox(self, queue: SyncQueue) -> None:
-        """Write the handed-over parts into the sync queue file (one failure never stops the rest)."""
         while True:
             try:
                 part_dir = self._evidence_inbox.get_nowait()
@@ -1178,11 +1083,6 @@ class StationApp:
                                    "error": str(exc) or type(exc).__name__})
 
     def evidence_sync_once(self) -> dict[str, int]:
-        """Queue the parts saved since the last run, then copy the pending ones to the laptop once.
-
-        Never raises: a failed copy leaves the part queued for the next run and logs an event.
-        Returns the counts ({} when evidence sync is not configured).
-        """
         cfg = self._evidence_cfg
         if cfg is None:
             return {}
@@ -1203,24 +1103,22 @@ class StationApp:
         while not self._stop_event.wait(self.sync_interval_s):
             try:
                 self.evidence_sync_once()
-            except Exception as exc:  # keep the thread alive; evidence_sync_once already logs its own failures
+            except Exception as exc:
                 self._log_quietly("evidence_sync_failed", {"error": str(exc) or type(exc).__name__})
 
     def _enqueue(self, record: PartRecord) -> None:
-        """on_complete hook: queue the saved part for MES. Never raises."""
         if self._demo:
-            return  # demo parts must never reach the outbox, which a later real run would send
+            return
         if record.disposition == COLLECTED:
-            return  # collected parts have no verdict and are never posted to the MES
+            return
         if self._partial_blocked:
-            return  # a partial station posts only when mes.allow_partial_cameras is true
+            return
         try:
             part_dir = self.store._known_path(record.session_id)
             if part_dir is None:
                 raise StationError("saved part is not in the store index")
             station_session = self.session.station_session_for(record.part_id)
             if self.auth_mode == MES_MODE and not station_session:
-                # mes_ticket: a part is posted only under the inspector's MES session, never anonymously
                 raise StationError("no MES session for this part: it is not sent to the MES")
             proposals = self.session.proposals_for(record.part_id)
             extra: dict[str, Any] = {"proposals": proposals} if proposals else {}
@@ -1236,14 +1134,11 @@ class StationApp:
             )
 
     def _archive_ref(self, part_dir: pathlib.Path) -> str:
-        """archiveRef for the MES post: the laptop path the part will have after sync when
-        evidence.sync is configured (planned_destination), else the local folder."""
         if self._evidence_cfg is None:
             return self.store.archive_ref(part_dir)
         return planned_destination(part_dir, self._evidence_cfg["dest_root"])
 
     def sync_once(self, now: Optional[float] = None) -> dict[str, int]:
-        """Drain the outbox once. Logs a 'mes_sync' event when anything was attempted."""
         empty = {"sent": 0, "failed_permanent": 0, "retry_later": 0}
         if self._client is None:
             return empty
@@ -1257,10 +1152,8 @@ class StationApp:
         while not self._stop_event.wait(self.sync_interval_s):
             try:
                 self.sync_once()
-            except Exception as exc:  # keep the thread alive; the next round retries
+            except Exception as exc:
                 self.store.append_event("mes_sync_failed", {"error": str(exc) or type(exc).__name__})
-
-    # ------------------------------------------------------- lifecycle
 
     @property
     def url(self) -> str:
@@ -1286,11 +1179,6 @@ class StationApp:
             self._evidence_thread.start()
 
     def _open_cameras(self) -> None:
-        """Open the cameras before the UI starts. Never raises.
-
-        A failure is logged ('camera_open_failed' and one stderr line) and the
-        station still starts: the live view retries, and capture() retries on Enter.
-        """
         opener = getattr(self._cameras, "open", None)
         if not callable(opener):
             return
@@ -1314,20 +1202,16 @@ class StationApp:
             pass
 
     def camera_status(self) -> dict:
-        """{'open': bool, 'last_error': str or None} for the UI. Cameras without is_open count as open."""
         cams = self._cameras
         if not hasattr(cams, "is_open"):
             return {"open": True, "last_error": None}
         return {"open": bool(cams.is_open), "last_error": getattr(cams, "last_open_error", None)}
-
-    # ------------------------------------------------------------ parts
 
     @property
     def parts_mode(self) -> str:
         return self._parts_mode
 
     def search_parts(self, q: str, limit: int = 20) -> list[dict]:
-        """MES part search for the UI. A network call: callers must not hold the session lock."""
         self._require_mes_parts()
         return self._require_parts_client().search(q, limit)
 
@@ -1343,19 +1227,12 @@ class StationApp:
             }
 
     def select_part(self, part_number: str, by: str) -> dict:
-        """Make a part the one being inspected, with that part's approved model. Takes the session lock.
-
-        Raises ValueError (fixed station or bad input), InvalidTransition (not IDLE) and PartsError
-        (not in the MES, MES unreachable, no token). A part with no usable approved model is not an
-        error: the session is blocked with the reason and the result has can_inspect False.
-        """
         self._require_mes_parts()
         if not isinstance(part_number, str) or not part_number.strip():
             raise ValueError("part number must be a non-empty string")
         if not isinstance(by, str) or not by.strip():
             raise ValueError("by is required")
         pn = part_number.strip()
-        # MES calls can take seconds: do them before the lock so presses and snapshots keep working.
         client = self._require_parts_client()
         if client.get_part(pn) is None:
             raise PartsError(f"part {pn} not found in the MES")
@@ -1364,7 +1241,6 @@ class StationApp:
         remote: Optional[RemoteModel] = None
         remote_error: Optional[str] = None
         if self._remote_cfg is not None:
-            # The laptop must list an approved model for this part before the part can be chosen.
             try:
                 remote = RemoteModel(self._remote_cfg["base_url"], self._remote_cfg["token_env"],
                                      self._remote_cfg["timeout_s"], pn)
@@ -1402,13 +1278,7 @@ class StationApp:
             return {"part_number": pn, "model_version": info.version, "can_inspect": True,
                     "warnings": warnings}
 
-    # ------------------------------------------------------------ labels
-    # Two-step approval. Operators PROPOSE (status 'proposed'); only an admin APPROVES, REJECTS or
-    # SETS the official label. Only an 'official' label is used for training. Nothing here changes
-    # the part's verdict, counters, images, manifest or the MES outbox.
-
     def _label_target(self, part_id: Optional[str]) -> tuple[str, dict]:
-        """(session_id, part.json) of the named collected part, else of the last collected part."""
         if part_id is not None:
             session_id = self.store.collected_session_id_for_part(str(part_id))
             if session_id is None:
@@ -1420,7 +1290,6 @@ class StationApp:
         return session_id, self.store.collected_part_doc(session_id)
 
     def _allowed_criteria(self, part_number: Any) -> set[str]:
-        """Configured mes.criteria_ids plus the part's own MES criteria (parts mode). May be empty."""
         allowed: set[str] = set()
         mes_cfg = getattr(self, "_mes_cfg", None)
         if mes_cfg is not None:
@@ -1439,7 +1308,6 @@ class StationApp:
             raise ValueError("a GOOD label takes no criterion_id")
         criterion = check_criterion_id(criterion_id)
         allowed = self._allowed_criteria(part_number)
-        # Neither list available (fixed mode, no criteria_ids): any valid free name, as before.
         if allowed and criterion not in allowed:
             raise ValueError("criterion_id must be one of the configured mes.criteria_ids "
                              "or this part's MES criteria")
@@ -1450,11 +1318,6 @@ class StationApp:
 
     def label_part(self, by: str, verdict: Any, criterion_id: Optional[str] = None,
                    part_id: Optional[str] = None) -> dict:
-        """PROPOSE a label for a collected part (operator, supervisor or admin). Status 'proposed'.
-
-        A new proposal replaces an earlier proposal or rejection. An official label cannot be
-        proposed over: only an admin changes it (set_official_label).
-        """
         new_verdict = Verdict(verdict)
         if new_verdict not in (Verdict.GOOD, Verdict.BAD):
             raise ValueError("verdict must be GOOD or BAD")
@@ -1474,7 +1337,6 @@ class StationApp:
                 "status": LABEL_PROPOSED, "changed": previous is not None}
 
     def approve_label(self, by: str, part_id: Optional[str] = None) -> dict:
-        """ADMIN: make the pending proposal of a collected part OFFICIAL."""
         _need_name(by)
         with self._label_lock:
             session_id, doc = self._label_target(part_id)
@@ -1491,7 +1353,6 @@ class StationApp:
         return _label_result(session_id, label, previous)
 
     def reject_label(self, by: str, reason: str, part_id: Optional[str] = None) -> dict:
-        """ADMIN: reject the pending proposal of a collected part, with a short reason."""
         _need_name(by)
         reject_reason = check_reject_reason(reason)
         with self._label_lock:
@@ -1510,7 +1371,6 @@ class StationApp:
 
     def set_official_label(self, by: str, verdict: Any, criterion_id: Optional[str] = None,
                            part_id: Optional[str] = None) -> dict:
-        """ADMIN: set the OFFICIAL label of a collected part directly (replaces any earlier label)."""
         _need_name(by)
         new_verdict = Verdict(verdict)
         if new_verdict not in (Verdict.GOOD, Verdict.BAD):
@@ -1526,7 +1386,6 @@ class StationApp:
         return _label_result(session_id, label, previous)
 
     def last_label_status(self) -> Optional[dict]:
-        """The last collected part and its label (any status), or None if there is none."""
         session_id = self.store.last_collected_session_id()
         if session_id is None:
             return None
@@ -1540,7 +1399,6 @@ class StationApp:
                 "reject_reason": label.get("reject_reason") if label is not None else None}
 
     def pending_labels(self) -> list[dict]:
-        """Collected parts with a proposal waiting for an admin, oldest first."""
         rows = self.store.collected_labels(status=LABEL_PROPOSED)
         return [{"session_id": r["session_id"], "part_id": r["part_id"],
                  "part_number": r["part_number"], "verdict": r["operator_label"]["verdict"],
@@ -1548,21 +1406,13 @@ class StationApp:
                  "proposed_by": r["operator_label"].get("proposed_by"),
                  "proposed_at": r["operator_label"].get("proposed_at")} for r in rows]
 
-    # ------------------------------------------------------- defect proposals
-
     def part_criteria(self) -> list[dict]:
-        """The active criteria (id, name, description) of the part being shown; [] if none."""
         with self._session_lock:
             part = self._part_configs.get(self.session.part_number) if self._parts_mode == "mes" else None
             return [dict(c) for c in part["criteria"]] if part is not None else []
 
     def propose_defect(self, by: str, criterion_id: str, camera_id: str, side: str,
                        note: str = "") -> dict:
-        """Add a human defect proposal to the part being shown. `by` is the logged-in inspector.
-
-        Raises ValueError (no criteria, criterion not active, picture not one of the 8, bad note),
-        InvalidTransition (the part is not shown in VERDICT or SUPERVISOR_REVIEW).
-        """
         if not isinstance(by, str) or not by.strip():
             raise ValueError("by is required")
         try:
@@ -1577,7 +1427,6 @@ class StationApp:
         return {"replaced": replaced}
 
     def remove_defect(self, criterion_id: str) -> dict:
-        """Remove the proposal for one criterion of the part being shown."""
         with self._session_lock:
             return {"removed": self.session.remove_defect(criterion_id)}
 
@@ -1587,19 +1436,17 @@ class StationApp:
         return {"part_number": part_number, "can_inspect": False, "reason": reason, "warnings": warnings}
 
     def _load_part_model(self, info: Any) -> Any:
-        """Build the runtime model for an approved version. StationError (incl. ModelError) if unusable."""
         from station.golden import cv2_decoder  # noqa: PLC0415 - needs cv2 and numpy at run time
 
         if info.type == "patchcore" and not _torch_importable():
             raise StationError(_NEEDS_TORCH)
         decode = cv2_decoder()
         if info.type == "patchcore":
-            # PatchCore is trained on RGB pictures (trainer/weekly.py); the golden decoder gives grayscale
             from station.anomaly import cv2_rgb_decoder, register_patchcore_loader  # noqa: PLC0415 - lazy
             decode = cv2_rgb_decoder()
             register_patchcore_loader(self._make_extractor)
         model = load_runtime_model(info, decode)
-        model.version = info.version  # the approved version name is what the records show
+        model.version = info.version
         return model
 
     def _make_extractor(self) -> Any:
@@ -1620,7 +1467,6 @@ class StationApp:
         return self._parts_client
 
     def _mes_cfg_for(self, part_number: str) -> MesConfig:
-        """MES config for one part: its own criteria in 'mes' mode, the configured ones otherwise."""
         if self._parts_mode != "mes":
             return self._mes_cfg
         part = self._part_configs.get(part_number)
@@ -1641,7 +1487,7 @@ class StationApp:
             if thread is not None:
                 thread.join(timeout=10)
         if self._evidence_cfg is not None:
-            try:  # keep parts handed over but not yet written to the queue file
+            try:
                 self._evidence_drain_inbox(SyncQueue(self._evidence_cfg["queue_dir"]))
             except Exception:
                 pass
@@ -1649,7 +1495,6 @@ class StationApp:
 
 
 def _serial_writer(port: str) -> Callable[[bytes], None]:
-    """Open the relay board's serial device for writing. Baud rate and line settings are not configured."""
     handle = open(port, "wb", buffering=0)  # noqa: SIM115 - kept open for the station's lifetime
 
     def write(data: bytes) -> None:
@@ -1669,12 +1514,5 @@ def build_station(
     token: Optional[str] = None,
     demo: bool = False,
 ) -> StationApp:
-    """Build the station from a validated or raw config dict. Nothing is started yet.
-
-    token: the MES bearer token. Default None reads the environment variable named
-    by mes.token_env. An empty token disables MES posting (parts are still stored).
-    cameras, model, outputs: inject to replace the ones the config would build.
-    demo: parts are never queued for MES (the outbox would send them later).
-    """
     return StationApp(config, cameras=cameras, model=model, outputs=outputs, now_utc=now_utc,
                       clock=clock, token=token, demo=demo)

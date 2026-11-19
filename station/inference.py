@@ -1,10 +1,3 @@
-"""Inference models for the inspection station.
-
-ScriptedModel returns preset results (tests). MarkerModel reads a score
-marker embedded in frame bytes (end-to-end demo). OnnxModel wraps an ONNX
-Runtime session; onnxruntime is imported lazily and never needed when a
-session is injected.
-"""
 from __future__ import annotations
 
 import re
@@ -17,8 +10,6 @@ _MARKER_KEYS = ("SCORE", "CLASS", "BOX")
 
 
 class ScriptedModel:
-    """Returns the scripted ImageResult for (camera_id, side), else a default."""
-
     def __init__(
         self,
         version: str,
@@ -43,7 +34,6 @@ class ScriptedModel:
 
 
 def _parse_marker(data: bytes) -> dict[str, str]:
-    """Return the marker fields in frame data, or {} when there is no marker."""
     match = _MARKER_RE.search(data)
     if match is None:
         return {}
@@ -63,7 +53,7 @@ def _parse_score(text: str) -> float:
         value = float(text)
     except ValueError as exc:
         raise StationError(f"malformed marker SCORE {text!r}") from exc
-    if not 0.0 <= value <= 1.0:  # also rejects NaN
+    if not 0.0 <= value <= 1.0:
         raise StationError(f"marker SCORE out of range 0..1: {text!r}")
     return value
 
@@ -82,13 +72,6 @@ def _parse_box(text: str) -> tuple[int, int, int, int]:
 
 
 class MarkerModel:
-    """Demo model that reads a marker such as b'SCORE:0.72;CLASS:scratch;BOX:10,20,30,40'.
-
-    Every field is optional. No marker gives score 0.0 and no defects. A
-    CLASS field produces one Defect (box defaults to 0,0,0,0). A BOX field
-    needs a CLASS field. Malformed markers raise StationError.
-    """
-
     def __init__(self, version: str) -> None:
         self.version = version
 
@@ -112,13 +95,6 @@ class MarkerModel:
 
 
 class CollectModel:
-    """No-verdict model for collect mode: every image gets a neutral score of 0.0.
-
-    It makes no judgement. The session in collect mode does not fuse the
-    results, so the score is never a verdict. It is stored as 0.0 only because
-    ImageResult needs a number.
-    """
-
     def __init__(self, version: str) -> None:
         self.version = version
 
@@ -137,8 +113,6 @@ def _import_onnxruntime() -> Any:
 
 
 class OnnxModel:
-    """Runs an ONNX model: postprocess(frame, preprocess(frame) -> session.run)."""
-
     def __init__(
         self,
         path: Any,

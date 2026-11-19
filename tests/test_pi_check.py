@@ -1,5 +1,3 @@
-"""Tests for tools/pi_check.py. A fake cv2 stands in for OpenCV; a localhost fake inference
-server stands in for the laptop. Nothing here touches a camera, the LAN or the real SMB share."""
 from __future__ import annotations
 
 import contextlib
@@ -21,8 +19,6 @@ PART = "PN-TEST-001"
 
 
 class FakeFrame:
-    """Stands in for a numpy image: shape, and any() for the all-black test."""
-
     def __init__(self, value: int, h: int = 48, w: int = 64) -> None:
         self.shape = (h, w, 3)
         self._any = value != 0
@@ -73,9 +69,6 @@ class FakeCv2:
 
 
 class _FakeLaptop(BaseHTTPRequestHandler):
-    """Localhost stand-in for the laptop inference service: GET /v1/health (no token),
-    GET /v1/status and POST /v1/predict (bearer token)."""
-
     server_version = "FakeLaptop"
     sys_version = ""
 
@@ -97,7 +90,7 @@ class _FakeLaptop(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/v1/health":  # unauthenticated, as in the real service
+        if self.path == "/v1/health":
             self.server.health_headers.append(self.headers.get("Authorization"))
             self._send(200, {"status": "ok", "busy": False, "in_flight": 0})
             return
@@ -156,7 +149,6 @@ class FakeLaptopServer:
 
 
 def _closed_port_url() -> str:
-    """A localhost URL where nothing listens: the port was free a moment ago."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
@@ -197,7 +189,7 @@ class CameraListTests(_Base):
 
     def test_dead_camera_is_reported_by_index(self) -> None:
         rc = self.run_main(["--max-index", "3"], cv2=FakeCv2(dead={2}), no_cameras=False)
-        self.assertEqual(rc, 0)  # camera results are data, not an error
+        self.assertEqual(rc, 0)
         self.assertIn("index 2: NOT WORKING: does not open", self.text)
         cams = self.report()["cameras"]
         self.assertEqual(cams["working"], [0, 1, 3])
@@ -271,7 +263,7 @@ class LaptopTests(_Base):
         for word in ("min", "median", "max", "Total"):
             self.assertIn(word, self.text)
         self.assertIn("Operator wait limit: [Quality to define]", self.lines)
-        self.assertEqual(self.lines[-2], "Operator wait limit: [Quality to define]")  # then "Report written"
+        self.assertEqual(self.lines[-2], "Operator wait limit: [Quality to define]")
         inf = self.report()["inference"]
         self.assertEqual(inf["stats"]["count_ok"], 8)
         self.assertLessEqual(inf["stats"]["min_s"], inf["stats"]["median_s"])
@@ -303,7 +295,7 @@ class LaptopTests(_Base):
             self.run_main(["--inference-url", laptop.url, "--token-env", "PI_TOKEN",
                            "--part-number", PART, "--images", "1"], env={"PI_TOKEN": TOKEN})
             health_auth = laptop.health_headers
-        self.assertEqual(health_auth, [None])  # GET /v1/health: no Authorization header
+        self.assertEqual(health_auth, [None])
         inf = self.report()["inference"]
         self.assertTrue(inf["health"]["ok"])
         self.assertIs(inf["health"]["busy"], False)
@@ -331,7 +323,7 @@ class LaptopTests(_Base):
     def test_token_never_appears_in_output_or_json_even_if_a_server_echoes_it(self) -> None:
         with FakeLaptopServer() as laptop:
             laptop.httpd.predict_status = 500
-            laptop.httpd.predict_error = f"bad token {TOKEN} seen"  # a broken server echoing it
+            laptop.httpd.predict_error = f"bad token {TOKEN} seen"
             self.run_main(["--inference-url", laptop.url, "--token-env", "PI_TOKEN",
                            "--part-number", PART, "--images", "1"], env={"PI_TOKEN": TOKEN})
         self.assertNotIn(TOKEN, self.text)
@@ -344,7 +336,7 @@ class LaptopTests(_Base):
                            "--part-number", PART], env={"PI_TOKEN": TOKEN})
         self.assertNotIn(TOKEN, self.text)
         self.assertNotIn(TOKEN, self.report_path.read_text(encoding="utf-8"))
-        self.assertIn("PI_TOKEN", self.text)  # the variable's NAME may be shown
+        self.assertIn("PI_TOKEN", self.text)
 
     def test_missing_token_variable_is_an_argument_error(self) -> None:
         rc = self.run_main(["--inference-url", "http://127.0.0.1:9", "--token-env", "PI_TOKEN",

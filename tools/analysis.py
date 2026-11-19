@@ -1,18 +1,8 @@
-"""Numpy-only image repeatability metrics. Shapes and return keys: see tools/FORMAT.md.
-
-This module only measures. It makes no pass/fail judgements and has no thresholds.
-gray is an ndarray of shape (T, H, W) with dtype uint8 (or float). Frames are
-converted to float64 one at a time so that large stacks do not need a float copy
-of the whole array.
-"""
-
 import os
 
 from tools import ToolDependencyError
 
-# Work-size bound for chunked row processing (not a judgement threshold).
 _CHUNK_ELEMS = 4_000_000
-# Relative floor for the phase-correlation normalisation (numerical, not a judgement).
 _PHASE_FLOOR = 1e-6
 
 
@@ -115,7 +105,6 @@ def temporal_noise(gray, roi=None):
         x, y, w, h = 0, 0, W, H
     else:
         x, y, w, h = _validate_roi(roi, H, W)
-    # Welford's streaming mean and sum of squared deviations, one frame at a time.
     mean_acc = np.zeros((h, w), dtype=np.float64)
     m2 = np.zeros((h, w), dtype=np.float64)
     for k in range(T):
@@ -135,7 +124,6 @@ def temporal_noise(gray, roi=None):
 
 
 def _parabolic(left, centre, right):
-    """Sub-pixel offset of a peak from three samples at -1, 0, +1."""
     den = left - 2.0 * centre + right
     if den == 0:
         return 0.0
@@ -144,11 +132,6 @@ def _parabolic(left, centre, right):
 
 
 def _phase_shifts(g, ref2d):
-    """Phase correlation of every frame in g against ref2d.
-
-    Positive dx means the frame content moved right relative to ref2d
-    (frame(x) = ref(x - dx)); positive dy means it moved down.
-    """
     np = _np()
     T, H, W = g.shape
     ref2d = np.asarray(ref2d, dtype=np.float64)
@@ -161,14 +144,11 @@ def _phase_shifts(g, ref2d):
     for t in range(T):
         f = g[t].astype(np.float64)
         if ref_flat or f.max() == f.min():
-            # A flat image has no phase information: report no shift and no response.
             out.append({"dx": 0.0, "dy": 0.0, "response": 0.0})
             continue
         F = np.fft.rfft2((f - f.mean()) * win)
         cross = F * R
         mag = np.abs(cross)
-        # Phase-only normalisation; the small floor stops round-off in empty bands from
-        # being amplified to unit magnitude.
         cross /= mag + _PHASE_FLOOR * mag.max() + 1e-300
         r = np.fft.irfft2(cross, s=(H, W))
         py, px = (int(v) for v in np.unravel_index(np.argmax(r), r.shape))
@@ -207,8 +187,6 @@ def residual_scores(gray, reference=None, align=True):
     else:
         sy = [0] * T
         sx = [0] * T
-    # Aligned frame k at (y, x) is frame_k at (y + sy_k, x + sx_k). Only the region where
-    # every frame stays inside the frame is compared, so the wrapped border is excluded.
     y0 = max(0, -min(sy))
     y1 = min(H, H - max(sy))
     x0 = max(0, -min(sx))

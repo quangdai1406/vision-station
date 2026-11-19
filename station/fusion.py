@@ -1,8 +1,3 @@
-"""Per-image classification and per-part fusion.
-
-Thresholds come in as an argument everywhere; nothing here hardcodes a value.
-Standard library only. Types come from station/contracts.py.
-"""
 from __future__ import annotations
 
 from typing import List, Sequence
@@ -18,7 +13,6 @@ from station.contracts import (
 
 
 def classify_image(result: ImageResult, th: Thresholds) -> Verdict:
-    """score >= t_img -> BAD; score >= t_low -> REVIEW; otherwise GOOD."""
     if result.score >= th.t_img:
         return Verdict.BAD
     if result.score >= th.t_low:
@@ -31,13 +25,6 @@ def fuse(
     th: Thresholds,
     expected: int = IMAGES_PER_PART,
 ) -> PartVerdict:
-    """Combine the image results of one part into one verdict.
-
-    `expected` is the image count for the station: 8 for the real 4-camera
-    station (the default), 2 * camera count for a proof-of-concept station.
-    Any BAD image makes the part BAD. Otherwise any REVIEW image makes the
-    part REVIEW. Only a part with no BAD and no REVIEW images is GOOD.
-    """
     if isinstance(expected, bool) or not isinstance(expected, int):
         raise ValueError(f"expected must be an int, got {expected!r}")
     if expected < 2 or expected % 2 != 0:
@@ -61,8 +48,6 @@ def fuse(
         reason = "no image above T_low"
     else:
         deciding = [r for r, c in zip(items, classes) if c is verdict]
-        # max() returns the first image with the highest score, so ties
-        # resolve to capture order.
         worst = max(deciding, key=lambda r: r.score)
         reason = (
             f"{verdict.value}: worst {worst.camera_id} {worst.side.value} "
@@ -80,7 +65,6 @@ def fuse(
 
 
 def worst_defects(results: Sequence[ImageResult]) -> List[Defect]:
-    """Every defect from every result, sorted by score descending."""
     all_defects: List[Defect] = [d for r in results for d in r.defects]
     all_defects.sort(key=lambda d: d.score, reverse=True)
     return all_defects

@@ -1,4 +1,19 @@
-"""Export saved evidence from the Pi station to a destination folder.
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Iterator, Optional, Sequence
+
+from station.scanstore import verify_scan
+
+DOC_TEXT = """Export saved evidence from the Pi station to a destination folder.
 
 Standard library only. Read-only at the source. Nothing is ever deleted at the
 source or at the destination. Plain file copy: the destination can be an SMB
@@ -50,29 +65,15 @@ CLI (run from the repo root):
 Exit codes: 0 no corrupt or failed part or scan, 1 some part or scan is corrupt or failed,
 2 bad arguments or unusable source/destination.
 """
-from __future__ import annotations
-
-import argparse
-import hashlib
-import json
-import os
-import re
-import sys
-from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
-from pathlib import Path
-from typing import Iterator, Optional, Sequence
-
-from station.scanstore import verify_scan
 
 PART_JSON = "part.json"
 MANIFEST = "manifest.sha256"
-PURGED_FILE = "purged.json"  # tombstone written by trainer/purge.py
+PURGED_FILE = "purged.json"
 STORE_DIR = "store"
 SCANS_DIR = "scans"
 SCAN_JSON = "scan.json"
 REPORT_FILE = "export_report.json"
-IMAGES_PER_PART = 8  # same value as station/contracts.py IMAGES_PER_PART
+IMAGES_PER_PART = 8
 _TMP_PREFIX = ".tmp-"
 _META_FILES = frozenset({PART_JSON, MANIFEST})
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -93,18 +94,16 @@ _COUNT_KEYS = (
 
 
 class ExportError(RuntimeError):
-    """The source or destination cannot be used at all."""
+    pass
 
 
 @dataclass
 class PartCheck:
-    status: str  # ok | incomplete | corrupt | purged
+    status: str
     problems: list = field(default_factory=list)
     manifest_bytes: Optional[bytes] = None
-    entries: list = field(default_factory=list)  # [(file name, sha256)]
+    entries: list = field(default_factory=list)
 
-
-# ------------------------------------------------------------ verification
 
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -115,7 +114,6 @@ def _sha256_file(path: Path) -> str:
 
 
 def _parse_manifest(data: bytes) -> tuple[list, list]:
-    """Parse sha256sum text. Returns (entries, corrupt problems)."""
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -149,7 +147,6 @@ def _parse_manifest(data: bytes) -> tuple[list, list]:
 
 
 def check_part(part_dir: Path) -> PartCheck:
-    """Verify one part folder without changing it."""
     if (part_dir / PURGED_FILE).exists():
         return PartCheck("purged", [f"{PURGED_FILE} present (pictures deleted)"])
 
@@ -185,8 +182,6 @@ def check_part(part_dir: Path) -> PartCheck:
         elif _sha256_file(path) != digest:
             corrupt.append(f"hash mismatch: {name}")
 
-    # Without a readable manifest the part is only incomplete; the unlisted-file and
-    # part.json checks need the manifest to compare against.
     if manifest_bytes is not None:
         for entry in sorted(part_dir.iterdir()):
             if entry.name in _META_FILES or entry.name in listed:
@@ -216,10 +211,7 @@ def check_part(part_dir: Path) -> PartCheck:
     return PartCheck("ok", [], manifest_bytes, entries)
 
 
-# ------------------------------------------------------------------ copying
-
 def _copy_verified(src: Path, dst: Path, expected: str) -> None:
-    """Copy one file and re-hash the copy. Raises OSError on any mismatch."""
     with open(src, "rb") as fin, open(dst, "wb") as fout:
         for chunk in iter(lambda: fin.read(1 << 20), b""):
             fout.write(chunk)
@@ -239,7 +231,6 @@ def _write_manifest(dst_dir: Path, data: bytes) -> None:
 
 
 def _export_part(check: PartCheck, src: Path, dst: Path, dry_run: bool) -> tuple[str, str]:
-    """Return (outcome, reason). Outcome: copied | already_present | failed."""
     dst_manifest = dst / MANIFEST
     if dst_manifest.is_file():
         if dst_manifest.read_bytes() != check.manifest_bytes:
@@ -259,25 +250,20 @@ def _export_part(check: PartCheck, src: Path, dst: Path, dry_run: bool) -> tuple
     return "copied", ""
 
 
-# ------------------------------------------------------------- scan records
-
 def check_scan(scan_dir: Path) -> PartCheck:
-    """Verify one scan folder with station.scanstore.verify_scan. Nothing is changed."""
     if (scan_dir / PURGED_FILE).exists():
         return PartCheck("purged", [f"{PURGED_FILE} present (pictures deleted)"])
     problems = verify_scan(scan_dir)
     if problems:
-        # verify_scan words a missing manifest, scan.json or picture as "missing ...".
         if any(not p.startswith("missing") for p in problems):
             return PartCheck("corrupt", problems)
         return PartCheck("incomplete", problems)
     manifest_bytes = (scan_dir / MANIFEST).read_bytes()
-    entries, _ = _parse_manifest(manifest_bytes)  # verify_scan already checked the format
+    entries, _ = _parse_manifest(manifest_bytes)
     return PartCheck("ok", [], manifest_bytes, entries)
 
 
 def _copy_atomic(src: Path, dst: Path, expected: str) -> None:
-    """Copy one file under a temporary name, re-hash it, then rename it into place."""
     tmp = dst.parent / f".{dst.name}.part"
     with open(src, "rb") as fin, open(tmp, "wb") as fout:
         for chunk in iter(lambda: fin.read(1 << 20), b""):
@@ -290,11 +276,6 @@ def _copy_atomic(src: Path, dst: Path, expected: str) -> None:
 
 
 def _export_scan(check: PartCheck, src: Path, dst: Path, dry_run: bool) -> tuple[str, str]:
-    """Return (outcome, reason). Outcome: copied | already_present | failed.
-
-    Copies every file the manifest lists (scan.json included), then writes the manifest last.
-    A destination file that already exists with a different hash is never overwritten.
-    """
     dst_manifest = dst / MANIFEST
     manifest_present = os.path.lexists(dst_manifest)
     if manifest_present and (
@@ -328,10 +309,7 @@ def _export_scan(check: PartCheck, src: Path, dst: Path, dry_run: bool) -> tuple
     return "copied", ""
 
 
-# ------------------------------------------------------------------- walking
-
 def _resolve_sources(source) -> tuple[Optional[Path], Optional[Path]]:
-    """Return (store folder, scans folder) to read. Either is None when absent."""
     root = Path(source)
     if not root.is_dir():
         raise ExportError(f"source folder not found: {root}")
@@ -341,7 +319,6 @@ def _resolve_sources(source) -> tuple[Optional[Path], Optional[Path]]:
     if root.name == SCANS_DIR:
         return None, root
     if (root / SCANS_DIR).is_dir():
-        # An evidence root with scans but no parts: never read scans/ as if it were store/.
         return None, root / SCANS_DIR
     return root, None
 
@@ -359,7 +336,6 @@ def _subdirs(path: Path, counts: dict) -> list:
 
 
 def iter_part_dirs(store: Path, counts: dict) -> Iterator[tuple[str, date, Path]]:
-    """Yield (line, day, part_dir) for store/{line}/{YYYY}/{MM}/{DD}/{part_id}/."""
     for line_dir in _subdirs(store, counts):
         for year_dir in _subdirs(line_dir, counts):
             if not _YEAR.fullmatch(year_dir.name):
@@ -379,16 +355,10 @@ def iter_part_dirs(store: Path, counts: dict) -> Iterator[tuple[str, date, Path]
 
 
 def _plain_dirs(path: Path) -> list:
-    """Sorted sub-folders, symlinks left out. Hidden folders are kept (the caller decides)."""
     return [e for e in sorted(path.iterdir()) if e.is_dir() and not e.is_symlink()]
 
 
 def iter_scan_dirs(scans: Path) -> Iterator[tuple[str, date, Path, str]]:
-    """Yield (line, day, entry, kind) for scans/{line}/{YYYY}/{MM}/{DD}/{entry}.
-
-    kind: "scan" (a finished scan folder), "staging" (a hidden .{scan_id}.partial folder),
-    "symlink" (a symlink in a day folder: never followed).
-    """
     for line_dir in _plain_dirs(scans):
         for year_dir in _plain_dirs(line_dir):
             if not _YEAR.fullmatch(year_dir.name):
@@ -434,10 +404,7 @@ def _write_report(dest: Path, report: dict) -> Path:
     return path
 
 
-# ------------------------------------------------------------------- export
-
 def export(source, dest, since: Optional[date] = None, dry_run: bool = False) -> dict:
-    """Copy every verified part and scan from source to dest. Returns the report dict."""
     store, scans = _resolve_sources(source)
     dest = Path(dest)
     for root in (store, scans):
@@ -521,10 +488,8 @@ def export(source, dest, since: Optional[date] = None, dry_run: bool = False) ->
     return report
 
 
-# ---------------------------------------------------------------------- CLI
-
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p = argparse.ArgumentParser(description=DOC_TEXT.split("\n")[0])
     p.add_argument("--source", required=True,
                    help="Pi evidence root (the folder that holds store/ and/or scans/)")
     p.add_argument("--dest", required=True,

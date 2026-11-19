@@ -1,21 +1,3 @@
-"""Scan records for "Taking data" mode: 360-degree pictures for training.
-
-Standard library only. A scan is a separate record from an inspected part: it
-never has a part verdict, never lights anything and never goes to the MES.
-Layout under ``root``:
-
-    scans/{line}/{YYYY}/{MM}/{DD}/{scan_id}/
-        {site}_{line}_{YYYYMMDD}_{HHMMSS}_{scan_id}_{CAM}_{SIDE}_S{step:02d}.{ext}
-        scan.json
-        manifest.sha256   (sha256sum text format; lists every picture and scan.json, written last)
-
-A scan is built in a hidden staging folder ``.{scan_id}.partial`` inside its day
-folder and renamed to ``{scan_id}`` only when it is complete, so an interrupted
-write never leaves a folder that looks finished.
-
-Plan reference: docs/26_1027_PLAN_taking_data_mode.md (sections 3, 4, 5, 8).
-Format reference: tools/FORMAT.md ("Scan record").
-"""
 from __future__ import annotations
 
 import contextlib
@@ -54,7 +36,6 @@ _SHA_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def _component(value: str, name: str) -> str:
-    """Reject values that cannot safely be used as one path component."""
     if (
         not isinstance(value, str)
         or value in ("", ".", "..")
@@ -78,7 +59,6 @@ def _parse_utc(value: object, name: str) -> datetime:
 
 
 def _text(value: object, name: str, max_chars: int = MAX_NAME_CHARS) -> str:
-    """A short printable string. Returns it stripped."""
     if not isinstance(value, str):
         raise ValueError(f"{name} must be a string")
     text = value.strip()
@@ -96,7 +76,6 @@ def _is_int(value: object) -> bool:
 
 
 def _try(fn, *args) -> list[str]:
-    """Run a check; return [] when it passes, [message] when it raises."""
     try:
         fn(*args)
     except (ValueError, TypeError) as exc:
@@ -112,7 +91,6 @@ def _write_durable(path: pathlib.Path, data: bytes) -> None:
 
 
 def _fsync_dir(path: pathlib.Path) -> None:
-    """Make a rename durable where the platform allows it (not on Windows)."""
     try:
         fd = os.open(str(path), os.O_RDONLY)
     except OSError:
@@ -138,7 +116,6 @@ def _dump_json(doc: dict) -> bytes:
 
 
 def _label_doc(label: object) -> dict:
-    """The scan.json form of a label dict: every known key present, unknown keys refused."""
     if not isinstance(label, dict):
         raise ValueError("label must be an object")
     extra = set(label) - set(_LABEL_KEYS)
@@ -151,7 +128,6 @@ def _label_doc(label: object) -> dict:
 
 
 def _label_problems(label: object) -> list[str]:
-    """Label rules, shared by begin_scan (refuses) and verify_scan (reports)."""
     if not isinstance(label, dict):
         return ["label must be an object"]
     problems: list[str] = []
@@ -197,7 +173,6 @@ def _label_problems(label: object) -> list[str]:
 
 
 def _scan_problems(doc: object) -> list[str]:
-    """Every rule a scan.json must follow. Empty list means valid."""
     if not isinstance(doc, dict):
         return ["scan.json is not an object"]
     problems: list[str] = []
@@ -324,14 +299,6 @@ def _scan_problems(doc: object) -> list[str]:
 
 
 class ScanWriter:
-    """Builds one scan step by step. Create it with ScanStore.begin_scan().
-
-    Each picture is written to the staging folder as soon as it is added, so
-    only small metadata stays in memory. finish() publishes the scan;
-    cancel() removes everything. Any error while writing closes the writer and
-    removes its staging folder.
-    """
-
     def __init__(
         self,
         store: "ScanStore",
@@ -366,7 +333,6 @@ class ScanWriter:
         ext: str = "png",
         defect_visible: Optional[bool] = None,
     ) -> str:
-        """Write one picture to staging. Returns its file name."""
         if self._closed:
             raise RuntimeError("scan writer is closed")
         if camera_id not in self.camera_ids:
@@ -415,7 +381,6 @@ class ScanWriter:
         return name
 
     def set_defect_visible(self, camera_id: str, side: str, step: int, value: bool) -> None:
-        """Change one picture's defect_visible. Only on a BAD scan, and only before finish()."""
         with self._store._lock:
             if self._closed:
                 raise RuntimeError("scan writer is closed")
@@ -430,7 +395,6 @@ class ScanWriter:
             raise ValueError(f"no picture {camera_id} {side} step {step} in this scan")
 
     def finish(self, finished_utc: str) -> pathlib.Path:
-        """Validate, write scan.json, then the manifest (last), then publish the folder."""
         if self._closed:
             raise RuntimeError("scan writer is closed")
         try:
@@ -462,7 +426,7 @@ class ScanWriter:
             with self._store._lock:
                 if self.final_dir.exists():
                     raise FileExistsError(f"scan folder already exists: {self.final_dir}")
-                os.rename(self.staging, self.final_dir)  # atomic publish of the whole scan
+                os.rename(self.staging, self.final_dir)
             _fsync_dir(self.day_dir)
         except BaseException:
             self._discard()
@@ -471,7 +435,6 @@ class ScanWriter:
         return self.final_dir
 
     def cancel(self) -> None:
-        """Abandon the scan and remove its staging folder. Safe to call twice."""
         if not self._closed:
             self._discard()
 
@@ -482,7 +445,6 @@ class ScanWriter:
             self._prune_empty_days()
 
     def _prune_empty_days(self) -> None:
-        """Remove day/month/year folders this scan left empty (never the line folder)."""
         stop = self._store.line_dir
         path = self.day_dir
         while path != stop and stop in path.parents:
@@ -494,8 +456,6 @@ class ScanWriter:
 
 
 class ScanStore:
-    """Writes scan records under ``root/scans/<line>/`` (see module docstring)."""
-
     def __init__(self, root: pathlib.Path, site: str = "SITE", line: str = "L1") -> None:
         self.root = pathlib.Path(root)
         self.site = _component(site, "site")
@@ -515,7 +475,6 @@ class ScanStore:
         camera_ids: list,
         started_utc: str,
     ) -> ScanWriter:
-        """Open a new scan. Refuses a scan_id that already exists anywhere under this root."""
         scan_id = _component(scan_id, "scan_id")
         part_number = _text(part_number, "part_number")
         toy_id = _text(toy_id, "toy_id")
@@ -559,7 +518,6 @@ class ScanStore:
             )
 
     def _scan_id_used(self, scan_id: str) -> bool:
-        """True if a finished or staging scan with this id exists under any line."""
         staging_name = f".{scan_id}{_STAGING_SUFFIX}"
         for entry in self.scans_dir.glob("*/*/*/*/*"):
             if entry.name in (scan_id, staging_name):
@@ -568,7 +526,6 @@ class ScanStore:
 
 
 def verify_scan(scan_dir: pathlib.Path) -> list[str]:
-    """Return a list of problems; an empty list means the scan is intact and valid."""
     scan_dir = pathlib.Path(scan_dir)
     if scan_dir.is_symlink():
         return ["scan folder is a symlink"]
@@ -615,7 +572,7 @@ def verify_scan(scan_dir: pathlib.Path) -> list[str]:
     for name, digest in expected.items():
         path = scan_dir / name
         if path.is_symlink():
-            continue  # already reported above
+            continue
         if not path.is_file():
             problems.append(f"missing file: {name}")
         elif _sha256_file(path) != digest:
@@ -623,7 +580,7 @@ def verify_scan(scan_dir: pathlib.Path) -> list[str]:
 
     for entry in sorted(scan_dir.iterdir()):
         if entry.is_symlink() or entry.name.startswith("."):
-            continue  # already reported above
+            continue
         if entry.name not in expected and entry.name not in _META_FILES:
             problems.append(f"not in manifest: {entry.name}")
 
@@ -677,10 +634,6 @@ def verify_scan(scan_dir: pathlib.Path) -> list[str]:
 
 
 def load_scan(scan_dir: pathlib.Path) -> dict:
-    """Read and validate scan.json. Raises ValueError if it is invalid.
-
-    This checks scan.json only; use verify_scan() to check the pictures and hashes.
-    """
     path = pathlib.Path(scan_dir) / SCAN_JSON
     if path.is_symlink():
         raise ValueError("scan.json is a symlink")
@@ -701,23 +654,6 @@ def review_scan_label(
     when_utc: str,
     reason: Optional[str] = None,
 ) -> dict:
-    """Approve or reject a finished scan's proposed label. Returns the new label dict.
-
-    ``decision`` is "approve" (status becomes official) or "reject" (status becomes
-    rejected; ``reason`` is required). Only a label whose status is "proposed" can be
-    reviewed. The scan must pass verify_scan() first; a damaged scan is never touched.
-    verdict, defects and the labeller stay as they were. For a rejection, approved_by
-    and approved_at record the reviewer (the rules require them on a rejected label).
-
-    scan.json is rewritten, then manifest.sha256 (its scan.json line only). Both are
-    written to hidden temp files first, then swapped in, manifest last, and the folder
-    is fsynced. If a step fails, scan.json is restored to its old bytes and the temp
-    files are removed. Two files cannot be swapped in one atomic step, so a crash in
-    the middle can leave a mismatch that verify_scan reports.
-
-    No lock: this is a module function, not a ScanStore method, so the store lock is
-    not taken. The caller must not review the same scan from two threads.
-    """
     if decision not in ("approve", "reject"):
         raise ValueError(f"decision must be 'approve' or 'reject', got {decision!r}")
     scan_dir = pathlib.Path(scan_dir)
@@ -785,11 +721,10 @@ def review_scan_label(
         _write_durable(manifest_tmp, manifest_bytes)
         os.replace(scan_tmp, scan_path)
         scan_swapped = True
-        os.replace(manifest_tmp, manifest_path)  # manifest last
+        os.replace(manifest_tmp, manifest_path)
         _fsync_dir(scan_dir)
     except BaseException:
         if scan_swapped:
-            # Put the old scan.json back so the scan still matches its old manifest.
             try:
                 _write_durable(scan_tmp, old_scan)
                 os.replace(scan_tmp, scan_path)
@@ -805,7 +740,6 @@ def review_scan_label(
 
 
 def list_scans(root: pathlib.Path, line: Optional[str] = None) -> list[pathlib.Path]:
-    """Finished scan folders under ``root/scans`` (one line, or all). Staging folders are skipped."""
     base = pathlib.Path(root) / "scans"
     if not base.is_dir():
         return []

@@ -20,7 +20,6 @@ def _encode(arr):
 
 
 def _decode(frame):
-    # Test decode: data is b"<h>x<w>:" followed by uint8 pixels. No cv2 involved.
     head, _, body = frame.data.partition(b":")
     h, w = (int(v) for v in head.split(b"x"))
     return np.frombuffer(body, dtype=np.uint8).reshape(h, w).astype(np.float64)
@@ -32,7 +31,6 @@ def _frame(arr, camera="C1", side=Side.TOP):
 
 
 def _still_set(shape, n, base=120, seed=0):
-    """n frames of a still scene with 0/1 gray noise."""
     rng = np.random.RandomState(seed)
     return [(base + rng.randint(0, 2, shape)).astype(np.uint8) for _ in range(n)]
 
@@ -91,7 +89,7 @@ class GoldenPredictTests(unittest.TestCase):
         self.assertEqual(result.side, Side.TOP)
 
     def test_clear_bright_blob_scores_high_with_box_on_blob(self):
-        shape = (120, 160)  # block factor 1
+        shape = (120, 160)
         model = _build({("C1", Side.TOP): _still_set(shape, 6)})
         blob = _blob(shape, top=40, left=50, h=40, w=40)
         result = model.predict(_frame(blob))
@@ -99,7 +97,7 @@ class GoldenPredictTests(unittest.TestCase):
         self.assertEqual(len(result.defects), 1)
         defect = result.defects[0]
         self.assertEqual(defect.defect_class, "difference_from_golden")
-        self.assertEqual(defect.box, (50, 40, 40, 40))  # x, y, w, h in original pixels
+        self.assertEqual(defect.box, (50, 40, 40, 40))
         self.assertGreater(defect.score, 0.5)
 
     def test_flat_images_do_not_divide_by_zero(self):
@@ -135,25 +133,25 @@ class GoldenPredictTests(unittest.TestCase):
             model.predict(_frame(np.zeros((8, 9), np.uint8)))
 
     def test_box_scaling_for_block_factor_two(self):
-        shape = (120, 320)  # width 320 with max 160 -> block 2
+        shape = (120, 320)
         model = _build({("C1", Side.TOP): _still_set(shape, 4)})
         self.assertEqual(model.describe()["keys"]["C1/TOP"]["block_factor"], 2)
-        blob = _blob(shape, top=20, left=100, h=40, w=60)  # aligned to the 2 px grid
+        blob = _blob(shape, top=20, left=100, h=40, w=60)
         defect = model.predict(_frame(blob)).defects[0]
         self.assertEqual(defect.box, (100, 20, 60, 40))
 
     def test_box_scaling_for_block_factor_four(self):
-        shape = (120, 640)  # width 640 with max 160 -> block 4
+        shape = (120, 640)
         model = _build({("C1", Side.TOP): _still_set(shape, 4)})
         self.assertEqual(model.describe()["keys"]["C1/TOP"]["block_factor"], 4)
-        blob = _blob(shape, top=40, left=200, h=40, w=80)  # aligned to the 4 px grid
+        blob = _blob(shape, top=40, left=200, h=40, w=80)
         defect = model.predict(_frame(blob)).defects[0]
         self.assertEqual(defect.box, (200, 40, 80, 40))
 
     def test_tiny_region_gives_no_box(self):
         shape = (40, 40)
         model = _build({("C1", Side.TOP): _still_set(shape, 4)})
-        speck = _blob(shape, top=10, left=10, h=1, w=3)  # 3 px < 4 px minimum
+        speck = _blob(shape, top=10, left=10, h=1, w=3)
         result = model.predict(_frame(speck))
         self.assertEqual(result.defects, ())
 

@@ -1,10 +1,3 @@
-"""MES client for the camera inspection station.
-
-Builds the inspection-event post for one finished part and sends it to
-POST /api/machine/inspection-events on the MES. Standard library only.
-
-API reference: /home/user/aisi_mes/docs/vision-station-integration.md
-"""
 from __future__ import annotations
 
 import json
@@ -23,15 +16,15 @@ _STATION_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 class MappingError(StationError):
-    """A defect or a failed criterion cannot be mapped to an MES criterion id."""
+    pass
 
 
 @dataclass
 class MesConfig:
-    base_url: str  # e.g. http://mes:3000
-    token: str = field(repr=False)  # never printed
-    criteria_ids: list[str]  # all MES inspection_criteria ids for the part
-    class_to_criterion: dict[str, str]  # defect class -> criterion id
+    base_url: str
+    token: str = field(repr=False)
+    criteria_ids: list[str]
+    class_to_criterion: dict[str, str]
     default_criterion_id: Optional[str] = None
     default_bad_disposition: str = "quarantine"
     timeout_s: float = 10.0
@@ -39,9 +32,9 @@ class MesConfig:
 
 @dataclass(frozen=True)
 class PostResult:
-    status: int  # HTTP status; 0 when no response was received
+    status: int
     ok: bool
-    replay: bool  # True when MES answered 200 for a key it already stored
+    replay: bool
     event_id: Optional[int]
     error: Optional[str]
     retryable: bool
@@ -58,7 +51,6 @@ def _check_criterion(criterion_id: str, cfg: MesConfig) -> str:
 
 
 def criterion_for(defect_class: str, cfg: MesConfig) -> str:
-    """Map a defect class to its criterion id, falling back to the default."""
     criterion_id = cfg.class_to_criterion.get(defect_class, cfg.default_criterion_id)
     if criterion_id is None:
         raise MappingError(
@@ -70,15 +62,6 @@ def criterion_for(defect_class: str, cfg: MesConfig) -> str:
 def build_request(
     record: PartRecord, cfg: MesConfig, archive_ref: str, proposals: Sequence[Any] = ()
 ) -> tuple[dict[str, str], list[tuple[str, str, bytes]]]:
-    """Return (fields, files) for one inspection event.
-
-    files is a list of (field_name, filename, data): one defect photo per failed
-    criterion, named defectPhoto_<criterion_id>. No other images are included.
-
-    proposals (defect_proposal.ProposalRecord rows, optional): each one fails its criterion
-    and its chosen picture is the photo for that criterion (it replaces a photo chosen from
-    the model's defects for the same criterion).
-    """
     if record.final_verdict not in (Verdict.GOOD, Verdict.BAD):
         raise ValueError(f"only GOOD or BAD can be posted, got {record.final_verdict!r}")
     if record.override is not None and record.override.new_verdict is not record.final_verdict:
@@ -90,7 +73,6 @@ def build_request(
     frame_by_key: dict[tuple[str, Any], Frame] = {(f.camera_id, f.side): f for f in record.frames}
     defect_classes: set[str] = set()
     failed: set[str] = set()
-    # criterion id -> (highest defect score mapped to it, the image result it came from)
     best: dict[str, tuple[float, ImageResult]] = {}
 
     if is_bad:
@@ -103,9 +85,7 @@ def build_request(
                     best[criterion_id] = (defect.score, result)
 
     if proposals and not is_bad:
-        # A proposal makes the final verdict BAD (session rule); a GOOD post must never carry one.
         raise ValueError("a part with defect proposals must be posted as BAD")
-    # criterion id -> the picture (camera, side) chosen for its photo
     chosen: dict[str, tuple[str, Any]] = {}
     for proposal in proposals:
         _check_criterion(proposal.criterion_id, cfg)
@@ -113,9 +93,6 @@ def build_request(
         chosen[proposal.criterion_id] = (proposal.camera_id, proposal.side)
 
     if is_bad and not failed:
-        # Failed criteria are the union of the model's defects and the proposals. Only when that
-        # union is empty (e.g. an anomaly model with no defect class, or a supervisor resolved a
-        # REVIEW to BAD with nothing recorded) does the default criterion apply.
         if cfg.default_criterion_id is None:
             raise MappingError("BAD part has no defects and no default_criterion_id is set")
         failed.add(_check_criterion(cfg.default_criterion_id, cfg))
@@ -160,7 +137,7 @@ def build_request(
         "materialHandler": record.material_handler,
         "verdict": record.final_verdict.value,
         "visionSessionId": record.session_id,
-        "capturedAt": record.started_utc,  # ISO 8601 UTC: the MES checks it against the session window
+        "capturedAt": record.started_utc,
         "modelVersion": record.model_version,
         "archiveRef": archive_ref,
         "notes": (
@@ -184,7 +161,6 @@ def build_request(
 
 
 def _q(text: str) -> str:
-    """Make a value safe inside a quoted multipart header parameter."""
     return text.replace('"', "_").replace("\r", "_").replace("\n", "_")
 
 
@@ -207,8 +183,6 @@ def _encode_multipart(
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Do not follow redirects: the bearer token must not follow a redirect elsewhere."""
-
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
         return None
 
@@ -240,8 +214,6 @@ class MesClient:
         idempotency_key: str,
         station_session: Optional[str] = None,
     ) -> PostResult:
-        """POST one inspection event. station_session (the MES session id of the inspector)
-        is sent as the Station-Session header when given; the Idempotency-Key stays session_id."""
         if station_session is not None and not _STATION_SESSION_RE.match(station_session):
             raise ValueError("station_session is not a valid MES session id")
         boundary = uuid.uuid4().hex
@@ -267,7 +239,7 @@ class MesClient:
         except urllib.error.HTTPError as e:
             status = e.code
             raw = _read_quietly(e)
-        except (urllib.error.URLError, OSError) as e:  # connection refused, DNS, timeouts
+        except (urllib.error.URLError, OSError) as e:
             reason = getattr(e, "reason", e)
             return PostResult(
                 status=0, ok=False, replay=False, event_id=None,

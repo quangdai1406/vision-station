@@ -1,30 +1,3 @@
-"""PyTorch feature extractor and cdist backend for the PatchCore anomaly model.
-
-UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest). Nothing in
-this module has been run against real torch or torchvision yet; the tests use
-injected fakes only.
-
-torch and torchvision are imported lazily, in the constructors, and a missing
-install raises StationError. Pass torch_module / torchvision_module to inject
-them (tests). Standard library and numpy only at module level.
-
-Pretrained weights: with weights_path=None, torchvision downloads its default
-ImageNet weights once (needs internet). On a corporate PC without internet,
-pass weights_path to a local state_dict file instead. The extractor name then
-carries a short sha256 of that file, so a model built with other weights is
-refused on load.
-
-Input images must be RGB (or grey) with values 0..255, RGB channel order. The
-array itself cannot show its channel order, so the contract is: decode camera
-bytes with station.anomaly.cv2_rgb_decoder (cv2 gives BGR, the decoder flips it).
-
-Resizing: input is downscaled with antialias=True. Plain bilinear downscaling
-from a 1080p frame to 320 px averages away small defects before the network
-sees them. Choose input_hw with the smallest defect in mind (more pixels, more
-GPU time), and check it on real defect images before trusting a threshold.
-keep_aspect=True (default) letterboxes the image into input_hw instead of
-squashing it, so the aspect ratio of the part is not distorted.
-"""
 from __future__ import annotations
 
 import hashlib
@@ -36,7 +9,7 @@ from station.contracts import StationError
 SUPPORTED_ARCHS = ("resnet18", "wide_resnet50_2")
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
-_CHUNK_BYTES = 256 * 1024 * 1024  # largest distance block held at once
+_CHUNK_BYTES = 256 * 1024 * 1024
 
 
 def _np() -> Any:
@@ -48,7 +21,6 @@ def _np() -> Any:
 
 
 def _import_torch(torch_module: Any) -> Any:
-    """UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest)."""
     if torch_module is not None:
         return torch_module
     try:
@@ -62,7 +34,6 @@ def _import_torch(torch_module: Any) -> Any:
 
 
 def _import_torchvision(torchvision_module: Any) -> Any:
-    """UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest)."""
     if torchvision_module is not None:
         return torchvision_module
     try:
@@ -75,11 +46,6 @@ def _import_torchvision(torchvision_module: Any) -> Any:
 
 
 def _resolve_device(torch: Any, device: str) -> str:
-    """UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest).
-
-    'auto' picks cuda when torch reports it available, else cpu. An explicit
-    cuda device without CUDA is a StationError.
-    """
     if not isinstance(device, str) or not device:
         raise StationError(f"device must be 'auto', 'cpu' or 'cuda', got {device!r}")
     cuda_ok = bool(torch.cuda.is_available())
@@ -91,7 +57,6 @@ def _resolve_device(torch: Any, device: str) -> str:
 
 
 def _weights_id(weights_path: Any) -> str:
-    """'imagenet-default', or 'sha256-' plus the first 12 hex digits of the weights file."""
     if weights_path is None:
         return "imagenet-default"
     digest = hashlib.sha256()
@@ -105,22 +70,6 @@ def _weights_id(weights_path: Any) -> str:
 
 
 class TorchExtractor:
-    """Layer2 + layer3 features of a torchvision ResNet, as (H', W', C) float32 numpy.
-
-    Steps: ImageNet normalisation; grey repeated to 3 channels; resize to
-    input_hw with antialias=True (letterboxed with zero padding, i.e. the
-    ImageNet mean grey, when keep_aspect=True; squashed otherwise); layer2 and
-    layer3 maps; 3x3 average pooling on each; layer3 bilinearly upsampled to
-    layer2 size; concatenated on channels.
-    stride = input_h / H' (8 for ResNet layer2 at a size divisible by 8).
-
-    name = '<arch>-l2l3-aa-<h>x<w>-<letterbox|squash>-<weights id>'. Any change
-    to preprocessing or weights changes the name, so an older saved model is
-    refused on load instead of silently scoring with different features.
-
-    UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest).
-    """
-
     def __init__(
         self,
         arch: str = "resnet18",
@@ -132,7 +81,6 @@ class TorchExtractor:
         torch_module: Any = None,
         torchvision_module: Any = None,
     ) -> None:
-        """UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest)."""
         if arch not in SUPPORTED_ARCHS:
             raise StationError(f"unsupported arch {arch!r}; use one of {', '.join(SUPPORTED_ARCHS)}")
         try:
@@ -150,13 +98,13 @@ class TorchExtractor:
         self.keep_aspect = keep_aspect
         mode = "letterbox" if keep_aspect else "squash"
         self.name = f"{arch}-l2l3-aa-{h}x{w}-{mode}-{_weights_id(weights_path)}"
-        self.stride = 8  # layer2 of a torchvision ResNet; refreshed from the real map in extract()
+        self.stride = 8
         self.device = _resolve_device(torch, device)
         self._torch = torch
         self._torch_device = torch.device(self.device)
         builder = getattr(tv.models, arch)
         if weights_path is None:
-            model = builder(weights="DEFAULT")  # downloads the default ImageNet weights once
+            model = builder(weights="DEFAULT")
         else:
             model = builder(weights=None)
             try:
@@ -168,10 +116,6 @@ class TorchExtractor:
         self._model = model.to(self._torch_device)
 
     def extract(self, image: Any) -> Any:
-        """UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest).
-
-        image: 2D grey or 3D RGB (channel order R, G, B), values 0..255.
-        """
         np = _np()
         torch = self._torch
         F = torch.nn.functional
@@ -198,7 +142,6 @@ class TorchExtractor:
                 top = (th - nh) // 2
                 left = (tw - nw) // 2
                 t = F.interpolate(t, size=(nh, nw), mode="bilinear", align_corners=False, antialias=True)
-                # zero after normalisation = ImageNet mean grey
                 t = F.pad(t, (left, tw - nw - left, top, th - nh - top), value=0.0)
             else:
                 t = F.interpolate(t, size=(th, tw), mode="bilinear", align_corners=False, antialias=True)
@@ -217,34 +160,18 @@ class TorchExtractor:
 
 
 class TorchBackend:
-    """nn_distance with torch.cdist, in row chunks of at most ~256 MB of distances.
-
-    Data is centred on the bank mean before the distances are taken, as in NumpyBackend.
-
-    The centred bank is uploaded to the device once per bank object and cached
-    (keyed by the identity of the bank array, which PatchCoreModel keeps per key),
-    so a model's bank is not copied to the GPU for every image. Call clear() to
-    free the cached tensors, e.g. after a model is retired.
-
-    UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest).
-    """
-
     def __init__(self, device: str = "auto", *, torch_module: Any = None, max_chunk_bytes: int = _CHUNK_BYTES) -> None:
-        """UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest)."""
         torch = _import_torch(torch_module)
         self.device = _resolve_device(torch, device)
         self._torch = torch
         self._torch_device = torch.device(self.device)
         self.max_chunk_bytes = max(4, int(max_chunk_bytes))
-        # id(bank) -> (bank object kept alive, bank shape, column means, device tensor)
         self._bank_cache: dict[int, tuple[Any, tuple[int, ...], Any, Any]] = {}
 
     def clear(self) -> None:
-        """Drop every cached bank tensor."""
         self._bank_cache.clear()
 
     def _device_bank(self, bank: Any) -> tuple[tuple[int, ...], Any, Any]:
-        """UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest)."""
         cached = self._bank_cache.get(id(bank))
         if cached is not None and cached[0] is bank:
             return cached[1], cached[2], cached[3]
@@ -262,7 +189,6 @@ class TorchBackend:
         return shape, mu, bt
 
     def nn_distance(self, queries: Any, bank: Any) -> Any:
-        """UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest)."""
         np = _np()
         torch = self._torch
         q = np.asarray(queries, dtype=np.float32)
@@ -290,13 +216,6 @@ def selftest(
     torch_module: Any = None,
     torchvision_module: Any = None,
 ) -> dict:
-    """Run one synthetic 3-channel image through the extractor (laptop self-test).
-
-    Returns name, device, feature_shape, seconds (one warm-up call, then one timed
-    call), cuda_available and torch_version.
-
-    UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest).
-    """
     np = _np()
     if extractor is None:
         extractor = TorchExtractor(torch_module=torch_module, torchvision_module=torchvision_module)
@@ -306,8 +225,8 @@ def selftest(
     h, w = (int(v) for v in extractor.input_hw)
     rng = np.random.RandomState(0)
     image = rng.randint(0, 256, size=(h, w, 3)).astype(np.float32)
-    image[h // 4: h // 2, w // 4: w // 2, :] = 255.0  # a bright square so the input is not flat
-    extractor.extract(image)  # warm-up: CUDA init and allocator are not timed
+    image[h // 4: h // 2, w // 4: w // 2, :] = 255.0
+    extractor.extract(image)
     start = time.perf_counter()
     feats = extractor.extract(image)
     if bool(torch.cuda.is_available()):

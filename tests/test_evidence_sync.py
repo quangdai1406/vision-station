@@ -1,9 +1,3 @@
-"""Tests for station/evidence_sync.py (plan S4: evidence transport to the laptop).
-
-Run from the project root:
-
-    python3 -m unittest discover -s tests
-"""
 import contextlib
 import hashlib
 import io
@@ -21,7 +15,6 @@ SIDES = ("TOP", "BOTTOM")
 
 
 def make_part(local_root, part_id="PN-1-0001", day=("2026", "11", "04")):
-    """Write one saved part the way station/storage.py does: 8 pictures, part.json, manifest last."""
     part_dir = pathlib.Path(local_root) / "store" / "L1" / day[0] / day[1] / day[2] / part_id
     part_dir.mkdir(parents=True)
     entries = []
@@ -56,7 +49,7 @@ class EvidenceSyncTestCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         base = pathlib.Path(self._tmp.name)
         self.local = base / "station"
-        self.dest = base / "laptop_store"  # stands in for the mounted SMB folder
+        self.dest = base / "laptop_store"
         self.dest.mkdir()
         self.part = make_part(self.local)
 
@@ -187,7 +180,7 @@ class QueueTests(EvidenceSyncTestCase):
         missing = self.dest.parent / "not-mounted-yet"
         report = queue.run_once(missing)
         self.assertEqual((report.synced, report.failed, report.pending), (0, 1, 1))
-        self.assertFalse(missing.exists())  # a missing mount must not be created locally
+        self.assertFalse(missing.exists())
         self.assertEqual(len(queue.pending()), 1)
         self.assertIsNotNone(queue.pending()[0]["last_error"])
 

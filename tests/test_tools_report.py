@@ -1,4 +1,3 @@
-"""Tests for tools/report.py. Synthetic session folders in a temp dir; numpy tests are skipped without numpy."""
 import contextlib
 import csv
 import io
@@ -28,12 +27,6 @@ NEED_NUMPY = unittest.skipUnless(HAS_NUMPY, "numpy is not installed")
 def _build_session(root, name, mode, *, shifts=None, frames=6, h=48, w=64,
                    autofocus_applied=True, seed=1, base=None, sigma=2.0,
                    offsets=None, autofocus_readback=None):
-    """Write a session folder that follows tools/FORMAT.md. Placement uses integer (dx, dy) shifts.
-
-    base: optional fixed image for a stationary session (pure noise, no drift); the
-    frame size then comes from base. offsets: optional per-frame brightness offsets
-    (stationary only, one per frame). autofocus_readback: optional read-back value for autofocus.
-    """
     rng = np.random.default_rng(seed)
     if base is None:
         base = rng.integers(30, 226, size=(h, w)).astype(np.float64)
@@ -140,7 +133,7 @@ class ReportTests(unittest.TestCase):
         auto_row = [ln for ln in cam_section.splitlines() if ln.startswith("| Autofocus |")]
         self.assertTrue(auto_row)
         self.assertIn("not confirmed", auto_row[0])
-        self.assertIn("reports auto", cam_section)  # session warning copied verbatim
+        self.assertIn("reports auto", cam_section)
 
     def test_no_warning_block_when_all_applied(self):
         sdir = _build_session(self.root, "stat_fine", "stationary")
@@ -176,7 +169,7 @@ class ReportTests(unittest.TestCase):
         try:
             aligned = analysis.residual_scores(gray, align=True)["mean"]
         except ValueError:
-            aligned = None  # the aligned figure may be unavailable; it is not used
+            aligned = None
         if aligned is not None:
             self.assertNotAlmostEqual(row["mean"], aligned, places=6)
         md = self._read(out / "report.md")
@@ -200,7 +193,6 @@ class ReportTests(unittest.TestCase):
         self._assert_noise_floor_is_unaligned(sdir)
 
     def test_stationary_flat_session_never_aligns(self):
-        # Previously the aligned residual could raise ValueError here; it must not be used.
         real = analysis.residual_scores
 
         def guarded(gray, *args, **kwargs):
@@ -292,7 +284,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("cmp_b", md)
         with open(out / "summary.csv", newline="", encoding="utf-8") as fh:
             lines = fh.read().splitlines()
-        self.assertEqual(len(lines), 3)  # header + two rows
+        self.assertEqual(len(lines), 3)
 
     def test_missing_npz_gives_clear_error(self):
         sdir = _build_session(self.root, "stat_miss", "stationary")

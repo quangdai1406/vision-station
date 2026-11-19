@@ -1,38 +1,3 @@
-# install_backup_task.ps1
-# Registers (or removes) the Windows scheduled task "VisionStation MES Nightly Backup", which runs
-# scripts\windows\backup_postgres.ps1 every day at the time given by -Time.
-#
-# Usage (PowerShell, from the vision-station folder):
-#   .\scripts\windows\install_backup_task.ps1 -WhatIf               # dry run: prints only, changes nothing
-#   .\scripts\windows\install_backup_task.ps1                       # registers the task at 22:00 (asks for the account)
-#   .\scripts\windows\install_backup_task.ps1 -Time 21:30           # another local time
-#   .\scripts\windows\install_backup_task.ps1 -Uninstall            # removes the task
-#   .\scripts\windows\install_backup_task.ps1 -Uninstall -WhatIf
-#
-# Time: 22:00 local time is an ENGINEERING DEFAULT, not a Quality or IT requirement. Change it
-# with -Time. The script refuses a time between 05:00 and 08:00, because the Sunday 06:00 weekly
-# training (install_weekly_task.ps1) must not overlap a backup.
-#
-# Why the task runs whether or not anyone is logged on: the nightly backup must happen unattended.
-# Task Scheduler needs the account's password. schtasks asks for it itself, on this console
-# (/RP *). This script never reads, names or stores the password.
-#
-# The account the task runs as must be the account whose PostgreSQL settings are set up for the
-# backup (PGHOST, PGPORT, PGUSER, PGPASSFILE in that account's environment; see
-# docs/laptop_services.md).
-#
-# Settings applied:
-#   trigger          daily at -Time local time
-#   StartWhenAvailable  a run missed while the laptop was asleep or off starts when it wakes
-#   ExecutionTimeLimit  2 hours (engineering default)
-#   MultipleInstances   IgnoreNew: do not start a second backup while one is still running
-#   battery          runs on AC power only
-#   run level        Limited
-#
-# Equivalent schtasks command (comment only). schtasks cannot set StartWhenAvailable, the battery
-# rules or the time limit, so this script creates the task with schtasks (step 1 below) and then
-# applies the other settings with Set-ScheduledTask (step 2):
-#   schtasks /Create /TN "VisionStation MES Nightly Backup" /SC DAILY /ST 22:00 /RL LIMITED /RU <DOMAIN\user> /RP * /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\vision-station\scripts\windows\backup_postgres.ps1"
 
 [CmdletBinding()]
 param(
@@ -104,20 +69,16 @@ if ($WhatIf) {
     exit 0
 }
 
-# The task runs unattended, so Task Scheduler needs the account's password. Step 1 is schtasks,
-# which asks for that password on this console (/RP *). This script never handles it.
 $account = Read-Host "Windows account the backup task runs as (DOMAIN\user). schtasks will then ask for its password"
 if ([string]::IsNullOrWhiteSpace($account)) {
     throw 'no account given; the task was not changed'
 }
 
-# Step 1: create or replace the task. /TR is a placeholder here; step 2 sets the real action.
 & schtasks.exe /Create /F /TN $TaskName /SC DAILY /ST $Time /RL LIMITED /RU $account /RP * /TR 'powershell.exe'
 if ($LASTEXITCODE -ne 0) {
     throw "schtasks could not create the task (exit code $LASTEXITCODE); nothing else was changed"
 }
 
-# Step 2: apply the real action, trigger, settings and principal. Set-ScheduledTask needs no password.
 $principal = New-ScheduledTaskPrincipal -UserId $account -LogonType Password -RunLevel Limited
 Set-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null
 

@@ -1,7 +1,3 @@
-"""Collect mode: the station saves the 8 images and part.json with no model verdict.
-
-Fakes only (FakeCameraSet, RecordingOutputs, an injected clock). Real Store in a temp folder.
-"""
 from __future__ import annotations
 
 import json
@@ -20,7 +16,7 @@ from station.session import COLLECTED_LABEL, StationSession
 from station.storage import COLLECTED, Store
 
 TS = "2026-10-26T08:00:00Z"
-PAST_MIN_FLIP = 2.5  # longer than the 2.0 s default min_flip_s
+PAST_MIN_FLIP = 2.5
 TOKEN_ENV = "VISION_TEST_COLLECT_TOKEN"
 
 
@@ -138,7 +134,7 @@ class CollectSessionTests(unittest.TestCase):
         self.assertEqual(self.session.state, State.FAULT)
         self.assertEqual(self.session.counters["total"], 0)
         self.assertNotIn("show_good", self.outputs.history)
-        del self.store.save_part  # restore the real method
+        del self.store.save_part
         self.session.clear_fault()
         self.assertEqual(self.session.state, State.IDLE)
         self.assertEqual(self.session.counters["total"], 1)
@@ -162,7 +158,7 @@ class CollectAppTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.clock = _Clock()
         with open(os.path.join(self.tmp, "users.json"), "w", encoding="utf-8") as fh:
-            fh.write("{}")  # an empty user store is enough: no login is used here
+            fh.write("{}")
         self.saved_env = os.environ.pop(TOKEN_ENV, None)
         self.addCleanup(self._restore_env)
 
@@ -171,7 +167,6 @@ class CollectAppTests(unittest.TestCase):
             os.environ[TOKEN_ENV] = self.saved_env
 
     def test_app_saves_collected_part_and_never_queues_it_for_mes(self) -> None:
-        # A token is set, so the only reason nothing is queued is collect mode.
         app = build_station(collect_config(self.tmp), cameras=FakeCameraSet(clock=lambda: TS),
                             outputs=RecordingOutputs(), now_utc=lambda: TS, clock=self.clock,
                             token="test-token")
@@ -222,7 +217,7 @@ class CollectAppTests(unittest.TestCase):
         app = self._collected_app()
         with self.assertRaises(ValueError):
             app.label_part(by="op1", verdict=Verdict.GOOD, criterion_id="CR-1")
-        with self.assertRaises(ValueError):  # not in mes.criteria_ids
+        with self.assertRaises(ValueError):
             app.label_part(by="op1", verdict=Verdict.BAD, criterion_id="CR-9")
         with self.assertRaises(ValueError):
             app.label_part(by="op1", verdict=Verdict.REVIEW)
@@ -247,8 +242,6 @@ class CollectAppTests(unittest.TestCase):
 
 
 class TwoStepLabelAppTests(unittest.TestCase):
-    """Two-step approval through StationApp: operators propose, only an admin makes it official."""
-
     setUp = CollectAppTests.setUp
     _restore_env = CollectAppTests._restore_env
     _collected_app = CollectAppTests._collected_app
@@ -305,7 +298,7 @@ class TwoStepLabelAppTests(unittest.TestCase):
         self.assertEqual(rejected["status"], "rejected")
         self.assertEqual(app.last_label_status()["reject_reason"], "blurred")
         self.assertEqual(app.pending_labels(), [])
-        again = app.label_part(by="op2", verdict=Verdict.GOOD)  # a new proposal replaces the rejection
+        again = app.label_part(by="op2", verdict=Verdict.GOOD)
         self.assertEqual(again["status"], "proposed")
         self.assertTrue(again["changed"])
 

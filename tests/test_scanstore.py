@@ -60,7 +60,6 @@ class ScanTestCase(unittest.TestCase):
         )
 
     def fill(self, writer, steps, bad=False):
-        """steps like {"TOP": 3, "BOTTOM": 5}; BAD scans alternate defect_visible."""
         for side, count in steps.items():
             for step in range(1, count + 1):
                 for cam in writer.camera_ids:
@@ -87,7 +86,7 @@ class TestRoundTrip(ScanTestCase):
         names = {p.name for p in final.iterdir()}
         self.assertIn("SITE_L1_20261027_083012_SC-1_C1_TOP_S01.png", names)
         self.assertIn("SITE_L1_20261027_083012_SC-1_C4_BOTTOM_S05.png", names)
-        self.assertEqual(len(names), 32 + 2)  # 32 pictures, scan.json, manifest.sha256
+        self.assertEqual(len(names), 32 + 2)
 
         doc = load_scan(final)
         self.assertEqual(doc["steps"], {"TOP": 3, "BOTTOM": 5})
@@ -118,7 +117,7 @@ class TestRoundTrip(ScanTestCase):
         lines = (final / MANIFEST).read_text(encoding="utf-8").splitlines()
         names = [line.split("  ", 1)[1] for line in lines]
         self.assertIn(SCAN_JSON, names)
-        self.assertEqual(len(names), 8 + 1)  # 8 pictures (2 sides x 4 cameras) plus scan.json
+        self.assertEqual(len(names), 8 + 1)
         for line in lines:
             digest, name = line.split("  ", 1)
             self.assertEqual(len(digest), 64)
@@ -161,7 +160,7 @@ class TestRoundTrip(ScanTestCase):
         self.assertEqual(len(renames), 1)
         self.assertGreater(renames[0], events.index(f"write {SCAN_JSON}"))
         self.assertGreater(renames[0], events.index(f"write {MANIFEST}"))
-        self.assertEqual(renames[0], len(events) - 1)  # nothing is written after the rename
+        self.assertEqual(renames[0], len(events) - 1)
         self.assertEqual(verify_scan(self.scan_dir()), [])
 
 
@@ -170,7 +169,7 @@ class TestWriterLifecycle(ScanTestCase):
         writer = self.begin()
         self.fill(writer, {"TOP": 2})
         writer.cancel()
-        writer.cancel()  # second cancel is harmless
+        writer.cancel()
         self.assertEqual(list((self.root / "scans" / "L1").iterdir()), [])
         self.assertEqual(list_scans(self.root), [])
         with self.assertRaises(RuntimeError):
@@ -197,7 +196,6 @@ class TestWriterLifecycle(ScanTestCase):
         self.assertFalse(self.scan_dir().exists())
         self.assertEqual(list_scans(self.root), [])
         self.assertEqual(list((self.root / "scans" / "L1").iterdir()), [])
-        # the id is free again after the failed write
         retry = self.begin()
         self.fill(retry, {"TOP": 1, "BOTTOM": 1})
         self.assertEqual(retry.finish(FINISHED), self.scan_dir())
@@ -222,7 +220,6 @@ class TestWriterLifecycle(ScanTestCase):
     def test_interrupted_scan_is_only_staging_and_list_skips_it(self):
         writer = self.begin()
         self.fill(writer, {"TOP": 2})
-        # simulate a crash: the writer is dropped without finish() or cancel()
         staging = self.root.joinpath(*DAY[:-1], "27", ".SC-1.partial")
         self.assertTrue(staging.is_dir())
         self.assertFalse(self.scan_dir().exists())
@@ -239,7 +236,7 @@ class TestRefusals(ScanTestCase):
         with self.assertRaises(FileExistsError):
             self.begin()
         with self.assertRaises(FileExistsError):
-            self.begin(started="2026-10-28T07:00:00Z")  # other day, same id
+            self.begin(started="2026-10-28T07:00:00Z")
 
     def test_duplicate_scan_id_refused_while_first_is_open(self):
         self.begin("SC-2")
@@ -265,8 +262,8 @@ class TestRefusals(ScanTestCase):
             dict(GOOD_LABEL, defects=["doh_small"]),
             dict(BAD_LABEL, defects=[]),
             dict(GOOD_LABEL, status="maybe"),
-            dict(GOOD_LABEL, status="rejected"),  # rejected needs a reason
-            dict(GOOD_LABEL, approved_by=None),  # approved_by and approved_at go together
+            dict(GOOD_LABEL, status="rejected"),
+            dict(GOOD_LABEL, approved_by=None),
             dict(GOOD_LABEL, extra_key=1),
             dict(GOOD_LABEL, labelled_by="  "),
         ]
@@ -308,7 +305,7 @@ class TestRefusals(ScanTestCase):
             dict(camera_id="C9", side="TOP", step=2),
             dict(camera_id="C1", side="LEFT", step=2),
             dict(camera_id="C1", side="TOP", step=0),
-            dict(camera_id="C1", side="TOP", step=1),  # duplicate
+            dict(camera_id="C1", side="TOP", step=1),
             dict(camera_id="C2", side="TOP", step=1, ext="../png"),
             dict(camera_id="C2", side="TOP", step=1, ext="p/g"),
         ]
@@ -383,7 +380,7 @@ class TestVerify(ScanTestCase):
     def test_edited_label_caught_by_hash_and_rules(self):
         final = self.finished_scan()
         doc = json.loads((final / SCAN_JSON).read_text(encoding="utf-8"))
-        doc["label"]["defects"] = ["doh_small"]  # GOOD with a defect
+        doc["label"]["defects"] = ["doh_small"]
         (final / SCAN_JSON).write_text(json.dumps(doc), encoding="utf-8")
         problems = verify_scan(final)
         self.assertIn(f"hash mismatch: {SCAN_JSON}", problems)
@@ -408,10 +405,6 @@ class TestVerify(ScanTestCase):
         self.assertIn("missing scan.json", problems)
 
     def forge(self, final, edit_doc=None, rename=None):
-        """Change scan.json, a picture name, or both, and rebuild the manifest from scan.json.
-
-        This is what someone who edits the whole folder would do; it is not what the writer does.
-        """
         doc = json.loads((final / SCAN_JSON).read_text(encoding="utf-8"))
         if edit_doc:
             edit_doc(doc)
@@ -431,11 +424,11 @@ class TestVerify(ScanTestCase):
         final = self.finished_scan()
         doc = json.loads((final / SCAN_JSON).read_text(encoding="utf-8"))
         doc["site"] = "EVIL"
-        (final / SCAN_JSON).write_text(json.dumps(doc), encoding="utf-8")  # manifest not updated
+        (final / SCAN_JSON).write_text(json.dumps(doc), encoding="utf-8")
         problems = verify_scan(final)
         self.assertIn(f"hash mismatch: {SCAN_JSON}", problems)
         name_problems = [p for p in problems if "file name does not match the scan" in p]
-        self.assertEqual(len(name_problems), 8)  # every picture name carries the real site
+        self.assertEqual(len(name_problems), 8)
 
     def test_altered_site_with_rebuilt_manifest_still_caught_by_names(self):
         final = self.finished_scan()
@@ -531,14 +524,14 @@ class TestSetDefectVisible(ScanTestCase):
         bad = self.begin("SC-B", label=BAD_LABEL)
         self.fill(bad, {"TOP": 1}, bad=True)
         with self.assertRaises(ValueError):
-            bad.set_defect_visible("C1", "TOP", 2, True)  # no such step
+            bad.set_defect_visible("C1", "TOP", 2, True)
         with self.assertRaises(ValueError):
-            bad.set_defect_visible("C1", "BOTTOM", 1, True)  # no such side
+            bad.set_defect_visible("C1", "BOTTOM", 1, True)
         with self.assertRaises(ValueError):
-            bad.set_defect_visible("C1", "TOP", 1, "yes")  # not a bool
+            bad.set_defect_visible("C1", "TOP", 1, "yes")
         bad.finish(FINISHED)
         with self.assertRaises(RuntimeError):
-            bad.set_defect_visible("C1", "TOP", 1, True)  # after finish
+            bad.set_defect_visible("C1", "TOP", 1, True)
         self.assertEqual(verify_scan(self.scan_dir("SC-B")), [])
 
 
@@ -554,7 +547,6 @@ REVIEW_AT = "2026-10-28T10:00:00Z"
 
 class TestReviewLabel(ScanTestCase):
     def snapshot(self, scan_id="SC-1"):
-        """Bytes of every file in the scan folder, by name."""
         folder = self.scan_dir(scan_id)
         return {p.name: p.read_bytes() for p in sorted(folder.iterdir())}
 
@@ -635,7 +627,7 @@ class TestReviewLabel(ScanTestCase):
         review_scan_label(self.scan_dir(), "approve", "admin-1", REVIEW_AT)
         after = self.snapshot()
         pictures = [name for name in before if name not in (SCAN_JSON, MANIFEST)]
-        self.assertEqual(len(pictures), 12)  # 3 steps x 4 cameras
+        self.assertEqual(len(pictures), 12)
         for name in pictures:
             self.assertEqual(after[name], before[name])
         before_lines = before[MANIFEST].decode().splitlines()

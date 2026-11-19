@@ -1,31 +1,3 @@
-# install_weekly_task.ps1
-# Registers (or removes) the Windows scheduled task "VisionStation Weekly Training", which runs
-# scripts\windows\run_weekly_training.ps1 every Sunday at 06:00 local time.
-#
-# Usage (PowerShell, from the vision-station folder):
-#   .\scripts\windows\install_weekly_task.ps1 -WhatIf      # dry run: prints only, changes nothing
-#   .\scripts\windows\install_weekly_task.ps1              # registers the task (asks for the account)
-#   .\scripts\windows\install_weekly_task.ps1 -Uninstall   # removes the task
-#   .\scripts\windows\install_weekly_task.ps1 -Uninstall -WhatIf
-#
-# Why it is not "run only when the user is logged on": the 06:00 run must happen unattended.
-# The task therefore runs whether or not anyone is logged on, as a Limited (non-elevated)
-# account. Task Scheduler needs that account's password. schtasks asks for it itself, on this
-# console (/RP *). This script never reads, names or stores the password.
-#
-# Settings applied:
-#   trigger          weekly, Sunday, 06:00 local time
-#   StartWhenAvailable  a run missed while the laptop was asleep or off starts when it wakes
-#   WakeToRun        the laptop wakes from sleep for the run (power settings may still block it)
-#   ExecutionTimeLimit  6 hours
-#   MultipleInstances   IgnoreNew: do not start a second run while one is still running
-#   battery          runs on AC power only; does not start on battery, stops if it switches to battery
-#   run level        Limited
-#
-# Equivalent schtasks command (comment only). schtasks cannot set StartWhenAvailable, WakeToRun,
-# the battery rules or the time limit, so this script creates the task with schtasks (step 1
-# below) and then applies the other settings with Set-ScheduledTask (step 2):
-#   schtasks /Create /TN "VisionStation Weekly Training" /SC WEEKLY /D SUN /ST 06:00 /RL LIMITED /RU <DOMAIN\user> /RP * /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\vision-station\scripts\windows\run_weekly_training.ps1"
 
 [CmdletBinding()]
 param(
@@ -91,20 +63,16 @@ if ($WhatIf) {
     exit 0
 }
 
-# The task runs unattended, so Task Scheduler needs the account's password. Step 1 is schtasks,
-# which asks for that password on this console (/RP *). This script never handles it.
 $account = Read-Host "Windows account the task runs as (DOMAIN\user). schtasks will then ask for its password"
 if ([string]::IsNullOrWhiteSpace($account)) {
     throw 'no account given; the task was not changed'
 }
 
-# Step 1: create or replace the task. /TR is a placeholder here; step 2 sets the real action.
 & schtasks.exe /Create /F /TN $TaskName /SC WEEKLY /D SUN /ST 06:00 /RL LIMITED /RU $account /RP * /TR 'powershell.exe'
 if ($LASTEXITCODE -ne 0) {
     throw "schtasks could not create the task (exit code $LASTEXITCODE); nothing else was changed"
 }
 
-# Step 2: apply the real action, trigger, settings and principal. Set-ScheduledTask needs no password.
 $principal = New-ScheduledTaskPrincipal -UserId $account -LogonType Password -RunLevel Limited
 Set-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null
 

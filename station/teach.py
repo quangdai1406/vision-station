@@ -1,13 +1,3 @@
-"""`python -m station teach`: learn the golden model from GOOD parts on the real cameras.
-
-    python -m station teach --config config.json [--frames-per-side N] [--parts K]
-                            [--out PATH] [--force]
-
-DEMO HEURISTIC for the proof of concept: the golden model is learned from good
-parts only and its scores are not validated. Standard library at module level;
-numpy and cv2 are imported lazily by station.golden. Nothing is written until
-every part has been captured.
-"""
 from __future__ import annotations
 
 import argparse
@@ -22,8 +12,8 @@ from station import golden
 from station.app import ConfigError, StationApp, load_config
 from station.contracts import Side, StationError
 
-DEFAULT_FRAMES_PER_SIDE = 5  # engineering setting, not a quality limit
-DEFAULT_PARTS = 3  # engineering setting, not a quality limit
+DEFAULT_FRAMES_PER_SIDE = 5
+DEFAULT_PARTS = 3
 DEFAULT_PAUSE_S = 0.3
 REMINDER = (
     "Learned from GOOD parts only. This is a demo heuristic for a proof of concept: "
@@ -52,7 +42,6 @@ def _at_least(minimum: int, label: str) -> Callable[[str], int]:
 
 
 def add_teach_arguments(parser: argparse.ArgumentParser) -> None:
-    """The teach options, shared by `python -m station teach` and its tests."""
     parser.add_argument("--config", required=True, help="path to the station config (JSON); cameras come from it")
     parser.add_argument("--frames-per-side", type=_at_least(2, "--frames-per-side"),
                         default=DEFAULT_FRAMES_PER_SIDE, metavar="N",
@@ -65,7 +54,6 @@ def add_teach_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def load_teach_config(path: str | os.PathLike) -> dict:
-    """Load the station config (model.kind 'golden' is accepted by app.load_config)."""
     return load_config(path)
 
 
@@ -90,7 +78,7 @@ def _release(cameras: Any) -> None:
     if callable(release):
         try:
             release()
-        except Exception as exc:  # the model is already saved or the run already failed
+        except Exception as exc:
             _err(f"teach warning: could not release the cameras: {exc}")
 
 
@@ -120,13 +108,6 @@ def run_teach(
     sleep: Callable[[float], Any] = time.sleep,
     write: Callable[[str], Any] = print,
 ) -> int:
-    """Photograph K good parts (top and bottom), learn the golden model and save it.
-
-    config: a validated config dict with model.kind 'golden'. out defaults to model.path.
-    cameras and builder are injectable for tests; by default they are built from config.
-    Returns 0 on success, 2 for a usage or config problem (nothing built), 1 for a
-    camera or build error, or an aborted prompt. Nothing is written unless every part succeeded.
-    """
     kind = config["model"]["kind"]
     if kind != "golden":
         _err(f"teach: model.kind must be 'golden' to learn a golden model, not {kind!r}")

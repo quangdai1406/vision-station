@@ -1,4 +1,3 @@
-"""mes_ticket mode: station.ui routes, session identity and the press rule. Local server, fakes only."""
 import http.client
 import json
 import threading
@@ -19,8 +18,6 @@ INFO = SessionInfo(session_id=SID, username="anna.k", roles=("inspector",),
 
 
 class FakeMesSessions:
-    """Stands in for MesSessionClient. Records calls; the scripted results drive each case."""
-
     def __init__(self):
         self.redeem_result = INFO
         self.redeem_error = None
@@ -47,8 +44,6 @@ class FakeMesSessions:
 
 
 class RecordingSession(FakeSession):
-    """FakeSession whose press() records who pressed and the MES session."""
-
     def __init__(self):
         super().__init__()
         self.press_kwargs = []
@@ -248,8 +243,6 @@ class LocalModeTests(unittest.TestCase):
 
 
 class SessionIdentityTests(unittest.TestCase):
-    """The press rule in StationSession: the part is recorded under the inspector who started it."""
-
     def start_part(self, h, by="anna.k", sid="sess-anna-1"):
         self.assertTrue(h.session.press(by=by, station_session=sid))
         self.assertEqual(h.session.state, State.WAIT_FLIP)

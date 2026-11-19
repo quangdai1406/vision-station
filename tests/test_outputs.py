@@ -11,7 +11,6 @@ ACTIONS = ["show_good", "show_bad", "alarm_off", "show_review", "show_fault", "c
 
 
 def expected_after(action, prev):
-    """The invariant table from the module docstring, as full lamp states."""
     if action == "show_good":
         return dict(OFF, green=True)
     if action == "show_bad":
@@ -28,7 +27,6 @@ def expected_after(action, prev):
 
 
 def run_sequence(test, driver, observe):
-    """Drive ACTIONS through driver; observe(driver) gives the lamp dict after each step."""
     prev = dict(OFF)
     for action in ACTIONS:
         getattr(driver, action)()
@@ -38,8 +36,6 @@ def run_sequence(test, driver, observe):
 
 
 class InvariantTableTests(unittest.TestCase):
-    """Spot checks of the rules the spec calls out explicitly."""
-
     def test_good_never_lights_red_or_alarm(self):
         s = expected_after("show_good", OFF)
         self.assertTrue(s["green"])
@@ -98,7 +94,6 @@ class ConsoleOutputsTests(unittest.TestCase):
         driver = ConsoleOutputs(write=lines.append)
 
         def observe():
-            # The most recent line carries the full state after the call.
             return parse_console_line(lines[-1])
 
         run_sequence(self, driver, observe)

@@ -1,32 +1,3 @@
-"""Dataset reader for the weekly trainer.
-
-Reads the evidence the stations saved under
-``<store>/store/<line>/YYYY/MM/DD/<part_id>/`` (layout: ``station/storage.py``)
-and turns it into per-part GOOD and BAD sets. Standard library only. Nothing
-here writes to the store.
-
-Label policy, from part.json:
-  BAD                        final_verdict == BAD
-  GOOD, strict (default)     final GOOD and machine GOOD and override is null
-  GOOD, include-overridden   final GOOD, even when the machine said BAD or REVIEW
-                             (a human decided)
-  anything else              excluded (REVIEW never reaches final_verdict)
-
-Collected parts (disposition 'collected', saved in collect mode, final REVIEW) use the
-operator label instead: label GOOD -> good, label BAD -> bad, no label -> excluded.
-The strict GOOD rule above is not used for them.
-
-Parts with a purged.json tombstone (pictures deleted by trainer/purge.py) are
-skipped with a note, not read as problems of the store.
-
-Problem lines are strings ``"<part folder>: <reason>"``. An unreadable part.json
-cannot be tied to a part number, so it is reported by every scan that reads it.
-
-Split: split_holdout() assigns whole calendar days (UTC) to the holdout, never
-single images. If the parts fall on fewer than two days it assigns whole parts.
-The holdout size is approximate: days (or parts) are added greedily in a seeded
-random order, only while that brings the holdout closer to the target size.
-"""
 from __future__ import annotations
 
 import hashlib
@@ -40,7 +11,7 @@ from typing import Iterable, Iterator, Optional, Sequence
 
 PART_JSON = "part.json"
 MANIFEST = "manifest.sha256"
-PURGED_FILE = "purged.json"  # tombstone written by trainer/purge.py after pictures were deleted
+PURGED_FILE = "purged.json"
 STORE_DIR = "store"
 GOOD_POLICIES = ("strict", "include-overridden")
 SIDES = ("TOP", "BOTTOM")
@@ -74,9 +45,9 @@ _TEXT_KEYS = (
 class ImageRef:
     path: pathlib.Path
     camera_id: str
-    side: str  # 'TOP' | 'BOTTOM'
+    side: str
     score: Optional[float]
-    sha256: str  # as recorded in part.json
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -88,17 +59,16 @@ class PartSample:
     machine_verdict: str
     final_verdict: str
     override: Optional[dict]
-    defect_label: Optional[str]  # part.json 'defect_label' when present
+    defect_label: Optional[str]
     model_version: str
     partial_station: bool
     camera_count: int
-    images: tuple  # tuple of ImageRef
+    images: tuple
     part_dir: pathlib.Path
-    disposition: Optional[str] = None  # 'collected' for a collect-mode part
-    operator_label: Optional[dict] = None  # {'verdict': 'GOOD'|'BAD', ...} or None
+    disposition: Optional[str] = None
+    operator_label: Optional[dict] = None
 
 
-# ----------------------------------------------------------------- helpers
 def _check_policy(good_policy: str) -> str:
     policy = str(good_policy).strip().lower().replace("_", "-")
     if policy not in GOOD_POLICIES:
@@ -125,7 +95,6 @@ def _parse_utc(text: str) -> datetime:
 
 
 def _resolve_store(store_root) -> pathlib.Path:
-    """Accept the folder that contains 'store/' or the 'store/' folder itself."""
     root = pathlib.Path(store_root)
     if not root.is_dir():
         raise FileNotFoundError(f"store folder not found: {root}")
@@ -140,7 +109,7 @@ def _part_json_paths(store_dir: pathlib.Path) -> list[pathlib.Path]:
             continue
         parents = path.relative_to(store_dir).parts[:-1]
         if any(p.startswith(_TMP_PREFIX) for p in parents):
-            continue  # an interrupted save, never published
+            continue
         found.append(path)
     return sorted(found)
 
@@ -178,7 +147,6 @@ def _check_doc(doc: dict) -> Optional[str]:
     label = doc.get("defect_label")
     if label is not None and not isinstance(label, str):
         return "bad defect_label"
-    # Optional: parts saved before operator labels existed have no key at all.
     operator_label = doc.get("operator_label")
     if operator_label is not None and (
         not isinstance(operator_label, dict) or operator_label.get("verdict") not in ("GOOD", "BAD")
@@ -251,7 +219,6 @@ def _sha256_file(path: pathlib.Path) -> str:
 
 
 def _verify_problems(part_dir: pathlib.Path, refs: Sequence[ImageRef]) -> list[str]:
-    """Same rules as station.storage.Store.verify_part, without needing a Store."""
     manifest_path = part_dir / MANIFEST
     if not manifest_path.is_file():
         return ["missing manifest.sha256"]
@@ -332,7 +299,6 @@ def _fmt_utc(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# ------------------------------------------------------------------ reading
 def iter_parts(
     store_root,
     *,
@@ -343,13 +309,6 @@ def iter_parts(
     verify: bool = True,
     problems: Optional[list] = None,
 ) -> Iterator[PartSample]:
-    """Yield intact parts, ordered by started_utc then part_id.
-
-    since is inclusive and until exclusive, compared with the UTC date of
-    started_utc. Parts that fail a check are skipped and described in
-    ``problems`` (a list you pass in). Raises FileNotFoundError when the store
-    folder is missing and ValueError for a malformed date.
-    """
     since_day = _parse_day(since, "since")
     until_day = _parse_day(until, "until")
     store_dir = _resolve_store(store_root)
@@ -363,7 +322,6 @@ def iter_parts(
         if not _passes(doc, part_number, since_day, until_day, full_station_only):
             continue
         if (part_dir / PURGED_FILE).is_file():
-            # Pictures were deleted on purpose after a verified training run (trainer purge).
             _note(problems, part_dir, "skipped: pictures purged after training (see purged.json)")
             continue
         sample, reasons = _make_sample(part_dir, doc, verify)
@@ -383,7 +341,6 @@ def list_part_numbers(
     until: Optional[str] = None,
     full_station_only: bool = True,
 ) -> dict:
-    """Map part_number -> number of parts. Reads part.json only; no image checks."""
     since_day = _parse_day(since, "since")
     until_day = _parse_day(until, "until")
     store_dir = _resolve_store(store_root)
@@ -397,14 +354,10 @@ def list_part_numbers(
     return dict(sorted(counts.items()))
 
 
-# ----------------------------------------------------------------- labels
 def classify(sample: PartSample, good_policy: str = "strict") -> str:
-    """Return 'good', 'bad' or 'excluded' for one part under the label policy."""
     policy = _check_policy(good_policy)
-    if sample.disposition == "collected":  # station.storage.COLLECTED; this module imports nothing from station
+    if sample.disposition == "collected":
         label = sample.operator_label
-        # Only an admin-approved label trains. A label with no status key is official (older parts).
-        # 'proposed' and 'rejected' labels, and any other status, are excluded.
         if not isinstance(label, dict) or label.get("status", "official") != "official":
             return "excluded"
         verdict = label.get("verdict")
@@ -442,7 +395,6 @@ class Dataset:
         problems: Optional[list] = None,
         exclude_session_ids: Iterable[str] = (),
     ) -> "Dataset":
-        """Label already-read samples. Sessions listed in exclude_session_ids go to excluded."""
         policy = _check_policy(good_policy)
         dataset = cls(part_number=part_number, good_policy=policy, problems=list(problems or []))
         skip = set(exclude_session_ids)
@@ -467,7 +419,6 @@ class Dataset:
         verify: bool = True,
         exclude_session_ids: Iterable[str] = (),
     ) -> "Dataset":
-        """Read one part number from the store and label its parts."""
         if not isinstance(part_number, str) or not part_number:
             raise ValueError("part_number is required")
         policy = _check_policy(good_policy)
@@ -490,7 +441,6 @@ class Dataset:
         )
 
     def counts(self) -> dict:
-        """(camera_id, side, 'good'|'bad') -> number of images."""
         tally: Counter = Counter()
         for label, group in (("good", self.good), ("bad", self.bad)):
             for sample in group:
@@ -499,7 +449,6 @@ class Dataset:
         return dict(sorted(tally.items()))
 
     def summary(self) -> dict:
-        """Plain, JSON-ready overview. first_utc/last_utc cover good, bad and excluded parts."""
         everything = self.good + self.bad + self.excluded
         if everything:
             times = [_parse_utc(s.started_utc) for s in everything]
@@ -520,7 +469,6 @@ class Dataset:
         }
 
 
-# ------------------------------------------------------------------ split
 def _check_fraction(value) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 0.9:
         raise ValueError(f"holdout_fraction must be a number in [0, 0.9], got {value!r}")
@@ -528,14 +476,6 @@ def _check_fraction(value) -> float:
 
 
 def split_holdout(samples: Iterable[PartSample], holdout_fraction: float, seed) -> tuple[list, list]:
-    """Split parts into (train, holdout) by whole calendar day (UTC).
-
-    Days are shuffled with random.Random(seed) and added to the holdout while
-    that brings its part count closer to holdout_fraction * n. At least one
-    day stays in train. With fewer than two days, whole parts are used
-    instead, so no part's images are ever split. Both lists are in
-    started_utc, part_id order.
-    """
     fraction = _check_fraction(holdout_fraction)
     ordered = sorted(samples, key=_sort_key)
     if fraction == 0 or not ordered:

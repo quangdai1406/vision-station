@@ -1,4 +1,3 @@
-"""tools/liveview.py: page, stream routing and the /snap host check, with fake cameras (no opencv)."""
 import http.client
 import threading
 import unittest

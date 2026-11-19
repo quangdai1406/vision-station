@@ -1,4 +1,3 @@
-"""Unit tests for station.auth: hashing, role policy, user store, sessions."""
 import json
 import os
 import tempfile
@@ -14,7 +13,6 @@ from station.auth import (
     verify_password,
 )
 
-# Throwaway test credentials only.
 PW = "test-only-pass-1"
 
 
@@ -73,10 +71,10 @@ class HashTests(unittest.TestCase):
             "bcrypt$16384$8$1$00$00",
             "scrypt$abc$8$1$00$00",
             "scrypt$16384$8$1$$" + good_digest,
-            "scrypt$3$8$1$" + salt + "$" + good_digest,  # n not a power of two
-            "scrypt$16384$8$1$zz$" + good_digest,  # not hex
-            "scrypt$16384$8$1$" + salt,  # too few fields
-            "scrypt$16384$8$1$" + salt + "$" + "00" * 4,  # digest too short
+            "scrypt$3$8$1$" + salt + "$" + good_digest,
+            "scrypt$16384$8$1$zz$" + good_digest,
+            "scrypt$16384$8$1$" + salt,
+            "scrypt$16384$8$1$" + salt + "$" + "00" * 4,
         ]
         for stored in cases:
             with self.subTest(stored=stored):
@@ -115,8 +113,8 @@ class RolePolicyTests(unittest.TestCase):
         self.assertEqual(set(ACTIONS),
                          {"press", "ack", "resolve", "override", "clear_fault", "select_part",
                           "label_propose", "label_approve", "scan", "propose_defect"})
-        self.assertFalse(role_allows("operator", "scan"))  # Taking data is not for operators
-        self.assertFalse(role_allows("operator", "label"))  # the old single 'label' action is gone
+        self.assertFalse(role_allows("operator", "scan"))
+        self.assertFalse(role_allows("operator", "label"))
 
 
 class UserStoreTests(unittest.TestCase):
@@ -165,15 +163,15 @@ class SessionManagerTests(unittest.TestCase):
         self.assertIsNone(sm.get("no-such-token"))
         self.assertIsNone(sm.get(""))
         self.assertIsNone(sm.get(None))
-        sm.destroy("no-such-token")  # no error
+        sm.destroy("no-such-token")
 
     def test_expires_after_timeout(self):
         clock = FakeClock(0.0)
         sm = SessionManager(60, clock=clock)
         token = sm.create("alice", "operator")
         clock.t = 59.9
-        self.assertIsNotNone(sm.get(token))  # still valid, refreshed at 59.9
-        clock.t = 59.9 + 60.0  # 60s of inactivity since the refresh
+        self.assertIsNotNone(sm.get(token))
+        clock.t = 59.9 + 60.0
         self.assertIsNone(sm.get(token))
 
     def test_get_refreshes_timer(self):
@@ -181,14 +179,14 @@ class SessionManagerTests(unittest.TestCase):
         sm = SessionManager(60, clock=clock)
         token = sm.create("alice", "operator")
         clock.t = 50.0
-        self.assertEqual(sm.get(token), ("alice", "operator"))  # refresh at 50
-        clock.t = 100.0  # 50s since the refresh, but 100s since creation
-        self.assertEqual(sm.get(token), ("alice", "operator"))  # refresh at 100
+        self.assertEqual(sm.get(token), ("alice", "operator"))
+        clock.t = 100.0
+        self.assertEqual(sm.get(token), ("alice", "operator"))
         clock.t = 159.0
         self.assertEqual(sm.get(token), ("alice", "operator"))
-        clock.t = 220.0  # 61s of inactivity
+        clock.t = 220.0
         self.assertIsNone(sm.get(token))
-        self.assertIsNone(sm.get(token))  # stays gone
+        self.assertIsNone(sm.get(token))
 
     def test_invalid_timeout(self):
         with self.assertRaises(ValueError):

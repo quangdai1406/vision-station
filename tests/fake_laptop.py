@@ -1,10 +1,3 @@
-"""A local stand-in for the laptop inference service (inference_service/server.py), for tests.
-
-It binds 127.0.0.1 on a free port and answers the service's endpoints: GET /v1/health (no
-token), GET /v1/status and GET /v1/models/<part> (bearer token), and POST /v1/predict (token).
-Tests change its attributes to set the reply: the models it lists, the status, a raw body, a
-delay. Standard library only.
-"""
 from __future__ import annotations
 
 import http.server
@@ -22,7 +15,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     server_version = "FakeLaptop"
     sys_version = ""
 
-    def log_message(self, *args: Any) -> None:  # keep test output quiet
+    def log_message(self, *args: Any) -> None:
         pass
 
     def _send(self, status: int, body: bytes) -> None:
@@ -33,7 +26,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
-            pass  # the client gave up (a timeout test); nothing to answer
+            pass
 
     def _authorised(self) -> bool:
         fake = self.server.fake  # type: ignore[attr-defined]
@@ -49,7 +42,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if fake.delay:
             time.sleep(fake.delay)
         path = self.path.split("?")[0]
-        if path == "/v1/health":  # unauthenticated, as in the real service
+        if path == "/v1/health":
             if fake.health_raw is not None:
                 self._send(fake.health_status, fake.health_raw)
                 return
@@ -118,22 +111,20 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 
 class FakeLaptop:
-    """Start with FakeLaptop(); read .base for the URL; close() when done."""
-
     def __init__(self, models: Optional[dict] = None, token: str = FAKE_LAPTOP_TOKEN) -> None:
         self.token = token
         self.models: dict[str, str] = dict(models or {})
         self.health_status = 200
         self.health_raw: Optional[bytes] = None
         self.model_status = 200
-        self.model_raw: Optional[bytes] = None  # raw reply for GET /v1/models/<part>
+        self.model_raw: Optional[bytes] = None
         self.predict_status = 200
         self.predict_error = "GPU out of memory while scoring"
         self.predict_raw: Optional[bytes] = None
         self.predict_score = 0.0
         self.predict_fields: dict = {}
         self.predict_drop: list = []
-        self.delay = 0.0  # seconds to wait before answering any request
+        self.delay = 0.0
         self.requests: list = []
         self.last_predict_body: bytes = b""
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)

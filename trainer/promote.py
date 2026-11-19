@@ -1,13 +1,3 @@
-"""Human-approved promotion and rollback of part models: ``python3 -m trainer promote|rollback|versions``.
-
-Promotion is a human decision. The CLI needs a named person (--by) and a reason
-(--reason), refuses names that look like automation, verifies the candidate's
-sha256 before anything changes, prints what is being approved and what is
-approved now, and asks for the word ``yes`` unless --yes is given. The actual
-switch is ModelStore.approve / ModelStore.rollback, which write the approval log.
-
-Exit codes: 0 done, 1 refused or error (nothing changed).
-"""
 from __future__ import annotations
 
 import argparse
@@ -24,7 +14,7 @@ CONFIRM_WORD = "yes"
 
 
 class Refusal(Exception):
-    """The command must stop without changing anything. The message is shown to the operator."""
+    pass
 
 
 def utc_now_iso() -> str:

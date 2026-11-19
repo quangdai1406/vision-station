@@ -1,16 +1,3 @@
-"""MES session client for the station: redeem a ticket, validate and end a session.
-
-Standard library only. The MES bearer token goes only in the Authorization header. It is
-never put in an error message, a repr or a log. Redirects are not followed, so the token
-never reaches another host. Proxies are bypassed, as in station/parts.py.
-
-API (machine routes on the MES):
-  POST /api/machine/sessions/redeem      {ticket}  -> 200 {sessionId, username, roles, expiresAt}
-                                                      409 when the ticket was already used
-  GET  /api/machine/sessions/:id                   -> 200 {active, username, roles, expiresAt}
-                                                      401 when the session is not valid
-  POST /api/machine/sessions/:id/end               -> 200 (404 when already gone)
-"""
 from __future__ import annotations
 
 import http.client
@@ -29,11 +16,9 @@ _MAX_TICKET_CHARS = 256
 
 
 class MesSessionError(StationError):
-    """The MES could not redeem, validate or end a session. The text never holds the token or a ticket."""
-
     def __init__(self, message: str, status: int = 0):
         super().__init__(message)
-        self.status = status  # HTTP status from the MES; 0 when no response was received
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -45,8 +30,6 @@ class SessionInfo:
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Do not follow redirects: the token must not be sent to another host."""
-
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
         return None
 
@@ -77,8 +60,6 @@ def _info_from(data: Any, session_id: Optional[str] = None) -> SessionInfo:
 
 
 class MesSessionClient:
-    """Redeems inspector tickets and manages MES sessions for this station."""
-
     def __init__(self, base_url: str, token: str, *, timeout_s: float = 10.0) -> None:
         if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
             raise MesSessionError("MES base URL must start with http:// or https://")
@@ -95,7 +76,6 @@ class MesSessionClient:
         return f"MesSessionClient(base_url={self._base!r})"
 
     def redeem(self, ticket: str) -> SessionInfo:
-        """Exchange a one-time ticket for a session. A second use raises with status 409."""
         if not isinstance(ticket, str) or not ticket or len(ticket) > _MAX_TICKET_CHARS:
             raise ValueError("ticket must be a non-empty string")
         body = json.dumps({"ticket": ticket}).encode("utf-8")
@@ -106,7 +86,6 @@ class MesSessionClient:
         return _info_from(data)
 
     def validate(self, session_id: str) -> Optional[SessionInfo]:
-        """The session if the MES still holds it active, otherwise None (ended or unknown)."""
         sid = self._checked_id(session_id)
         status, data = self._call("GET", f"/api/machine/sessions/{sid}", what="session check")
         if status in (401, 404):
@@ -120,14 +99,11 @@ class MesSessionClient:
         return _info_from(data, session_id=sid)
 
     def end(self, session_id: str) -> None:
-        """End the MES session. An already-gone session (404) is not an error."""
         sid = self._checked_id(session_id)
         status, _ = self._call("POST", f"/api/machine/sessions/{sid}/end", what="session end")
         if status in (200, 204, 404):
             return
         raise MesSessionError(self._refusal("session end", status), status=status)
-
-    # ----- internals -----------------------------------------------------
 
     @staticmethod
     def _checked_id(session_id: str) -> str:

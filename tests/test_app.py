@@ -1,4 +1,3 @@
-"""Unit tests for station/app.py, station/users_cli.py and station/__main__.py."""
 from __future__ import annotations
 
 import copy
@@ -56,7 +55,6 @@ except ImportError:
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 TOKEN_ENV = "VISION_TEST_APP_TOKEN"
-# A gap between the TOP and BOTTOM press that is longer than the 2.0 s default min_flip_s.
 PAST_MIN_FLIP = 2.5
 REMOTE_ENV = "VISION_TEST_LAPTOP_TOKEN"
 
@@ -144,7 +142,7 @@ class ConfigTests(TmpCase):
                 validate_config(data)
 
     def test_min_flip_s_defaults_to_2_and_is_validated(self) -> None:
-        data = base_config(self.tmp)  # no min_flip_s key: an existing config keeps working
+        data = base_config(self.tmp)
         self.assertEqual(validate_config(data)["min_flip_s"], 2.0)
         data["min_flip_s"] = 0
         self.assertEqual(validate_config(data)["min_flip_s"], 0.0)
@@ -221,9 +219,9 @@ class ConfigTests(TmpCase):
         with self.assertRaisesRegex(ConfigError, "placeholders"):
             validate_config(example)
         text = (REPO / "config.example.json").read_text(encoding="utf-8")
-        self.assertNotIn("token\":", text.lower())  # no token value anywhere in the example
+        self.assertNotIn("token\":", text.lower())
         self.assertTrue(example["mes"]["token_env"].startswith("["))
-        self.assertEqual(example["min_flip_s"], 2.0)  # an engineering default, not a placeholder
+        self.assertEqual(example["min_flip_s"], 2.0)
 
 
 class PartIdTests(TmpCase):
@@ -245,7 +243,7 @@ class PartIdTests(TmpCase):
         factory = _PartIdFactory(self._store(), lambda: next(times))
         ids = [factory() for _ in range(4)]
         self.assertEqual(ids[2], "P202610230830130001")
-        self.assertEqual(ids[3], "P202610230830120003")  # clock went back: still no repeat
+        self.assertEqual(ids[3], "P202610230830120003")
         self.assertEqual(len(set(ids)), 4)
 
     def test_id_already_on_disk_is_skipped(self) -> None:
@@ -277,7 +275,7 @@ class BuildTests(TmpCase):
         clock.now += PAST_MIN_FLIP
         self.assertTrue(app.session.press())
         self.assertEqual(app.session.counters["total"], 1)
-        self.assertEqual(app.outbox.pending_count(), 1)  # queued for later, not sent
+        self.assertEqual(app.outbox.pending_count(), 1)
 
     def test_token_from_environment_enables_mes(self) -> None:
         os.environ[TOKEN_ENV] = "not-a-real-token-for-tests"
@@ -301,8 +299,6 @@ class BuildTests(TmpCase):
                           model=MarkerModel("test-1"), outputs=RecordingOutputs())
 
     def test_enqueue_failure_is_logged_and_does_not_stop_the_session(self) -> None:
-        # The defect class has no criterion mapping and there is no default, so
-        # build_request raises MappingError when the part is posted.
         cfg = base_config(self.tmp)
         cfg["mes"]["class_to_criterion"] = {}
         marker = b"SCORE:0.92;CLASS:dent;BOX:1,2,3,4"
@@ -319,7 +315,7 @@ class BuildTests(TmpCase):
         clock.now += PAST_MIN_FLIP
         app.session.press()
         self.assertEqual(app.session.snapshot()["state"], State.VERDICT.value)
-        app.session.ack_alarm()  # must not raise even though the MES mapping fails
+        app.session.ack_alarm()
 
         self.assertEqual(app.session.counters, {"total": 1, "good": 0, "bad": 1})
         self.assertEqual(app.outbox.pending_count(), 0)
@@ -346,7 +342,6 @@ class BuildTests(TmpCase):
         self.assertEqual(app2.outbox.pending_count(), 1)
         self.assertEqual(app2.session.snapshot()["state"], State.IDLE.value)
 
-        # The next part gets a new id and session, and nothing is lost.
         clock.now += PAST_MIN_FLIP
         app2.session.press()
         clock.now += PAST_MIN_FLIP
@@ -365,11 +360,11 @@ class BuildTests(TmpCase):
                 self.assertIn(b"Vision Station", resp.read())
         finally:
             app.stop()
-        app.stop()  # second stop is a no-op
+        app.stop()
         self.assertFalse(app._ui_thread.is_alive())
 
     def test_sync_thread_drains_on_its_interval(self) -> None:
-        cfg = base_config(self.tmp)  # MES at 127.0.0.1:9 refuses connections: a retryable failure
+        cfg = base_config(self.tmp)
         cfg["mes"]["sync_interval_s"] = 0.05
         os.environ[TOKEN_ENV] = "not-a-real-token-for-tests"
         clock = FakeClock()
@@ -397,19 +392,18 @@ class BuildTests(TmpCase):
         from station.__main__ import build_demo_station
 
         cfg = base_config(self.tmp)
-        cfg["min_flip_s"] = 0.0  # real clock here: a 2 s flip gap would make the test wait 2 s
+        cfg["min_flip_s"] = 0.0
         os.environ[TOKEN_ENV] = "not-a-real-token-for-tests"
         app = build_demo_station(cfg)
         self.addCleanup(app.stop)
         self.assertFalse(app.mes_enabled)
-        app.session.press()  # demo uses the real monotonic clock, so wait out the 0.3 s debounce
+        app.session.press()
         import time as _t
         _t.sleep(0.35)
         app.session.press()
         self.assertEqual(app.session.counters["total"], 1)
         self.assertEqual(app.outbox.pending_count(), 0)
 
-    # helpers
     @staticmethod
     def _events(store: Store, kind: str) -> list[dict]:
         import sqlite3
@@ -465,7 +459,7 @@ class CameraConfigTests(TmpCase):
             data = base_config(self.tmp)
             data["cameras"] = {"kind": "fake", "camera_count": count}
             self.assertEqual(validate_config(data)["cameras"]["camera_ids"], ids)
-        data = base_config(self.tmp)  # default is the full 4-camera station
+        data = base_config(self.tmp)
         self.assertEqual(validate_config(data)["cameras"]["camera_ids"], ["C1", "C2", "C3", "C4"])
 
     def test_fake_camera_count_out_of_range_and_opencv_count_are_rejected(self) -> None:
@@ -486,7 +480,7 @@ class CameraConfigTests(TmpCase):
             validate_config(data)
 
     def test_validated_config_validates_again_to_the_same_value(self) -> None:
-        data = base_config(self.tmp)  # StationApp validates an already validated config
+        data = base_config(self.tmp)
         data["cameras"] = {"kind": "fake", "camera_count": 1}
         data["mes"]["allow_partial_cameras"] = True
         once = validate_config(data)
@@ -501,8 +495,6 @@ class CameraConfigTests(TmpCase):
 
 
 class CaptureModeConfigTests(TmpCase):
-    """cameras.capture_mode and cameras.sequential_keep_open: validation and the kwargs passed to OpenCvCameraSet."""
-
     def _opencv(self, devices=(0, 1, 2, 3), **cams) -> dict:
         data = base_config(self.tmp)
         data["cameras"] = {"kind": "opencv", "devices": list(devices), **cams}
@@ -596,8 +588,6 @@ class KeepOpenConfigTests(TmpCase):
 
 
 class RecordingCameraFactory:
-    """Stands in for OpenCvCameraSet: records the devices and the capture-mode kwargs it is built with."""
-
     CAPTURE_KWARGS = ("capture_mode", "sequential_keep_open")
 
     def __init__(self) -> None:
@@ -657,7 +647,7 @@ class CaptureModeBuildTests(TmpCase):
         self.addCleanup(app.stop)
         self.assertEqual(factory.calls[0][1]["capture_mode"], "sequential")
         self.assertTrue(app.partial)
-        self.assertFalse(app.mes_enabled)  # mes.allow_partial_cameras is false
+        self.assertFalse(app.mes_enabled)
         self.assertEqual(app.outbox.pending_count(), 0)
 
 
@@ -674,7 +664,7 @@ class PartialStationTests(TmpCase):
         return cfg
 
     def test_one_camera_part_is_stored_with_two_images_and_never_queued(self) -> None:
-        os.environ[TOKEN_ENV] = "not-a-real-token-for-tests"  # a token is present, MES still off
+        os.environ[TOKEN_ENV] = "not-a-real-token-for-tests"
         clock = FakeClock()
         app = build_station(self._one_camera_config(), model=MarkerModel("test-1"),
                             outputs=RecordingOutputs(), clock=clock)
@@ -683,9 +673,9 @@ class PartialStationTests(TmpCase):
         self.assertFalse(app.mes_enabled)
         self.assertEqual(app.session.snapshot()["camera_ids"], ["C1"])
 
-        self.assertTrue(app.session.press())  # TOP
+        self.assertTrue(app.session.press())
         clock.now += PAST_MIN_FLIP
-        self.assertTrue(app.session.press())  # BOTTOM: fuse and save
+        self.assertTrue(app.session.press())
         self.assertEqual(app.session.counters["total"], 1)
 
         part = app.store.recent_parts(1)[0]
@@ -723,7 +713,7 @@ class PartialStationTests(TmpCase):
         self.addCleanup(app.stop)
         self.assertFalse(app.mes_enabled)
         kinds = BuildTests._event_kinds(app.store)
-        self.assertEqual(kinds.count("mes_disabled"), 2)  # partial reason and no-token reason
+        self.assertEqual(kinds.count("mes_disabled"), 2)
 
     def test_full_station_is_not_partial(self) -> None:
         os.environ[TOKEN_ENV] = "not-a-real-token-for-tests"
@@ -757,7 +747,7 @@ class GoldenModelConfigTests(TmpCase):
         from station.app import StationApp
         from station.golden import GoldenBuilder
 
-        def decode(frame: Frame):  # the bytes are one grey value: a flat 8x8 image
+        def decode(frame: Frame):
             return np.full((8, 8), float(frame.data[0]))
 
         builder = GoldenBuilder(decode)
@@ -774,7 +764,7 @@ class GoldenModelConfigTests(TmpCase):
         with mock.patch("station.golden.cv2_decoder", return_value=decode):
             model = StationApp._make_model(validate_config(cfg))
 
-        self.assertEqual(model.version, "golden-poc-1")  # the config version, not the file's
+        self.assertEqual(model.version, "golden-poc-1")
         ts = "2026-10-23T08:30:12Z"
         good = model.predict(Frame("C1", Side.TOP, 0, ts, bytes([100])))
         bad = model.predict(Frame("C1", Side.TOP, 0, ts, bytes([200])))
@@ -805,7 +795,7 @@ class PocConfigTests(TmpCase):
 
         cfg = load_config(self.write_config(filled, "poc.json"))
         self.assertEqual(cfg["cameras"]["camera_ids"], ["C1"])
-        self.assertFalse(is_full_station(cfg["cameras"]["camera_ids"]))  # partial
+        self.assertFalse(is_full_station(cfg["cameras"]["camera_ids"]))
         self.assertFalse(cfg["mes"]["allow_partial_cameras"])
         self.assertEqual(cfg["model"]["kind"], "golden")
         self.assertTrue(cfg["model"]["path"].endswith("golden.npz"))
@@ -831,8 +821,8 @@ class MinFlipTests(TmpCase):
 
     def test_quick_second_press_is_ignored_with_the_default(self) -> None:
         app, clock = self._app()
-        self.assertTrue(app.session.press())  # TOP
-        clock.now += 0.5  # past the 0.3 s debounce, but inside the 2.0 s default
+        self.assertTrue(app.session.press())
+        clock.now += 0.5
         self.assertFalse(app.session.press())
         self.assertEqual(app.session.snapshot()["state"], State.WAIT_FLIP.value)
         self.assertEqual(app.session.counters["total"], 0)
@@ -864,7 +854,7 @@ class PreviewWrapperTests(unittest.TestCase):
         wrapped = _LockedSession(session, lock)
         self.assertEqual(wrapped.preview("C1"), b"jpeg-bytes")
         self.assertEqual(session.calls, ["C1"])
-        self.assertTrue(lock.acquire(blocking=False))  # not left held
+        self.assertTrue(lock.acquire(blocking=False))
         lock.release()
 
     def test_preview_returns_none_at_once_while_a_press_holds_the_lock(self) -> None:
@@ -884,7 +874,7 @@ class PreviewWrapperTests(unittest.TestCase):
         try:
             self.assertTrue(holding.wait(10))
             self.assertIsNone(wrapped.preview("C1"))
-            self.assertEqual(session.calls, [])  # the session was never touched
+            self.assertEqual(session.calls, [])
         finally:
             release.set()
             worker.join(10)
@@ -894,13 +884,11 @@ class PreviewWrapperTests(unittest.TestCase):
         lock = threading.RLock()
         wrapped = _LockedSession(self.FakeSession(error=StationError("camera gone")), lock)
         self.assertIsNone(wrapped.preview("C2"))
-        self.assertTrue(lock.acquire(blocking=False))  # released despite the error
+        self.assertTrue(lock.acquire(blocking=False))
         lock.release()
 
 
 class ScriptedCameras(FakeCameraSet):
-    """A FakeCameraSet whose open() succeeds or raises, like OpenCvCameraSet.open()."""
-
     def __init__(self, open_error=None) -> None:
         super().__init__()
         self._open_error = open_error
@@ -954,7 +942,7 @@ class CameraOpenTests(TmpCase):
         app = self._app(cams)
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
-            app.start()  # must not raise
+            app.start()
         app.stop()
         self.assertEqual(cams.open_calls, 1)
         rows = BuildTests._events(app.store, "camera_open_failed")
@@ -1022,7 +1010,7 @@ class UsersCliTests(TmpCase):
     def test_bad_role_and_mismatched_or_short_passwords_write_nothing(self) -> None:
         path = os.path.join(self.tmp, "users.json")
         code, _, _ = self.run_cli(["add", "carol", "boss", "--users-file", path])
-        self.assertEqual(code, 2)  # argparse rejects the role before any prompt
+        self.assertEqual(code, 2)
         self.assertFalse(os.path.exists(path))
 
         code, _, err = self.run_cli(["add", "carol", "operator", "--users-file", path],
@@ -1147,7 +1135,7 @@ class MesPartsFakeHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *args) -> None:  # keep test output quiet
+    def log_message(self, *args) -> None:
         pass
 
 
@@ -1169,8 +1157,6 @@ FAKE_CRITERIA = {
 
 
 class FakeMes:
-    """A local MES stand-in for the part search, part lookup and criteria routes."""
-
     def __init__(self) -> None:
         self.parts = copy.deepcopy(FAKE_PARTS)
         self.criteria = copy.deepcopy(FAKE_CRITERIA)
@@ -1341,7 +1327,7 @@ class GoldenPartTests(PartTestCase):
 
         from station.golden import GoldenBuilder
 
-        def decode(frame: Frame):  # the bytes are one grey value: a flat 8x8 image
+        def decode(frame: Frame):
             return np.full((8, 8), float(frame.data[0]))
 
         patcher = mock.patch("station.golden.cv2_decoder", return_value=decode)
@@ -1427,7 +1413,7 @@ class GoldenPartTests(PartTestCase):
         self.approve_model("PN-B", self.golden_file)
         app = self.build(clock=self.clock, cameras=self.good_cameras())
         app.select_part("PN-A", "op1")
-        self.assertTrue(app.session.press())  # TOP: the part is now waiting for the flip
+        self.assertTrue(app.session.press())
         with self.assertRaises(InvalidTransition):
             app.select_part("PN-B", "op1")
         self.assertEqual(app.session.part_number, "PN-A")
@@ -1437,7 +1423,7 @@ class GoldenPartTests(PartTestCase):
         self.approve_model("PN-A", self.golden_file)
         app = self.build(clock=self.clock, cameras=self.good_cameras())
         app.select_part("PN-A", "op1")
-        app._part_configs.clear()  # simulate a lost cache: posting must fail, not raise
+        app._part_configs.clear()
         self.assertTrue(app.session.press())
         self.clock.now += PAST_MIN_FLIP
         self.assertTrue(app.session.press())
@@ -1546,8 +1532,6 @@ class EvidenceConfigTests(TmpCase):
 
 
 class RemotePartTests(PartTestCase):
-    """A 'mes' station whose parts are scored on a (local stand-in) laptop service."""
-
     def setUp(self) -> None:
         super().setUp()
         self.laptop = FakeLaptop(models={"PN-A": "2026-11-01-a"})
@@ -1582,7 +1566,7 @@ class RemotePartTests(PartTestCase):
 
     def test_part_the_laptop_does_not_list_is_blocked_with_the_reason(self) -> None:
         app = self.build(self.remote_config(), clock=self.clock)
-        result = app.select_part("PN-B", "op1")  # PN-B has no approved model on the laptop
+        result = app.select_part("PN-B", "op1")
         self.assertFalse(result["can_inspect"])
         self.assertIn("does not list an approved model for part PN-B", result["reason"])
         self.assertFalse(app.session.can_inspect)
@@ -1678,8 +1662,8 @@ class EvidenceSyncTests(TmpCase):
         self.press_good(app, clock)
         self.assertEqual(app.session.counters["good"], 1)
         part_dir = app.store.recent_parts(1)[0]["path"]
-        self.assertTrue(os.path.isfile(os.path.join(part_dir, "part.json")))  # saved first
-        self.assertFalse(os.path.exists(self.queue_path()))  # not queued yet: the press never waits
+        self.assertTrue(os.path.isfile(os.path.join(part_dir, "part.json")))
+        self.assertFalse(os.path.exists(self.queue_path()))
 
         app.evidence_sync_once()
         done = SyncQueue(self.queue_dir).done()
@@ -1690,11 +1674,11 @@ class EvidenceSyncTests(TmpCase):
         from station.evidence_sync import SyncQueue
 
         clock = FakeClock()
-        app = self.build(self.evidence_cfg(dest_exists=False), clock)  # the laptop share is not mounted
+        app = self.build(self.evidence_cfg(dest_exists=False), clock)
         self.press_good(app, clock)
         self.assertEqual(app.session.counters, {"total": 1, "good": 1, "bad": 0})
         self.assertEqual(app.session.state, State.IDLE)
-        app.evidence_sync_once()  # must not raise
+        app.evidence_sync_once()
         pending = SyncQueue(self.queue_dir).pending()
         self.assertEqual(len(pending), 1)
         self.assertIn("evidence_sync", BuildTests._event_kinds(app.store))

@@ -37,7 +37,6 @@ SIDE_NAMES = ("TOP", "BOTTOM")
 
 def make_record(session_id, part_id, part_number, started, final, *,
                 machine=None, override=None, pairs=None, bad=None):
-    """A PartRecord shaped like tests/test_storage.make_record; `bad` marks one hot image."""
     pairs = list(pairs or FULL)
     frames, results = [], []
     for seq, (cam, side) in enumerate(pairs):
@@ -77,16 +76,6 @@ def make_record(session_id, part_id, part_number, started, final, *,
 
 
 class EvidenceFixture(unittest.TestCase):
-    """Six parts, two part numbers, four dates.
-
-    PN-1  P-A1  10-01 08:00  GOOD machine GOOD              -> good (strict and include)
-    PN-1  P-A2  10-01 09:00  BAD  machine BAD               -> bad
-    PN-1  P-A3  10-02 08:00  GOOD machine BAD, overridden   -> excluded (strict), good (include)
-    PN-1  P-A4  10-03 08:00  GOOD machine GOOD, ONE camera  -> partial station
-    PN-1  P-A5  10-05 08:00  GOOD machine GOOD              -> good
-    PN-2  P-B1  10-02 08:00  GOOD machine GOOD              -> good (other part number)
-    """
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self._tmp.name)
@@ -123,7 +112,6 @@ class TestIterParts(EvidenceFixture):
     def test_default_skips_partial_and_orders_by_time_then_part_id(self):
         problems = []
         got = list(iter_parts(self.root, problems=problems))
-        # P-A3 and P-B1 share 10-02 08:00, so part_id breaks the tie.
         self.assertEqual(self.ids(got), ["P-A1", "P-A2", "P-A3", "P-B1", "P-A5"])
         self.assertEqual(problems, [])
         for sample in got:
@@ -351,7 +339,7 @@ class TestSplit(unittest.TestCase):
             for s in group:
                 sides.setdefault(s.started_utc[:10], set()).add(side_name)
         self.assertTrue(all(len(v) == 1 for v in sides.values()), sides)
-        self.assertEqual(len(holdout), 6)  # three whole days of two parts
+        self.assertEqual(len(holdout), 6)
 
     def test_fraction_zero_keeps_everything_in_train(self):
         samples = six_days()
@@ -438,8 +426,6 @@ class TestInventoryCli(EvidenceFixture):
 
 
 class CollectedLabelDatasetTests(unittest.TestCase):
-    """Collected parts (final REVIEW) are labelled by the operator; other parts keep the strict rule."""
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self._tmp.name)
@@ -450,7 +436,7 @@ class CollectedLabelDatasetTests(unittest.TestCase):
             rec = make_record(session, part, "PN-1", when, Verdict.REVIEW, machine=Verdict.REVIEW)
             return dataclasses.replace(rec, disposition=COLLECTED, operator_label=label)
 
-        store.save_part(collected("S-c0", "P-c0"))  # unlabelled
+        store.save_part(collected("S-c0", "P-c0"))
         store.save_part(collected("S-c1", "P-c1", OperatorLabel(Verdict.GOOD, "qa-1", when)))
         store.save_part(collected("S-c2", "P-c2", OperatorLabel(
             Verdict.BAD, "qa-1", when, criterion_id="CR-1")))
@@ -492,7 +478,6 @@ class CollectedLabelDatasetTests(unittest.TestCase):
         self.assertEqual(classify(parts["P-g1"]), "good")
 
     def test_only_official_labels_train(self):
-        """Proposed and rejected labels stay out; a label with no status key is official."""
         for session, part, status in (("S-p1", "P-p1", "proposed"), ("S-r1", "P-r1", "rejected")):
             store = Store(self.root)
             label = {"verdict": "BAD", "criterion_id": "CR-1", "labelled_by": "op-1",
@@ -509,7 +494,7 @@ class CollectedLabelDatasetTests(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertEqual(classify(parts["P-p1"]), "excluded")
         self.assertEqual(classify(parts["P-r1"]), "excluded")
-        self.assertEqual(classify(self.samples["P-c1"]), "good")  # no status key -> official
+        self.assertEqual(classify(self.samples["P-c1"]), "good")
 
     def test_unknown_status_is_a_problem(self):
         path = self.part_json("P-c1")

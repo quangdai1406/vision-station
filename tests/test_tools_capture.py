@@ -1,4 +1,3 @@
-"""Tests for tools/capture.py. A fake cv2 module stands in for OpenCV."""
 from __future__ import annotations
 
 import contextlib
@@ -35,8 +34,6 @@ SETTLE_KEYS = {"checked", "settled", "seconds", "frames_used", "last_means", "to
 
 
 class FakeClock:
-    """Time that moves only when sleep() is called, so the settle loop costs no real time."""
-
     def __init__(self) -> None:
         self.t = 0.0
 
@@ -48,17 +45,6 @@ class FakeClock:
 
 
 class FakeCapture:
-    """One fake camera.
-
-    Profile keys: ignore (props whose set is dropped), reject ({prop: values} refused
-    without change), raise_set (props whose set raises), fail_open, fail_grab_at,
-    fail_retrieve_at, image_follows_exposure (brightness follows the exposure prop;
-    otherwise the picture ignores exposure while read-back still echoes the value),
-    black (every frame is all zeros), start_dark ((frames, scale): the first retrieved frames
-    are scaled, then the picture is steady), flicker (every other frame is 20 % darker, so the
-    brightness never settles).
-    """
-
     def __init__(self, cv2: "FakeCv2", index: int, api: object) -> None:
         self._cv2 = cv2
         self.index = index
@@ -106,7 +92,7 @@ class FakeCapture:
             mjpg = self.props[self._cv2.CAP_PROP_FOURCC] == float(self._cv2.MJPG)
             limit = 640 if prop == self._cv2.CAP_PROP_FRAME_WIDTH else 480
             if not mjpg and value > limit:
-                value = limit  # without MJPG this fake camera only does VGA
+                value = limit
         self.props[prop] = float(value)
         return True
 
@@ -128,8 +114,6 @@ class FakeCapture:
         w = int(self.props[self._cv2.CAP_PROP_FRAME_WIDTH])
         h = int(self.props[self._cv2.CAP_PROP_FRAME_HEIGHT])
         ys, xs = np.mgrid[0:h, 0:w]
-        # A stationary scene: the picture does not change from frame to frame, so any
-        # change in brightness in these tests comes from the exposure setting only.
         b = (xs * 3 + ys + self.index * 29) % 256
         g = (xs + ys * 2 + self.index * 5) % 256
         r = (xs * ys + self.index * 7) % 256
@@ -139,9 +123,9 @@ class FakeCapture:
             img = np.clip(img.astype(np.int64) + shift, 0, 255)
         scale = 1.0
         if self.start_dark is not None and n < self.start_dark[0]:
-            scale *= self.start_dark[1]  # dark first frames, then a steady picture
+            scale *= self.start_dark[1]
         if self.flicker and n % 2 == 1:
-            scale *= 0.8  # every other frame 20 % darker: never settles
+            scale *= 0.8
         if scale != 1.0:
             img = np.clip(np.round(img.astype(np.float64) * scale), 0, 255)
         if self.black:
@@ -172,7 +156,7 @@ class FakeCv2:
     def __init__(self, profiles: dict | None = None) -> None:
         self.profiles = profiles or {}
         self.set_log: list[tuple[int, int, float]] = []
-        self.events: list[tuple] = []  # ("grab", dev) / ("retrieve", dev) / ("input",)
+        self.events: list[tuple] = []
         self.released: list[int] = []
         self.created: list[FakeCapture] = []
         self.imwrites: list[str] = []
@@ -220,8 +204,6 @@ class CaptureTests(unittest.TestCase):
             backend="default",
             cv2_module=cv2,
             input_fn=lambda prompt="": "",
-            # Brightness settle is off here, so the exact event sequences in the older tests
-            # stay exact; the settle tests pass settle_max_s explicitly.
             settle_max_s=0.0,
             clock=self.clock.now,
             sleep=self.clock.sleep,
@@ -418,14 +400,13 @@ class CaptureTests(unittest.TestCase):
 
     def test_device_failure_keeps_partial_data_and_notes_aborted(self) -> None:
         cv2 = FakeCv2(profiles={1: {"fail_grab_at": 2}})
-        # flush_frames=0 so that grab call 2 is round 2's real grab, as the test intends.
         summary, _ = self.run_capture(cv2=cv2, devices=[0, 1], count=5, flush_frames=0)
         self.assertIsNotNone(summary["aborted"])
         self.assertIn("device 1", summary["aborted"])
         doc = self.load_session()
         self.assert_schema(doc)
         self.assertIn("aborted", doc["notes"]["free"])
-        self.assertEqual(len(doc["frames"]), 4)  # two complete rounds on two devices
+        self.assertEqual(len(doc["frames"]), 4)
         for dev in (0, 1):
             with np.load(self.session_dir() / f"frames_dev{dev}.npz") as z:
                 self.assertEqual(z["gray"].shape, (2, 48, 64))
@@ -517,22 +498,18 @@ class CaptureTests(unittest.TestCase):
             {"index", "device", "stamp", "mean", "laplacian_var"},
         )
 
-    # --- stale frames: flushing ------------------------------------------------
-
     def test_flush_grabs_happen_before_each_placement_capture(self) -> None:
         cv2 = FakeCv2()
         self.run_capture(cv2=cv2, mode="placement", count=2, no_prompt=False,
                          input_fn=self.input_logger(cv2), flush_frames=3)
         expected = []
         for _ in range(2):
-            # Enter, then 3 discarded grabs and the real grab, then retrieve.
             expected += [("input",)] + [("grab", 0)] * 4 + [("retrieve", 0)]
         self.assertEqual(cv2.events, expected)
 
     def test_flush_grabs_happen_before_each_stationary_round_on_every_device(self) -> None:
         cv2 = FakeCv2()
         self.run_capture(cv2=cv2, devices=[0, 1], count=2, flush_frames=2)
-        # Per round: 2 discarded grabs per device, then the real grab per device, then retrieves.
         one_round = [("grab", 0), ("grab", 0), ("grab", 1), ("grab", 1),
                      ("grab", 0), ("grab", 1), ("retrieve", 0), ("retrieve", 1)]
         self.assertEqual(cv2.events, one_round * 2)
@@ -561,8 +538,6 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(cv2.events, [("grab", 0), ("retrieve", 0)] * 2)
 
-    # --- buffer size -----------------------------------------------------------
-
     def test_buffersize_is_set_to_one_and_read_back_recorded(self) -> None:
         cv2 = FakeCv2()
         self.run_capture(cv2=cv2, count=1)
@@ -587,8 +562,6 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(cam["buffersize_readback"], 4.0)
         self.assertTrue(any("buffer size" in w for w in cam["warnings"]))
 
-    # --- exposure response -----------------------------------------------------
-
     def test_exposure_that_changes_the_picture_is_responding(self) -> None:
         cv2 = FakeCv2(profiles={0: {"image_follows_exposure": True}})
         self.run_capture(cv2=cv2, count=1, exposure=-4.0)
@@ -596,11 +569,9 @@ class CaptureTests(unittest.TestCase):
         self.assertIs(cam["applied_ok"]["exposure_responds"], True)
         self.assertGreater(cam["exposure_response"]["delta"], capture_mod.RESPONSE_EPS_GRAY)
         self.assertFalse(any("exposure" in w for w in cam["warnings"]))
-        # The requested exposure is restored after the check.
         self.assertEqual(cv2.created[0].props[FakeCv2.CAP_PROP_EXPOSURE], -4.0)
 
     def test_exposure_that_does_not_change_the_picture_is_flagged(self) -> None:
-        # Default fake: read-back echoes the set value, but the picture ignores it.
         summary, _ = self.run_capture(count=1, exposure=-4.0)
         cam = self.load_session()["cameras"]["0"]
         self.assertEqual(cam["readback"]["exposure"], -4.0)
@@ -617,7 +588,6 @@ class CaptureTests(unittest.TestCase):
         self.assertIsNone(cam["applied_ok"]["exposure_responds"])
         self.assertIsNone(cam["exposure_response"])
         self.assertFalse(any("exposure" in w for w in cam["warnings"]))
-        # No extra grabs: only the flush and the real grab for the one frame.
         self.assertEqual(cv2.events, [("grab", 0)] * 6 + [("retrieve", 0)])
 
     def test_response_check_skipped_by_flag_is_noted(self) -> None:
@@ -646,7 +616,6 @@ class CaptureTests(unittest.TestCase):
         self.assertTrue(detail["restore_ok"])
         self.assertEqual(detail["restore_readback"], -4.0)
         self.assertFalse(any("did not take" in w for w in cam["warnings"]))
-        # base: flush + 3 frames; alt: flush + 3 frames; restore: flush; real capture: flush + 1.
         mean = [("grab", 0)] * 2 + [("grab", 0), ("retrieve", 0)] * 3
         real = [("grab", 0)] * 2 + [("grab", 0), ("retrieve", 0)]
         self.assertEqual(cv2.events, mean + mean + [("grab", 0)] * 2 + real)
@@ -654,7 +623,6 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(cv2.created[0].props[FakeCv2.CAP_PROP_EXPOSURE], -4.0)
 
     def test_exposure_restore_that_does_not_take_is_warned(self) -> None:
-        # The driver refuses the set back to -4, so the picture stays at the changed -8.
         cv2 = FakeCv2(profiles={0: {"reject": {FakeCv2.CAP_PROP_EXPOSURE: {-4.0}},
                                     "image_follows_exposure": True}})
         summary, _ = self.run_capture(cv2=cv2, count=1, exposure=-4.0, flush_frames=0)
@@ -665,15 +633,12 @@ class CaptureTests(unittest.TestCase):
         self.assertTrue(any("did not take" in w for w in summary["warnings"]))
 
     def test_exposure_is_restored_even_when_a_grab_fails(self) -> None:
-        # flush_frames=0: grab calls 0-2 are the base frames, 3 is the alt frame, 4 fails.
         cv2 = FakeCv2(profiles={0: {"image_follows_exposure": True, "fail_grab_at": 4}})
         summary, _ = self.run_capture(cv2=cv2, count=1, exposure=-4.0, flush_frames=0)
         self.assertIsNotNone(summary["aborted"])
         self.assertIn("grab failed", summary["aborted"])
         self.assertEqual(cv2.created[0].props[FakeCv2.CAP_PROP_EXPOSURE], -4.0)
         self.assertTrue(cv2.created[0].released)
-
-    # --- brightness settle -----------------------------------------------------
 
     def test_settle_waits_for_brightness_then_records_only_settled_frames(self) -> None:
         self.run_capture(cv2=FakeCv2(), name="ref", count=3)
@@ -683,7 +648,6 @@ class CaptureTests(unittest.TestCase):
         self.run_capture(cv2=cv2, count=3, settle_max_s=30.0, flush_frames=0)
         settle = self.load_session()["cameras"]["0"]["settle"]
         self.assertTrue(settle["settled"])
-        # Dark for the first 4 frames: the 5-frame window is all bright from tick 8, 0.2 s per tick.
         self.assertAlmostEqual(settle["seconds"], 1.6, places=6)
         self.assertEqual(settle["frames_used"], 9)
         means = [f["mean"] for f in self.load_session()["frames"]]
@@ -694,7 +658,7 @@ class CaptureTests(unittest.TestCase):
     def test_settle_frames_are_discarded_not_written_to_the_npz(self) -> None:
         cv2 = FakeCv2(profiles={0: {"start_dark": (4, 0.25)}})
         self.run_capture(cv2=cv2, count=2, settle_max_s=30.0, flush_frames=0)
-        self.assertEqual(cv2.created[0].retrieve_calls, 9 + 2)  # 9 settle frames, 2 recorded
+        self.assertEqual(cv2.created[0].retrieve_calls, 9 + 2)
         with np.load(self.session_dir() / "frames_dev0.npz") as z:
             self.assertEqual(z["gray"].shape, (2, 48, 64))
             self.assertEqual(z["stamps"].shape, (2,))
@@ -752,7 +716,6 @@ class CaptureTests(unittest.TestCase):
         cv2 = FakeCv2(profiles={0: {"start_dark": (4, 0.25)}})
         self.run_capture(cv2=cv2, mode="placement", count=1, no_prompt=False,
                          input_fn=self.input_logger(cv2), settle_max_s=30.0, flush_frames=0)
-        # The 9 settle ticks (grab + retrieve each) come before the first prompt.
         self.assertEqual(cv2.events.index(("input",)), 18)
         self.assertEqual(cv2.events[18:], [("input",), ("grab", 0), ("retrieve", 0)])
 
@@ -827,8 +790,6 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(params["settle_max_s"].default, 30.0)
         self.assertEqual(params["settle_frames"].default, 5)
         self.assertEqual(params["settle_tol_gray"].default, 1.0)
-
-    # --- session names and folder creation --------------------------------------
 
     def test_invalid_session_names_exit_2_with_a_message(self) -> None:
         bad = [
@@ -942,7 +903,7 @@ class ListDevicesTests(unittest.TestCase):
             main(["--devices", "0", "--name", "x"], cv2_module=cv2, out=self.lines.append)
         self.assertEqual(ctx.exception.code, 2)
         self.assertIn("--mode", err.getvalue())
-        self.assertEqual(len(cv2.created), 1)  # only the list run opened a camera
+        self.assertEqual(len(cv2.created), 1)
 
     def test_missing_cv2_gives_dependency_message(self) -> None:
         err = io.StringIO()

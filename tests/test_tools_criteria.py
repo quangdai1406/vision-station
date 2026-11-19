@@ -1,5 +1,3 @@
-"""Tests for tools/criteria.py. The fake MES runs on 127.0.0.1 inside the test; tokens are fake."""
-
 import contextlib
 import csv
 import io
@@ -288,8 +286,6 @@ def _dead_port():
 
 
 class ProxyModeTests(_MESTestCase):
-    """HTTP_PROXY points at a dead port. Default mode must ignore it; --use-env-proxy must use it."""
-
     def setUp(self):
         super().setUp()
         self.dead_proxy = f"http://127.0.0.1:{_dead_port()}"
@@ -317,7 +313,7 @@ class ProxyModeTests(_MESTestCase):
             C.fetch_criteria(self.base_url, FAKE_TOKEN, "P1", timeout_s=3, use_env_proxy=True)
         self.assertIn("could not reach MES", str(cm.exception))
         self.assertNotIn(FAKE_TOKEN, str(cm.exception))
-        self.assertEqual(self.server.requests, [])  # the MES was never reached directly
+        self.assertEqual(self.server.requests, [])
 
     def test_opener_handlers_differ_by_mode(self):
         self.route("/api/machine/criteria/P1", 200, [])
@@ -331,12 +327,10 @@ class ProxyModeTests(_MESTestCase):
 
         with mock.patch.object(urllib.request, "build_opener", side_effect=spy):
             C.fetch_criteria(self.base_url, FAKE_TOKEN, "P1")
-            # Env mode goes through the dead proxy, so this call is expected to fail.
             with self.assertRaises(C.CriteriaFetchError):
                 C.fetch_criteria(self.base_url, FAKE_TOKEN, "P1", timeout_s=3, use_env_proxy=True)
         default_proxies = [h for h in built[0].handlers if isinstance(h, urllib.request.ProxyHandler)]
         env_proxies = [h for h in built[1].handlers if isinstance(h, urllib.request.ProxyHandler)]
-        # An empty ProxyHandler({}) registers no protocol handlers, so the default opener has no proxy handler.
         self.assertEqual(default_proxies, [])
         self.assertEqual(len(env_proxies), 1)
         self.assertEqual(env_proxies[0].proxies.get("http"), self.dead_proxy)
@@ -347,13 +341,11 @@ class ProxyModeTests(_MESTestCase):
             C.fetch_criteria(self.base_url, FAKE_TOKEN, "P1")
         self.assertIn("401", str(cm.exception))
         self.assertNotIn(FAKE_TOKEN, str(cm.exception))
-        # Env mode, with 127.0.0.1 bypassed so the 401 comes back from the MES itself.
         with mock.patch.dict(os.environ, {"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}):
             with self.assertRaises(C.CriteriaFetchError) as cm:
                 C.fetch_criteria(self.base_url, FAKE_TOKEN, "P1", use_env_proxy=True)
         self.assertIn("401", str(cm.exception))
         self.assertNotIn(FAKE_TOKEN, str(cm.exception))
-        # Env mode through the dead proxy: connection error, still no token.
         with self.assertRaises(C.CriteriaFetchError) as cm:
             C.fetch_criteria(self.base_url, FAKE_TOKEN, "P1", timeout_s=3, use_env_proxy=True)
         self.assertNotIn(FAKE_TOKEN, str(cm.exception))

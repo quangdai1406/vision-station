@@ -1,26 +1,3 @@
-"""Scan reader for the weekly trainer (Taking data mode, plan step 6).
-
-Reads the scan records the station saved under ``<root>/scans/<line>/YYYY/MM/DD/<scan_id>/``
-(layout and checks: ``station/scanstore.py``; format: ``tools/FORMAT.md`` "Scan record").
-Standard library only. Nothing here writes to the store.
-
-Rules (plan docs/26_1027_PLAN_taking_data_mode.md, sections 4 and 6):
-  training   a scan that passes verify_scan, with label verdict GOOD and status official.
-             Its pictures are GOOD training images.
-  evaluation a scan that passes verify_scan, with label verdict BAD and status official.
-             It is returned separately and never becomes a training image.
-  excluded   every other scan (proposed or rejected label, or a failed check). Each one is
-             counted with a reason; a failed check also gives problem lines.
-
-Scan pictures are returned as ImageRef objects (the type trainer/dataset.py uses for part
-pictures), so the weekly trainer feeds them the same way. ScanImageRef adds the step and the
-"defect visible" mark. A scan is kept as one ScanSample, which has the attributes the weekly
-trainer reads from a part (images, started_utc).
-
-Split: split_by_toy() holds out whole toys, never single scans or pictures.
-
-Problem lines are strings ``"<scan folder>: <reason>"``, the same shape as trainer/dataset.py.
-"""
 from __future__ import annotations
 
 import pathlib
@@ -32,7 +9,7 @@ from typing import Optional
 from station.scanstore import list_scans, load_scan, verify_scan
 from trainer.dataset import ImageRef
 
-STORE_DIR = "store"  # same name as trainer/dataset.py: the folder that holds the parts
+STORE_DIR = "store"
 SCANS_DIR = "scans"
 GOOD = "GOOD"
 BAD = "BAD"
@@ -46,44 +23,39 @@ RULE_SEEDED = "seeded whole toys (holdout_fraction)"
 
 @dataclass(frozen=True)
 class ScanImageRef(ImageRef):
-    """One scan picture: an ImageRef plus its step and its BAD-scan 'defect visible' mark."""
     step: int = 0
-    defect_visible: Optional[bool] = None  # True/False on a BAD scan, None on a GOOD scan
+    defect_visible: Optional[bool] = None
 
 
 @dataclass(frozen=True)
 class ScanSample:
-    """One intact scan. Carries the attributes the weekly trainer reads from a part."""
     scan_id: str
     toy_id: str
     part_number: str
     started_utc: str
-    verdict: str  # GOOD | BAD
-    status: str  # proposed | official | rejected
-    defects: tuple  # defect names (BAD only; empty for GOOD)
-    steps: dict  # {'TOP': n, 'BOTTOM': m}, sides present only
+    verdict: str
+    status: str
+    defects: tuple
+    steps: dict
     scan_dir: pathlib.Path
-    images: tuple  # tuple of ScanImageRef
+    images: tuple
 
 
 @dataclass
 class ScanSet:
-    """Everything read from one store root. Nothing is written."""
     root: pathlib.Path
-    folders: int = 0  # finished scan folders found
-    valid: list = field(default_factory=list)  # intact scans, any label and status
-    good: list = field(default_factory=list)  # official GOOD: training images
-    bad: list = field(default_factory=list)  # official BAD: evaluation only
-    excluded: list = field(default_factory=list)  # (scan folder, reason), one per unused scan
-    problems: list = field(default_factory=list)  # "<scan folder>: <reason>"
+    folders: int = 0
+    valid: list = field(default_factory=list)
+    good: list = field(default_factory=list)
+    bad: list = field(default_factory=list)
+    excluded: list = field(default_factory=list)
+    problems: list = field(default_factory=list)
 
     def excluded_reasons(self) -> dict:
         return dict(sorted(Counter(reason for _folder, reason in self.excluded).items()))
 
 
-# ------------------------------------------------------------------ helpers
 def scans_root_for(store_root) -> pathlib.Path:
-    """The folder that contains ``scans/``. Accepts the folder holding ``store/`` or ``store/`` itself."""
     root = pathlib.Path(store_root)
     if (root / SCANS_DIR).is_dir():
         return root
@@ -93,7 +65,6 @@ def scans_root_for(store_root) -> pathlib.Path:
 
 
 def has_scans(store_root) -> bool:
-    """True when a scans/ folder exists for this store root."""
     return (scans_root_for(store_root) / SCANS_DIR).is_dir()
 
 
@@ -114,7 +85,6 @@ def _status_reason(sample: ScanSample) -> str:
 
 
 def _sample(scan_dir: pathlib.Path) -> tuple[Optional[ScanSample], list[str]]:
-    """(sample, []) for an intact scan, (None, problem lines) otherwise."""
     problems = verify_scan(scan_dir)
     if problems:
         return None, [f"{scan_dir}: {text}" for text in problems]
@@ -150,11 +120,9 @@ def _sample(scan_dir: pathlib.Path) -> tuple[Optional[ScanSample], list[str]]:
     return sample, []
 
 
-# ------------------------------------------------------------------ reading
 def read_scans(store_root) -> ScanSet:
-    """Read every scan under the store root and sort it into good, bad, excluded and problems."""
     root = scans_root_for(store_root)
-    folders = list_scans(root)  # finished folders only; staging folders are skipped
+    folders = list_scans(root)
     scan_set = ScanSet(root=root, folders=len(folders))
     for folder in folders:
         sample, problems = _sample(folder)
@@ -174,15 +142,7 @@ def read_scans(store_root) -> ScanSet:
     return scan_set
 
 
-# -------------------------------------------------------------------- split
 def split_by_toy(scans, holdout_fraction, seed, holdout_toys=None) -> tuple[list, list, list]:
-    """Split GOOD scans into (train, held_out, held_toys) by whole toy_id. Never by picture or scan.
-
-    holdout_toys given (a list of toy ids): exactly those toys are held out.
-    holdout_toys None: toys are shuffled with random.Random(seed) and added to the holdout while
-    that brings its scan count closer to holdout_fraction * n, as trainer/dataset.py does for days.
-    At least one toy stays in train. Both lists are in started_utc, scan_id order.
-    """
     fraction = _check_fraction(holdout_fraction)
     by_toy: dict = {}
     for scan in sorted(scans, key=_order):
@@ -209,9 +169,7 @@ def split_by_toy(scans, holdout_fraction, seed, holdout_toys=None) -> tuple[list
     return train, holdout, sorted(held)
 
 
-# ----------------------------------------------------------------- counting
 def image_counts(samples) -> dict:
-    """'camera/side' -> number of pictures."""
     tally: Counter = Counter()
     for sample in samples:
         for img in sample.images:
@@ -220,10 +178,6 @@ def image_counts(samples) -> dict:
 
 
 def bad_defect_counts(samples) -> dict:
-    """Per defect name: scans, and pictures marked defect visible True / False.
-
-    A scan with several defects counts its pictures under each defect name. The mark is per picture.
-    """
     tally: dict = {}
     for sample in samples:
         for defect in sample.defects:
@@ -235,12 +189,10 @@ def bad_defect_counts(samples) -> dict:
 
 
 def inventory_scans(store_root) -> dict:
-    """Plain, JSON-ready counts for every scan under the store root (all scans; no part filter)."""
     return summarize(read_scans(store_root))
 
 
 def summarize(scan_set: ScanSet) -> dict:
-    """Plain, JSON-ready counts for one ScanSet (see inventory_scans)."""
     by_toy: dict = {}
     by_label: Counter = Counter()
     by_status: Counter = Counter()

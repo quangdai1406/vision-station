@@ -1,8 +1,3 @@
-"""Tests for station.scan.ScanSession. Fakes only; time is injected, no sleeping.
-
-The scan store is real (a temporary folder), so these tests also prove that the
-saved scan verifies clean with station.scanstore.verify_scan.
-"""
 import inspect
 import pathlib
 import subprocess
@@ -47,9 +42,6 @@ def make_frames(side, cams=CAMS):
 
 
 class FakeCameras:
-    """Each capture pops one scripted action: None -> all 4 cameras, list -> those frames,
-    exception -> raise it."""
-
     def __init__(self):
         self.sides = []
         self.script = []
@@ -91,7 +83,6 @@ class Harness:
         )
 
     def flip(self):
-        """Wait out the flip gap (min_flip_s), then flip the part explicitly."""
         self.clock.advance(self.min_flip_s)
         self.session.flip_ready()
 
@@ -105,7 +96,6 @@ class Harness:
         )
 
     def press(self, dt=1.0):
-        """Advance the clock past the debounce, then press. Returns the press result."""
         self.clock.advance(dt)
         return self.session.press()
 
@@ -117,7 +107,6 @@ class ScanSessionTestCase(unittest.TestCase):
         self.s = self.h.session
 
     def take(self, n, dt=1.0):
-        """n accepted presses, each after the debounce window."""
         for _ in range(n):
             self.assertTrue(self.h.press(dt), "press was ignored")
 
@@ -131,7 +120,6 @@ class ScanSessionTestCase(unittest.TestCase):
         return self.s.finish()
 
     def stored_scan_dirs(self):
-        """Everything under the line folder (staging folders and finished scans)."""
         return list(self.h.store.line_dir.rglob("*"))
 
     def pictures_on_disk(self):
@@ -167,14 +155,14 @@ class TestSaveAndVerify(ScanSessionTestCase):
         self.s.done_side()
         self.s.mark("C1", "TOP", 2, True)
         self.s.mark("C4", "BOTTOM", 1, True)
-        self.s.mark("C4", "BOTTOM", 1, False)  # changed again before finish: last value wins
+        self.s.mark("C4", "BOTTOM", 1, False)
         self.s.mark("C4", "BOTTOM", 1, True)
         final = self.s.finish()
         doc = load_scan(final)
         visible = {(i["camera_id"], i["side"], i["step"]): i["defect_visible"] for i in doc["images"]}
         self.assertTrue(visible[("C1", "TOP", 2)])
         self.assertTrue(visible[("C4", "BOTTOM", 1)])
-        self.assertFalse(visible[("C2", "TOP", 1)])  # default False
+        self.assertFalse(visible[("C2", "TOP", 1)])
         self.assertFalse(visible[("C1", "TOP", 1)])
         self.assertEqual(len(visible), 12)
         self.assertEqual(verify_scan(final), [])
@@ -295,7 +283,7 @@ class TestCameraFailure(ScanSessionTestCase):
         self.assertEqual(snap["counts"]["TOP"], 1)
         self.assertEqual(snap["step"], 1)
         self.assertIn("retry", snap["prompt"])
-        self.assertTrue(self.h.press())  # retry of the same step 2
+        self.assertTrue(self.h.press())
         snap = self.s.snapshot()
         self.assertEqual(snap["state"], "SCAN_SIDE")
         self.assertIsNone(snap["fault"])
@@ -314,7 +302,7 @@ class TestCameraFailure(ScanSessionTestCase):
         self.assertEqual(snap["state"], "FAULT")
         self.assertIn("C3", snap["fault"])
         self.assertEqual(snap["counts"]["TOP"], 0)
-        self.assertEqual(self.pictures_on_disk(), [])  # nothing from the failed step was written
+        self.assertEqual(self.pictures_on_disk(), [])
 
     def test_clear_fault_returns_to_the_side(self):
         self.h.start()
@@ -331,7 +319,6 @@ class TestCameraFailure(ScanSessionTestCase):
         self.take(1)
         self.s.done_side()
         self.h.cameras.script = [CameraError("C3: timeout")]
-        # The flip press, 2.0 s after Done (the flip gap): BOTTOM step 1 fails on C3.
         self.assertTrue(self.h.press(dt=2.0))
         snap = self.s.snapshot()
         self.assertEqual(snap["state"], "FAULT")
@@ -345,7 +332,7 @@ class TestCameraFailure(ScanSessionTestCase):
         self.h.start()
         self.h.cameras.script = [CameraError("C1: no frame"), CameraError("C1: no frame")]
         self.h.press()
-        self.h.press()  # retry fails again
+        self.h.press()
         self.assertEqual(self.s.snapshot()["state"], "FAULT")
         self.assertEqual(self.s.snapshot()["counts"]["TOP"], 0)
 
@@ -355,7 +342,7 @@ class TestCameraFailure(ScanSessionTestCase):
 
         def flaky(path, data):
             calls["n"] += 1
-            if calls["n"] == 2:  # second picture of step 1
+            if calls["n"] == 2:
                 raise OSError("disk full")
             return real_write(path, data)
 
@@ -375,21 +362,21 @@ class TestDebounce(ScanSessionTestCase):
     def test_fast_second_press_is_ignored(self):
         self.h.start()
         self.assertTrue(self.h.press(0.0))
-        self.assertFalse(self.h.press(0.1))  # 0.1 s after the accepted press: inside 0.3 s
+        self.assertFalse(self.h.press(0.1))
         self.assertEqual(self.s.snapshot()["counts"]["TOP"], 1)
-        self.assertTrue(self.h.press(0.3))  # 0.4 s after the accepted press: allowed
+        self.assertTrue(self.h.press(0.3))
         self.assertEqual(self.s.snapshot()["counts"]["TOP"], 2)
         self.assertEqual(len(self.h.cameras.sides), 2)
 
     def test_press_refused_in_wrong_state_returns_false(self):
-        self.assertFalse(self.h.press())  # IDLE
+        self.assertFalse(self.h.press())
         self.h.start()
         self.take(1)
         self.s.done_side()
         self.h.flip()
         self.take(1)
         self.s.done_side()
-        self.assertFalse(self.h.press())  # SAVING
+        self.assertFalse(self.h.press())
 
 
 class TestFlip(ScanSessionTestCase):
@@ -407,8 +394,6 @@ class TestFlip(ScanSessionTestCase):
 
 
 class TestFlipGap(ScanSessionTestCase):
-    """min_flip_s: a flip (press or flip_ready) is refused until it has passed since Done."""
-
     def take_top_and_done(self):
         self.h.start()
         self.take(1)
@@ -417,7 +402,7 @@ class TestFlipGap(ScanSessionTestCase):
     def test_press_right_after_done_side_is_ignored_and_captures_nothing(self):
         self.take_top_and_done()
         calls_before = len(self.h.cameras.sides)
-        self.assertFalse(self.h.press(dt=1.0))  # 1.0 s after Done: debounce passed, flip gap not
+        self.assertFalse(self.h.press(dt=1.0))
         self.assertEqual(len(self.h.cameras.sides), calls_before)
         snap = self.s.snapshot()
         self.assertEqual(snap["state"], "WAIT_FLIP")
@@ -427,7 +412,7 @@ class TestFlipGap(ScanSessionTestCase):
     def test_press_after_min_flip_flips_and_takes_bottom_step_one(self):
         self.take_top_and_done()
         self.assertFalse(self.h.press(dt=1.0))
-        self.assertTrue(self.h.press(dt=1.0))  # 2.0 s after Done
+        self.assertTrue(self.h.press(dt=1.0))
         snap = self.s.snapshot()
         self.assertEqual(snap["state"], "SCAN_SIDE")
         self.assertEqual((snap["side"], snap["step"]), ("BOTTOM", 1))
@@ -440,19 +425,18 @@ class TestFlipGap(ScanSessionTestCase):
         h.start()
         h.press(dt=1.0)
         self.assertEqual(h.session.done_side(), "WAIT_FLIP")
-        self.assertTrue(h.press(dt=1.0))  # debounce passed, no flip gap
+        self.assertTrue(h.press(dt=1.0))
         self.assertEqual(h.session.snapshot()["counts"], {"TOP": 1, "BOTTOM": 1})
 
     def test_double_tap_done_then_enter_is_ignored_by_debounce(self):
-        h = Harness(min_flip_s=0)  # flip gap off, so only the debounce can stop the tap
+        h = Harness(min_flip_s=0)
         self.addCleanup(h.cleanup)
         h.start()
         h.press(dt=1.0)
         h.session.done_side()
-        self.assertFalse(h.press(dt=0.1))  # 0.1 s after Done: inside debounce_s
+        self.assertFalse(h.press(dt=0.1))
         self.assertEqual(h.session.snapshot()["state"], "WAIT_FLIP")
         self.assertEqual(len(h.cameras.sides), 1)
-        # The default harness: the same double tap is ignored too, and nothing is captured.
         self.take_top_and_done()
         self.assertFalse(self.h.press(dt=0.1))
         self.assertEqual(len(self.h.cameras.sides), 1)
@@ -508,7 +492,7 @@ class TestThreads(ScanSessionTestCase):
             try:
                 for _ in range(10):
                     results.append(h.session.press())
-            except Exception as exc:  # any exception is a failure
+            except Exception as exc:
                 errors.append(exc)
 
         threads = [threading.Thread(target=presser) for _ in range(2)]
@@ -559,7 +543,7 @@ class TestSnapshot(ScanSessionTestCase):
         self.assertIn("TOP step 3", snap["prompt"])
         self.assertIn("Done with this side", snap["prompt"])
         self.s.done_side()
-        self.assertIn("Wait", self.s.snapshot()["prompt"])  # flip gap still running
+        self.assertIn("Wait", self.s.snapshot()["prompt"])
         self.h.flip()
         self.take(1)
         self.s.done_side()
@@ -573,8 +557,6 @@ class TestSnapshot(ScanSessionTestCase):
 
 
 class TestStepPicture(ScanSessionTestCase):
-    """step_picture(): the picture of the most recent saved step, for the UI thumbnails."""
-
     def test_none_before_any_step_and_for_unknown_camera(self):
         self.assertIsNone(self.s.step_picture("C1"))
         self.h.start()
@@ -614,7 +596,7 @@ class TestStepPicture(ScanSessionTestCase):
         self.assertIsNone(self.s.step_picture("C1"))
         self.h.start()
         self.h.cameras.script = [CameraError("C3 lost the image")]
-        self.assertTrue(self.h.press(1.0))  # a camera fault is still a processed press
+        self.assertTrue(self.h.press(1.0))
         self.assertEqual(self.s.snapshot()["state"], "FAULT")
         self.assertIsNone(self.s.step_picture("C1"))
 

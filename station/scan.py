@@ -1,45 +1,3 @@
-"""One "Taking data" scan: from the first press of a part to a saved scan record.
-
-Plan reference: docs/26_1027_PLAN_taking_data_mode.md (sections 3, 5, 8 step 2).
-Standard library only. Cameras and the scan store are injected. A scan never
-has a part verdict: no fusion, no outputs (lights, alarm) and no MES post.
-
-Flow: IDLE --start--> SCAN_SIDE --press--> SCAN_SIDE (one step = one picture per
-camera) --done_side--> WAIT_FLIP (TOP, or any side that is not the last) --press
-or flip_ready()--> SCAN_SIDE (next side) ... --done_side on the last side-->
-SAVING --finish--> DONE --reset--> IDLE. cancel() from SCAN_SIDE, WAIT_FLIP,
-SAVING or FAULT drops the scan and goes back to IDLE.
-
-Step rules (decided here):
-  - A step is all-or-nothing. All cameras are captured and checked first; only
-    then are the pictures written. A camera failure writes nothing, keeps the
-    steps already taken, goes to FAULT with the camera named, and press() retries
-    the same step number. clear_fault() drops the fault and stays on the side.
-  - A write failure while saving pictures: ScanWriter discards the whole staging
-    folder on any write error (its rule), so the scan cannot continue. The scan
-    is dropped, the state goes to FAULT, and clear_fault() returns to IDLE.
-  - finish() failures drop the scan the same way (the writer removes its staging).
-  - A side needs at least one step before done_side(). finish() needs every
-    requested side to have at least one step.
-  - BAD scans: every picture is written with defect_visible False until marked.
-    mark() changes one picture until finish(). GOOD scans take no marks.
-
-Debounce (copied from station/session.py): a press within debounce_s of the end
-of the previous accepted press is ignored. done_side() counts as an accepted
-press, so a double tap on Done then Enter is ignored. press() returns True when it
-was accepted and processed (a camera fault is still a processed press) and False
-when it was ignored. The default debounce_s is the same 0.3 s that session.py uses.
-
-Flip gap (min_flip_s, copied from station/session.py): after done_side() a flip
-is refused until min_flip_s seconds have passed. This is an engineering setting,
-not a quality limit; the default is 2.0 s and 0 turns it off. press() in WAIT_FLIP
-then returns False and changes nothing; flip_ready() raises ScanError with the
-seconds left. Without this gap a double tap on Done then Enter could photograph
-the unflipped part and label it BOTTOM.
-
-Thread safety: every public method takes one RLock, so a UI thread and a camera
-thread cannot interleave a step.
-"""
 from __future__ import annotations
 
 import math
@@ -67,10 +25,10 @@ class ScanState(str, Enum):
 
 
 class ScanError(StationError):
-    """A scan action refused: busy, wrong state, bad arguments or a failed save."""
+    pass
 
 
-PENDING_REVIEW_CAP = 200  # most scans listed for approval at once
+PENDING_REVIEW_CAP = 200
 
 
 def _default_scan_id() -> str:
@@ -82,7 +40,6 @@ def _utc_now() -> str:
 
 
 def _seconds_left(wait: float) -> float:
-    """Seconds to show to the operator: rounded up to 0.1 s, so it is never 0.0 while a wait is left."""
     return math.ceil(round(wait, 6) * 10) / 10
 
 
@@ -108,8 +65,6 @@ def _validate_sides(sides: object) -> tuple[str, ...]:
 
 
 class ScanSession:
-    """Runs one scan at a time. Create one per station and reuse it."""
-
     def __init__(
         self,
         cameras,
@@ -145,16 +100,11 @@ class ScanSession:
 
         self._state = ScanState.IDLE
         self._fault: Optional[str] = None
-        # Where clear_fault() goes: SCAN_SIDE after a camera fault (step retried),
-        # None when the scan was dropped (clear_fault goes to IDLE).
         self._fault_return: Optional[ScanState] = None
         self._last_done: Optional[float] = None
-        # When done_side() moved to WAIT_FLIP; the flip gap is counted from here.
         self._flip_started: Optional[float] = None
         self._saved_path: Optional[pathlib.Path] = None
         self._clear_scan()
-
-    # ------------------------------------------------------------------ public
 
     def start(
         self,
@@ -164,7 +114,6 @@ class ScanSession:
         taken_by: str,
         sides: Sequence[str] = ("TOP", "BOTTOM"),
     ) -> str:
-        """Open a scan and begin its cameras' first side. Returns the scan id."""
         with self._lock:
             if self._busy():
                 raise ScanError("an inspection is running; a scan cannot start now")
@@ -194,13 +143,6 @@ class ScanSession:
             return scan_id
 
     def press(self) -> bool:
-        """Take the next step on the current side, or start the next side after a flip.
-
-        In WAIT_FLIP the press starts the next side and takes its step 1 at once,
-        but only once min_flip_s has passed since done_side(); before that the press
-        is ignored. In FAULT the press retries the step that failed. Returns False
-        when ignored (nothing captured, state unchanged).
-        """
         with self._lock:
             now = self._clock()
             if not self._debounce_ok(now):
@@ -223,17 +165,12 @@ class ScanSession:
             return True
 
     def flip_ready(self) -> None:
-        """WAIT_FLIP -> SCAN_SIDE: the part is turned; the next side starts with no steps yet.
-
-        Raises ScanError with the seconds left if called before min_flip_s has passed.
-        """
         with self._lock:
             if self._state is not ScanState.WAIT_FLIP:
                 raise ScanError(f"flip_ready is not allowed in state {self._state.value}")
             self._flip(self._clock())
 
     def done_side(self) -> str:
-        """End the current side. Returns the new state: WAIT_FLIP, or SAVING after the last side."""
         with self._lock:
             if self._state is not ScanState.SCAN_SIDE:
                 raise ScanError(f"done_side is not allowed in state {self._state.value}")
@@ -246,11 +183,10 @@ class ScanSession:
                 self._flip_started = now
             else:
                 self._state = ScanState.SAVING
-            self._last_done = now  # the debounce window starts at Done too
+            self._last_done = now
             return self._state.value
 
     def mark(self, camera_id: str, side: str, step: int, visible: bool) -> None:
-        """Set 'defect visible' on one picture of a BAD scan. Allowed until finish()."""
         with self._lock:
             if self._state not in (ScanState.SCAN_SIDE, ScanState.WAIT_FLIP, ScanState.SAVING):
                 raise ScanError(f"marks cannot change in state {self._state.value}")
@@ -269,7 +205,6 @@ class ScanSession:
             self._visible[key] = visible
 
     def finish(self) -> pathlib.Path:
-        """Publish the scan (SAVING -> DONE). Returns the scan folder."""
         with self._lock:
             if self._state is not ScanState.SAVING:
                 raise ScanError("finish is only possible after Done on the last side")
@@ -287,7 +222,6 @@ class ScanSession:
             return path
 
     def cancel(self) -> None:
-        """Drop the scan without saving anything and return to IDLE."""
         with self._lock:
             if self._state in (ScanState.IDLE, ScanState.DONE):
                 raise ScanError(f"nothing to cancel in state {self._state.value}")
@@ -297,7 +231,6 @@ class ScanSession:
             self._state = ScanState.IDLE
 
     def reset(self) -> None:
-        """DONE -> IDLE, ready for the next scan."""
         with self._lock:
             if self._state is not ScanState.DONE:
                 raise ScanError(f"reset is only possible after a saved scan, not in {self._state.value}")
@@ -305,7 +238,6 @@ class ScanSession:
             self._state = ScanState.IDLE
 
     def clear_fault(self) -> None:
-        """Leave FAULT: back to the side (camera fault) or to IDLE (scan dropped)."""
         with self._lock:
             if self._state is not ScanState.FAULT:
                 raise ScanError(f"clear_fault is not allowed in state {self._state.value}")
@@ -318,22 +250,12 @@ class ScanSession:
             self._state = ScanState.SCAN_SIDE
 
     def step_picture(self, camera_id: str) -> Optional[tuple[bytes, str]]:
-        """(bytes, ext) of this camera's picture from the most recent saved step, or None.
-
-        Only the last step is kept (4 frames at most). None when no step has been
-        taken in this scan yet, after a fault, after cancel, or once the scan is saved.
-        """
         with self._lock:
             if self._state not in (ScanState.SCAN_SIDE, ScanState.WAIT_FLIP, ScanState.SAVING):
                 return None
             return self._last_pictures.get(camera_id)
 
     def pending_reviews(self) -> list[dict]:
-        """Finished scans of this line whose label waits for approval, newest first.
-
-        Only a label with status "proposed" whose scan verifies clean is listed; a
-        damaged scan is left out. No picture bytes. At most PENDING_REVIEW_CAP rows.
-        """
         with self._lock:
             found = []
             for scan_dir in list_scans(self._store.root, self._store.line):
@@ -343,7 +265,6 @@ class ScanSession:
                     continue
                 if doc["label"]["status"] == "proposed":
                     found.append((doc, scan_dir))
-            # started_utc is a fixed-width UTC text, so the text order is the time order.
             found.sort(key=lambda item: item[0]["started_utc"], reverse=True)
             rows: list[dict] = []
             for doc, scan_dir in found:
@@ -365,12 +286,6 @@ class ScanSession:
             return rows
 
     def review(self, scan_id: str, decision: str, by: str, reason: Optional[str] = None) -> dict:
-        """Approve or reject one proposed scan label. Returns the new label dict.
-
-        scan_id must be the exact name of a finished scan folder on this line; anything
-        with a path separator, or any other name, is refused. Other finished scans may be
-        reviewed while a new scan is running. Raises ValueError with the reason.
-        """
         with self._lock:
             if not isinstance(scan_id, str) or not scan_id:
                 raise ValueError("scan_id is required")
@@ -388,7 +303,6 @@ class ScanSession:
                 ) from exc
 
     def snapshot(self) -> dict[str, Any]:
-        """State for the UI. No pictures. Keys are listed in the module tests."""
         with self._lock:
             now = self._clock()
             wait = self._flip_wait(now)
@@ -423,16 +337,13 @@ class ScanSession:
                 "prompt": self._prompt(side, wait),
             }
 
-    # ----------------------------------------------------------------- helpers
-
     def _take_step(self) -> bool:
-        """Capture one step on the current side, then write it. Returns True if saved."""
         side = self._current_side()
         step = self._counts[side] + 1
         try:
             frames = list(self._cameras.capture(Side(side)))
             pictures = self._check_frames(side, step, frames)
-        except Exception as exc:  # CameraError, StationError or anything the cameras raise
+        except Exception as exc:
             text = str(exc) or type(exc).__name__
             self._fault_at(f"{side} step {step}: {text}", ScanState.SCAN_SIDE)
             return False
@@ -456,11 +367,6 @@ class ScanSession:
         return True
 
     def _check_frames(self, side: str, step: int, frames: list) -> dict[str, tuple[bytes, str]]:
-        """One picture per camera, no strangers, no empty data, no bad file type.
-
-        Returns {camera_id: (data, ext)} exactly as the writer will receive them,
-        so nothing is checked twice and nothing unchecked reaches the writer.
-        """
         by_cam: dict[str, tuple[bytes, str]] = {}
         for frame in frames:
             cam = frame.camera_id
@@ -486,7 +392,6 @@ class ScanSession:
         self._state = ScanState.FAULT
 
     def _drop_scan(self, text: str) -> None:
-        """Remove the scan's staging (the writer's own rule) and wait for clear_fault."""
         if self._writer is not None:
             self._writer.cancel()
         self._writer = None
@@ -499,13 +404,11 @@ class ScanSession:
         return self._last_done is None or now - self._last_done >= self._debounce_s
 
     def _flip_wait(self, now: float) -> float:
-        """Seconds still to wait before the part may be flipped (0.0 when ready or not in WAIT_FLIP)."""
         if self._state is not ScanState.WAIT_FLIP or self._flip_started is None:
             return 0.0
         return max(0.0, self._min_flip_s - (now - self._flip_started))
 
     def _flip(self, now: float) -> None:
-        """WAIT_FLIP -> SCAN_SIDE on the next side. Raises ScanError while the flip gap runs."""
         wait = self._flip_wait(now)
         if wait > 0:
             raise ScanError(

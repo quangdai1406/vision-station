@@ -1,15 +1,3 @@
-"""End-to-end (plan E1): the MES ticket login, the part flow and the laptop, over real HTTP.
-
-The station runs as in production for this flow: auth.mode 'mes_ticket', parts.mode 'mes',
-model.remote (the laptop inference service), evidence.sync into a temporary folder. The UI
-server listens on 127.0.0.1. The MES is a fake http.server on 127.0.0.1 with the machine
-routes (sessions, parts, criteria, inspection-events). The laptop is tests/fake_laptop.py.
-Cameras are FakeCameraSet frames. Nothing leaves 127.0.0.1.
-
-The tokens are made-up strings generated in this file. The laptop token reaches RemoteModel
-through an environment variable that this test sets (mock.patch.dict) and never reads back.
-The MES token is passed to build_station() directly. No file in this test holds a token.
-"""
 from __future__ import annotations
 
 import contextlib
@@ -40,11 +28,11 @@ from station.evidence_sync import planned_destination
 from station.outputs import RecordingOutputs
 from tests.fake_laptop import FakeLaptop
 
-LAPTOP_TOKEN_ENV = "VISION_E2E_MES_FLOW_LAPTOP_TOKEN"  # a name only
-MES_TOKEN_ENV = "VISION_E2E_MES_FLOW_MES_TOKEN"  # a name only, in the config
+LAPTOP_TOKEN_ENV = "VISION_E2E_MES_FLOW_LAPTOP_TOKEN"
+MES_TOKEN_ENV = "VISION_E2E_MES_FLOW_MES_TOKEN"
 ROLE_MAP = {"inspector": "operator", "supervisor": "supervisor"}
 EXPIRES = "2026-11-04T18:00:00Z"
-PAST_MIN_FLIP = 2.5  # past the default min_flip_s (2.0 s) between the TOP and BOTTOM press
+PAST_MIN_FLIP = 2.5
 
 PARTS = {
     "PN-A": {"part_number": "PN-A", "description": "Liner left", "part_type": "FG",
@@ -64,16 +52,14 @@ CRITERIA = {
 }
 
 
-SCRATCH = {"defect_class": "scratch", "score": 0.9, "box": [1, 1, 4, 4]}  # maps to CR-1
+SCRATCH = {"defect_class": "scratch", "score": 0.9, "box": [1, 1, 4, 4]}
 
 
 def frame_bytes(camera_id: str, side: Side, n: int) -> bytes:
-    """Each picture carries its camera and side, so a test can tell which one was attached."""
     return f"PIC {camera_id} {side.value} {n}".encode("ascii")
 
 
 def parse_multipart(content_type: str, body: bytes) -> tuple[dict, dict]:
-    """Return (text fields, files) where files maps field name -> (filename, bytes)."""
     raw = b"Content-Type: " + content_type.encode("ascii") + b"\r\nMIME-Version: 1.0\r\n\r\n" + body
     msg = email.parser.BytesParser(policy=email.policy.default).parsebytes(raw)
     fields: dict[str, str] = {}
@@ -91,8 +77,6 @@ def parse_multipart(content_type: str, body: bytes) -> tuple[dict, dict]:
 def sha256_of(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
-
-# ------------------------------------------------------------------ fake MES
 
 class _MesHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):  # noqa: A002 - keep test output quiet
@@ -213,17 +197,17 @@ class FakeMes(http.server.ThreadingHTTPServer):
     def __init__(self, token: str) -> None:
         super().__init__(("127.0.0.1", 0), _MesHandler)
         self.token = token
-        self.lock = threading.RLock()  # _send() takes it again while a handler holds it
+        self.lock = threading.RLock()
         self.parts = copy.deepcopy(PARTS)
         self.criteria = copy.deepcopy(CRITERIA)
         self.tickets: dict[str, dict] = {}
-        self.sessions: dict[str, dict] = {}  # insertion order = login order
+        self.sessions: dict[str, dict] = {}
         self.gets: list[str] = []
         self.posts: list[dict] = []
         self.accepted: dict[str, int] = {}
         self.accepted_by: dict[str, str] = {}
         self.next_id = 0
-        self.wire: list[bytes] = []  # every request and response body the MES saw or sent
+        self.wire: list[bytes] = []
         self.thread = threading.Thread(target=self.serve_forever, kwargs={"poll_interval": 0.1},
                                        daemon=True)
         self.thread.start()
@@ -233,7 +217,6 @@ class FakeMes(http.server.ThreadingHTTPServer):
         return f"http://127.0.0.1:{self.server_address[1]}"
 
     def issue(self, username: str, roles: tuple[str, ...]) -> str:
-        """A one-time ticket, as the MES hub card would issue it (made up for the test)."""
         ticket = "tkt-" + secrets.token_urlsafe(16)
         with self.lock:
             self.tickets[ticket] = {"username": username, "roles": tuple(roles), "used": False}
@@ -245,7 +228,6 @@ class FakeMes(http.server.ThreadingHTTPServer):
         return sids[-1]
 
     def end(self, sid: str) -> None:
-        """The MES ends the session by itself (idle timeout, logout elsewhere)."""
         with self.lock:
             self.sessions[sid]["active"] = False
 
@@ -259,8 +241,6 @@ class FakeMes(http.server.ThreadingHTTPServer):
         self.thread.join(5)
 
 
-# ------------------------------------------------------------------ station fakes
-
 class FakeClock:
     def __init__(self) -> None:
         self.now = 1000.0
@@ -270,8 +250,6 @@ class FakeClock:
 
 
 class LightSpy(RecordingOutputs):
-    """Records the light calls and how many parts were already saved at each one."""
-
     def __init__(self) -> None:
         super().__init__()
         self.store = None
@@ -298,14 +276,11 @@ class LightSpy(RecordingOutputs):
         super().show_fault()
 
 
-# ------------------------------------------------------------------ tests
-
 class MesFlowE2E(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="mes-flow-e2e-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
-        # Stderr of the station (tracebacks, log lines) is captured for the token scan.
         self.err = io.StringIO()
         stack = contextlib.ExitStack()
         stack.enter_context(contextlib.redirect_stderr(self.err))
@@ -325,22 +300,20 @@ class MesFlowE2E(unittest.TestCase):
 
         self.data_dir = os.path.join(self.tmp, "data")
         self.models_dir = os.path.join(self.tmp, "models")
-        os.makedirs(self.models_dir)  # validate_config requires it; the laptop holds the models
+        os.makedirs(self.models_dir)
         self.dest_root = os.path.join(self.tmp, "laptop-store")
-        os.makedirs(self.dest_root)  # stands for the mounted laptop share; sync never creates it
+        os.makedirs(self.dest_root)
         self.queue_dir = os.path.join(self.tmp, "sync-queue")
         self.clock = FakeClock()
         self.outputs = LightSpy()
         self.app = None
         self.port = None
-        self.wire: list[bytes] = []  # request and response bodies seen on the station's HTTP
+        self.wire: list[bytes] = []
 
     def _close_laptop(self) -> None:
         if self.laptop_open:
             self.laptop.close()
             self.laptop_open = False
-
-    # ---- helpers
 
     def config(self) -> dict:
         return {
@@ -349,7 +322,7 @@ class MesFlowE2E(unittest.TestCase):
             "material_handler": "mh1",
             "thresholds": {"t_low": 0.5, "t_img": 0.8},
             "data_dir": self.data_dir,
-            "users_file": os.path.join(self.tmp, "no-local-users.json"),  # not read in mes_ticket mode
+            "users_file": os.path.join(self.tmp, "no-local-users.json"),
             "ui": {"host": "127.0.0.1", "port": 0, "session_timeout_s": 900},
             "mes": {
                 "base_url": self.mes.base_url,
@@ -357,7 +330,7 @@ class MesFlowE2E(unittest.TestCase):
                 "criteria_ids": ["CR-1", "CR-2"],
                 "class_to_criterion": {"scratch": "CR-1"},
                 "default_criterion_id": None,
-                "sync_interval_s": 3600,  # the tests call sync_once() and evidence_sync_once()
+                "sync_interval_s": 3600,
                 "default_bad_disposition": "quarantine",
             },
             "cameras": {"kind": "fake"},
@@ -387,7 +360,6 @@ class MesFlowE2E(unittest.TestCase):
 
     def call(self, method: str, path: str, body=None, cookie: str | None = None,
              raw_body: bytes | None = None):
-        """(status, parsed JSON or text). Bodies and replies are kept in self.wire."""
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         headers = {}
         data = raw_body
@@ -413,7 +385,6 @@ class MesFlowE2E(unittest.TestCase):
         return resp.status, raw.decode("utf-8", "replace")
 
     def enter(self, username: str, roles: tuple[str, ...] = ("inspector",)) -> str:
-        """Log in through POST /api/enter with a fresh ticket. Returns the station cookie."""
         ticket = self.mes.issue(username, roles)
         status, body = self.call("POST", "/api/enter", {"ticket": ticket})
         self.assertEqual(status, 200, body)
@@ -427,14 +398,14 @@ class MesFlowE2E(unittest.TestCase):
         return body
 
     def press(self, cookie: str, gap: float = 1.0) -> bool:
-        self.clock.now += gap  # > 0.3 s debounce, and the flip gap when gap is PAST_MIN_FLIP
+        self.clock.now += gap
         status, body = self.call("POST", "/api/press", {}, cookie)
         self.assertEqual(status, 200, body)
         return bool(body["accepted"])
 
     def press_part(self, cookie: str) -> None:
-        self.assertTrue(self.press(cookie, 1.0))  # TOP: now WAIT_FLIP
-        self.assertTrue(self.press(cookie, PAST_MIN_FLIP))  # BOTTOM: inspection finishes
+        self.assertTrue(self.press(cookie, 1.0))
+        self.assertTrue(self.press(cookie, PAST_MIN_FLIP))
 
     def state(self, cookie: str) -> dict:
         status, body = self.call("GET", "/api/state", cookie=cookie)
@@ -442,7 +413,7 @@ class MesFlowE2E(unittest.TestCase):
         return body
 
     def saved_parts(self) -> list[dict]:
-        return list(reversed(self.app.store.recent_parts(50)))  # oldest first
+        return list(reversed(self.app.store.recent_parts(50)))
 
     def posted(self) -> list[dict]:
         out = []
@@ -455,18 +426,16 @@ class MesFlowE2E(unittest.TestCase):
         return [pathlib.Path(dirpath, name)
                 for dirpath, _dirs, names in os.walk(self.tmp) for name in names]
 
-    # ---- tests
-
     def test_ticket_login_rules(self) -> None:
         self.start()
         ticket = self.mes.issue("insp-1", ("inspector",))
 
         status, _ = self.call("GET", f"/enter?ticket={ticket}")
-        self.assertEqual(status, 400)  # the ticket in the query string is refused
+        self.assertEqual(status, 400)
 
         status, page = self.call("GET", "/enter")
         self.assertEqual(status, 200)
-        self.assertIn("location", page)  # the page reads the fragment (location.hash)
+        self.assertIn("location", page)
 
         status, body = self.call("POST", "/api/enter", {"ticket": ticket})
         self.assertEqual((status, body), (200, {"role": "operator"}))
@@ -476,10 +445,10 @@ class MesFlowE2E(unittest.TestCase):
         op = cookie.split(";", 1)[0].split("=", 1)[1]
         self.assertEqual(self.state(op)["auth"]["username"], "insp-1")
 
-        status, body = self.call("POST", "/api/enter", {"ticket": ticket})  # replay
+        status, body = self.call("POST", "/api/enter", {"ticket": ticket})
         self.assertEqual(status, 409, body)
 
-        aud_ticket = self.mes.issue("aud-1", ("auditor",))  # a role that is not mapped
+        aud_ticket = self.mes.issue("aud-1", ("auditor",))
         status, body = self.call("POST", "/api/enter", {"ticket": aud_ticket})
         self.assertEqual(status, 403, body)
         self.assertFalse(self.mes.session_active(self.mes.latest_session("aud-1")))
@@ -489,8 +458,8 @@ class MesFlowE2E(unittest.TestCase):
         self.assertEqual(self.app.store.recent_parts(5), [])
 
     def test_bad_part_with_a_proposal_is_saved_then_posted_with_its_photo(self) -> None:
-        self.laptop.predict_score = 0.9  # every picture at or above t_img: BAD
-        self.laptop.predict_fields = {"defects": [SCRATCH]}  # the model names the defect class
+        self.laptop.predict_score = 0.9
+        self.laptop.predict_fields = {"defects": [SCRATCH]}
         self.start()
         op = self.enter("insp-1")
         sid = self.mes.latest_session("insp-1")
@@ -502,14 +471,14 @@ class MesFlowE2E(unittest.TestCase):
         self.select(op, "PN-A")
         status, body = self.call("GET", "/api/part/criteria", cookie=op)
         self.assertEqual(status, 200)
-        self.assertEqual(sorted(c["id"] for c in body["criteria"]), ["CR-1", "CR-2"])  # CR-3 inactive
+        self.assertEqual(sorted(c["id"] for c in body["criteria"]), ["CR-1", "CR-2"])
 
         self.press_part(op)
         st = self.state(op)
         self.assertEqual((st["state"], st["verdict"]), ("VERDICT", "BAD"))
         self.assertIn("show_bad", self.outputs.history)
         self.assertNotIn("show_good", self.outputs.history)
-        self.assertEqual(self.app.store.recent_parts(5), [])  # saved when the inspector acks
+        self.assertEqual(self.app.store.recent_parts(5), [])
         self.assertEqual(self.app.sync_once(), {"sent": 0, "failed_permanent": 0, "retry_later": 0})
         self.assertEqual(self.mes.posts, [])
 
@@ -533,7 +502,6 @@ class MesFlowE2E(unittest.TestCase):
                           for p in doc["defect_proposals"]], [("CR-2", "insp-1", "C2", "BOTTOM")])
         session_id = parts[0]["session_id"]
 
-        # Laptop copy: the part folder reaches the evidence destination with equal hashes.
         planned = planned_destination(part_dir, self.dest_root)
         self.assertEqual(self.app.evidence_sync_once(), {"synced": 1, "failed": 0, "pending": 0})
         self.assertTrue(os.path.isdir(planned))
@@ -546,8 +514,8 @@ class MesFlowE2E(unittest.TestCase):
         self.assertEqual(len(self.mes.posts), 1)
         post = self.posted()[0]
         rec = post["record"]
-        self.assertEqual(rec["key"], session_id)  # Idempotency-Key is the session id
-        self.assertEqual(rec["station_session"], sid)  # Station-Session is the MES session
+        self.assertEqual(rec["key"], session_id)
+        self.assertEqual(rec["station_session"], sid)
         self.assertEqual(rec["auth"], f"Bearer {self.mes_token}")
         self.assertEqual(rec["status"], 201)
         f = post["fields"]
@@ -560,19 +528,16 @@ class MesFlowE2E(unittest.TestCase):
         self.assertIsNotNone(datetime.datetime.fromisoformat(f["capturedAt"].replace("Z", "+00:00")))
         self.assertEqual(sorted(post["files"]), ["defectPhoto_CR-1", "defectPhoto_CR-2"])
         _name, proposed_photo = post["files"]["defectPhoto_CR-2"]
-        self.assertTrue(proposed_photo.startswith(b"PIC C2 BOTTOM "), proposed_photo)  # the chosen picture
+        self.assertTrue(proposed_photo.startswith(b"PIC C2 BOTTOM "), proposed_photo)
         _name, model_photo = post["files"]["defectPhoto_CR-1"]
-        self.assertTrue(model_photo.startswith(b"PIC "), model_photo)  # a picture the model picked
+        self.assertTrue(model_photo.startswith(b"PIC "), model_photo)
 
-        # Retrying the queue does not post again (the MES key is already accepted).
         self.assertEqual(self.app.sync_once(), {"sent": 0, "failed_permanent": 0, "retry_later": 0})
         self.assertEqual(len(self.mes.posts), 1)
         self.assertEqual(self.mes.accepted_by[session_id], "insp-1")
 
     def test_bad_by_score_alone_with_a_proposal_is_posted(self) -> None:
-        # An anomaly model names no defect class. The inspector's proposal is the failed
-        # criterion, so the BAD part is posted with that criterion's photo.
-        self.laptop.predict_score = 0.9  # BAD by score, no defect classes named
+        self.laptop.predict_score = 0.9
         self.start()
         op = self.enter("insp-1")
         self.select(op, "PN-A")
@@ -595,7 +560,7 @@ class MesFlowE2E(unittest.TestCase):
         st = self.state(op)
         self.assertEqual((st["state"], st["verdict"]), ("IDLE", "GOOD"))
         self.assertEqual(st["counters"], {"total": 1, "good": 1, "bad": 0})
-        self.assertEqual(self.outputs.saved_at["show_good"], [1])  # saved before the green light
+        self.assertEqual(self.outputs.saved_at["show_good"], [1])
         self.assertTrue(self.outputs.green)
 
         status, body = self.call("POST", "/api/part/defects",
@@ -608,7 +573,7 @@ class MesFlowE2E(unittest.TestCase):
         post = self.posted()[0]
         self.assertEqual(post["fields"]["verdict"], "GOOD")
         self.assertEqual(json.loads(post["fields"]["checklistResults"]), {"CR-1": "pass", "CR-2": "pass"})
-        self.assertEqual(post["files"], {})  # no defect photo: a GOOD post carries no proposal
+        self.assertEqual(post["files"], {})
         self.assertEqual(post["record"]["station_session"], self.mes.latest_session("insp-1"))
 
     def test_laptop_down_mid_part_faults_and_nothing_is_posted_or_saved(self) -> None:
@@ -616,11 +581,11 @@ class MesFlowE2E(unittest.TestCase):
         self.start()
         op = self.enter("insp-1")
         self.select(op, "PN-A")
-        self.assertTrue(self.press(op, 1.0))  # TOP scored while the laptop is up
+        self.assertTrue(self.press(op, 1.0))
         self.assertEqual(self.state(op)["state"], "WAIT_FLIP")
 
         self._close_laptop()
-        self.assertTrue(self.press(op, PAST_MIN_FLIP))  # BOTTOM: the laptop is gone
+        self.assertTrue(self.press(op, PAST_MIN_FLIP))
 
         st = self.state(op)
         self.assertEqual(st["state"], "FAULT")
@@ -638,23 +603,19 @@ class MesFlowE2E(unittest.TestCase):
         op = self.enter("insp-1")
         sid1 = self.mes.latest_session("insp-1")
         self.select(op, "PN-A")
-        self.assertTrue(self.press(op, 1.0))  # TOP: WAIT_FLIP
+        self.assertTrue(self.press(op, 1.0))
         self.assertEqual(self.state(op)["state"], "WAIT_FLIP")
 
-        self.mes.end(sid1)  # the MES ends the session while the part waits for the flip
+        self.mes.end(sid1)
         status, body = self.call("GET", "/api/state", cookie=op)
         self.assertEqual((status, body.get("reason")), (401, "mes_session_ended"))
         status, body = self.call("POST", "/api/press", {}, op)
         self.assertEqual((status, body.get("reason")), (401, "mes_session_ended"))
-        self.assertEqual(self.app.session.state.value, "WAIT_FLIP")  # the BOTTOM press never ran
+        self.assertEqual(self.app.session.state.value, "WAIT_FLIP")
         self.assertEqual(self.app.sync_once(), {"sent": 0, "failed_permanent": 0, "retry_later": 0})
         self.assertEqual(self.mes.posts, [])
         self.assertEqual(self.app.store.recent_parts(5), [])
 
-        # The same inspector logs in again. The station finishes the flip (it does not fault):
-        # the part is saved GOOD. The queued post still names the session the part was started
-        # in (sid1, ended), so this fake MES refuses it and the item waits in the outbox. Nothing
-        # is accepted under any name, and the part is not lost.
         op2 = self.enter("insp-1")
         sid2 = self.mes.latest_session("insp-1")
         self.assertNotEqual(sid1, sid2)
@@ -664,9 +625,9 @@ class MesFlowE2E(unittest.TestCase):
         self.assertEqual((st["state"], st["verdict"]), ("IDLE", "GOOD"))
         self.assertEqual(len(self.app.store.recent_parts(5)), 1)
         self.assertEqual(self.app.sync_once(), {"sent": 0, "failed_permanent": 0, "retry_later": 1})
-        self.assertEqual(self.mes.accepted, {})  # nothing accepted under any identity
+        self.assertEqual(self.mes.accepted, {})
         self.assertEqual(self.mes.accepted_by, {})
-        self.assertEqual(self.app.outbox.pending_count(), 1)  # queued, not lost
+        self.assertEqual(self.app.outbox.pending_count(), 1)
         self.assertTrue({rec["station_session"] for rec in self.mes.posts} <= {sid1, sid2})
         self.assertEqual({rec["status"] for rec in self.mes.posts}, {401})
 
@@ -676,10 +637,10 @@ class MesFlowE2E(unittest.TestCase):
         self.start()
         op1 = self.enter("insp-1")
         self.select(op1, "PN-A")
-        self.assertTrue(self.press(op1, 1.0))  # TOP by insp-1
+        self.assertTrue(self.press(op1, 1.0))
         op2 = self.enter("insp-2")
 
-        self.assertFalse(self.press(op2, PAST_MIN_FLIP))  # BOTTOM by insp-2
+        self.assertFalse(self.press(op2, PAST_MIN_FLIP))
         st = self.state(op2)
         self.assertEqual(st["state"], "FAULT")
         self.assertIn("show_fault", self.outputs.history)
@@ -691,7 +652,7 @@ class MesFlowE2E(unittest.TestCase):
         self.assertEqual(self.mes.posts, [])
 
     def test_review_is_never_green_or_posted_until_a_supervisor_resolves_it(self) -> None:
-        self.laptop.predict_score = 0.6  # between t_low and t_img on every picture: REVIEW
+        self.laptop.predict_score = 0.6
         self.start()
         op = self.enter("insp-1")
         sup = self.enter("sup-1", ("supervisor",))
@@ -708,14 +669,14 @@ class MesFlowE2E(unittest.TestCase):
         self.assertEqual(self.mes.posts, [])
 
         status, body = self.call("POST", "/api/resolve", {"verdict": "GOOD", "reason": "by hand"}, op)
-        self.assertEqual(status, 403, body)  # an operator may not resolve a REVIEW
+        self.assertEqual(status, 403, body)
         self.assertEqual(self.state(op)["state"], "SUPERVISOR_REVIEW")
 
         status, body = self.call("POST", "/api/resolve", {"verdict": "GOOD", "reason": "checked by hand"},
                                  sup)
         self.assertEqual(status, 200, body)
         self.assertEqual(self.state(sup)["state"], "IDLE")
-        self.assertEqual(self.outputs.saved_at["show_good"], [1])  # saved before the green light
+        self.assertEqual(self.outputs.saved_at["show_good"], [1])
         self.assertEqual(self.app.sync_once(), {"sent": 1, "failed_permanent": 0, "retry_later": 0})
         self.assertEqual(self.posted()[0]["fields"]["verdict"], "GOOD")
         self.assertEqual(self.posted()[0]["record"]["station_session"], self.mes.latest_session("insp-1"))
@@ -732,7 +693,6 @@ class MesFlowE2E(unittest.TestCase):
         self.app.evidence_sync_once()
         self.assertEqual(self.app.sync_once()["sent"], 1)
 
-        # A laptop failure: its message is sent to the station log and must not carry the token.
         self.laptop.predict_status = 503
         self.laptop.predict_error = "GPU out of memory while scoring"
         self.select(op, "PN-A")
@@ -743,7 +703,7 @@ class MesFlowE2E(unittest.TestCase):
         blobs = list(self.wire) + list(self.mes.wire) + [self.err.getvalue().encode("utf-8")]
         for rec in self.mes.posts:
             blobs.append(rec["body"])
-        for path in self.all_station_files():  # data dir, outbox, event log, queue, laptop store
+        for path in self.all_station_files():
             with open(path, "rb") as fh:
                 blobs.append(fh.read())
         with contextlib.closing(sqlite3.connect(str(self.app.store.db_path))) as conn:
@@ -752,7 +712,7 @@ class MesFlowE2E(unittest.TestCase):
         for blob in blobs:
             for token in forbidden:
                 self.assertNotIn(token, blob)
-        self.assertGreater(len(self.mes.posts), 0)  # the scan saw real traffic
+        self.assertGreater(len(self.mes.posts), 0)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,3 @@
-"""Tests for tools/thresholds.py. Run from the project root:
-
-    python3 -m unittest
-"""
 import contextlib
 import io
 import json
@@ -148,7 +144,7 @@ class CandidateTableTests(unittest.TestCase):
         self.assertEqual(thresholds, sorted(thresholds))
         self.assertEqual(thresholds[0], 0.0)
         self.assertGreater(thresholds[-1], 0.9)
-        self.assertEqual(len(thresholds), 8)  # 0.0 + 6 distinct observed + top
+        self.assertEqual(len(thresholds), 8)
 
     def test_escape_and_false_reject_counts(self):
         table = th.candidate_table(self.GOOD, self.BAD)
@@ -195,7 +191,7 @@ class SuggestTests(unittest.TestCase):
 
     def test_min_arguments_are_required(self):
         with self.assertRaises(TypeError):
-            th.suggest([], [], review_from_good_percentile=90)  # no min_good / min_bad
+            th.suggest([], [], review_from_good_percentile=90)
 
     def test_separable_gives_t_img_min_bad_and_zero_escapes(self):
         good = rows([0.1, 0.2, 0.3], "good")
@@ -245,7 +241,6 @@ class SuggestTests(unittest.TestCase):
         self.assertEqual(result["verdict_counts"]["bad_parts"], {"GOOD": 0, "REVIEW": 0, "BAD": 3})
 
     def test_t_low_cap_behaviour(self):
-        # Percentile above t_img is capped to t_img and flagged.
         self.assertEqual(th.t_low_candidate([0.1, 0.2, 0.5], 100, 0.3), (0.3, True))
         self.assertEqual(th.t_low_candidate([0.1, 0.2, 0.5], 50, 0.3), (0.2, False))
 
@@ -287,7 +282,6 @@ PER_CLASS_LABEL_TEXT = (
 
 
 class ThresholdEvaluationTests(unittest.TestCase):
-    # Hand-made data. Good max 0.9 > bad min 0.2, so the sample is not separable.
     GOOD = [0.1, 0.2, 0.3, 0.4, 0.9]
     BAD = [
         {"label": "bad", "score": 0.5, "defect_class": "scratch"},
@@ -302,10 +296,6 @@ class ThresholdEvaluationTests(unittest.TestCase):
                           review_from_good_percentile=90, **kw)
 
     def test_evaluation_numbers_on_hand_made_data(self):
-        # t_img = 0.6: BAD if score >= 0.6.
-        # scratch: 0.5 escapes, 0.7 and 0.8 caught -> recall 2/3.
-        # dent: 0.2 escapes, 0.6 caught (boundary counts as caught) -> recall 1/2.
-        # overall: 3 of 5 caught, 2 escapes. good: 0.9 is a false reject (1 of 5).
         result = self._suggest(self.GOOD, self.BAD, t_img=0.6)
         self.assertTrue(result["ok"])
         self.assertFalse(result["separable"])
@@ -338,7 +328,7 @@ class ThresholdEvaluationTests(unittest.TestCase):
         self.assertEqual(at_06["evaluation"]["good"]["false_rejects"], 0)
         self.assertIsNone(at_06["evaluation"]["per_class"])
         at_07 = th.suggest(good, bad, min_good=3, min_bad=4, review_from_good_percentile=100, t_img=0.7)
-        self.assertEqual(at_07["evaluation"]["bad"]["escapes"], 1)  # 0.6 escapes
+        self.assertEqual(at_07["evaluation"]["bad"]["escapes"], 1)
         self.assertAlmostEqual(at_07["evaluation"]["bad"]["recall"], 0.75)
 
     def test_no_t_img_means_no_evaluation_and_same_result(self):

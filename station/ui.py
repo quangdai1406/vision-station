@@ -1,8 +1,3 @@
-"""HTTP server for the inspection station: a JSON API plus one HTML page.
-
-Standard library only. The page is the single _PAGE string below and loads no
-external assets. `session` is duck-typed (see make_server).
-"""
 from __future__ import annotations
 
 import base64
@@ -25,23 +20,20 @@ from station.scan import ScanError
 from station.scanstore import _component as _scan_name_check
 
 SESSION_COOKIE = "station_session"
-MES_MODE = "mes_ticket"  # auth.mode: the MES issues a one-time ticket; no local passwords
+MES_MODE = "mes_ticket"
 MAX_TICKET_CHARS = 256
 ENDED_MESSAGE = "Log in again from the MES"
 MAX_BODY_BYTES = 64 * 1024
 MAX_REASON_CHARS = 500
 PREVIEW_CAMERA_RE = re.compile(r"C[1-4]")
-# Taking data (plan section 8, step 4). Input bounds only; no quality limit is set here.
-MAX_SCAN_TOY_CHARS = 64  # same as the scan store's name limit
+MAX_SCAN_TOY_CHARS = 64
 MAX_SCAN_DEFECT_CHARS = 64
 MAX_SCAN_DEFECTS = 32
 SCAN_ACTIVE_STATES = ("SCAN_SIDE", "WAIT_FLIP", "SAVING", "FAULT")
 SCAN_SIDES = ("TOP", "BOTTOM")
-# Snapshot keys the browser may see. saved_path is left out: it is a path on the station.
 _SCAN_VIEW_KEYS = ("state", "side", "step", "counts", "sides", "scan_id", "part_number", "toy_id",
                    "label_verdict", "defects", "marks", "camera_names", "fault", "press_ready",
                    "flip_wait_s", "prompt")
-# Pending scan reviews the browser may see: no picture bytes, no folder paths.
 _SCAN_PENDING_KEYS = ("scan_id", "part_number", "toy_id", "verdict", "defects", "labelled_by",
                       "labelled_at", "steps")
 _SCAN_IMAGE_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}
@@ -49,9 +41,8 @@ PART_SEARCH_MAX_CHARS = 100
 PART_SEARCH_LIMIT_DEFAULT = 20
 PART_SEARCH_LIMIT_MAX = 50
 MAX_PART_NUMBER_CHARS = 100
-MAX_CRITERION_CHARS = 64  # longer than any MES criterion id or class name we accept
+MAX_CRITERION_CHARS = 64
 MAX_PART_ID_CHARS = 100
-# Only these keys leave the server, so no cost or planning data reaches the browser.
 _PART_SEARCH_KEYS = ("part_number", "description", "part_type", "lifecycle")
 _PART_KEYS = ("part_number", "model_version", "can_inspect", "reason", "parts_mode", "warnings")
 _LABEL_KEYS = ("session_id", "verdict", "criterion_id", "status", "changed")
@@ -59,8 +50,8 @@ _LABEL_STATUS_KEYS = ("session_id", "part_id", "part_number", "label_status", "v
                       "criterion_id", "reject_reason")
 _PENDING_LABEL_KEYS = ("session_id", "part_id", "part_number", "verdict", "criterion_id",
                        "proposed_by", "proposed_at")
-MAX_REJECT_REASON_CHARS = 200  # keep in step with station.storage.MAX_REJECT_REASON_CHARS
-MAX_DEFECT_NOTE_CHARS = 500  # keep in step with station.defect_proposal.MAX_NOTE_CHARS
+MAX_REJECT_REASON_CHARS = 200
+MAX_DEFECT_NOTE_CHARS = 500
 _CRITERIA_KEYS = ("id", "name", "description")
 
 _ACTION_PATHS = {
@@ -72,7 +63,6 @@ _ACTION_PATHS = {
     "/api/label": "label_propose",
 }
 
-# Taking data POST routes: the part after /api/scan/ -> _Handler method name.
 _SCAN_POST = {
     "start": "_scan_start",
     "press": "_scan_press",
@@ -101,7 +91,6 @@ class _HttpError(Exception):
 
 
 def _to_jsonable(value: Any) -> Any:
-    """Make snapshot values JSON-safe: enums -> value, bytes -> base64, dataclasses -> dict."""
     if isinstance(value, enum.Enum):
         return value.value
     if isinstance(value, (bytes, bytearray)):
@@ -169,7 +158,6 @@ def _parse_part_id(data: dict) -> Optional[str]:
 
 
 def _scan_toy_id(raw: Any) -> str:
-    """toy_id: 1 to 64 printable characters, usable as one path component (store rule)."""
     if not isinstance(raw, str):
         raise _HttpError(400, "toy_id is required")
     text = raw.strip()
@@ -185,7 +173,6 @@ def _scan_toy_id(raw: Any) -> str:
 
 
 def _scan_part_number(raw: Any) -> Optional[str]:
-    """part_number, or None when empty (the station's current part is used then)."""
     if raw is None:
         return None
     if not isinstance(raw, str) or len(raw) > MAX_PART_NUMBER_CHARS:
@@ -199,7 +186,6 @@ def _scan_part_number(raw: Any) -> Optional[str]:
 
 
 def _parse_scan_defects(raw: Any) -> list:
-    """Defect names as the operator typed them (no list of allowed names is enforced here)."""
     if raw is None:
         return []
     if not isinstance(raw, list) or len(raw) > MAX_SCAN_DEFECTS:
@@ -223,7 +209,6 @@ def _parse_scan_sides(raw: Any) -> list:
 
 
 def _scan_view(snap: Any) -> dict:
-    """The part of a scan snapshot the browser may see."""
     if not isinstance(snap, dict):
         raise RuntimeError("scan snapshot must be a dict")
     return {key: snap[key] for key in _SCAN_VIEW_KEYS if key in snap}
@@ -234,14 +219,10 @@ def _utc_now_text() -> str:
 
 
 def _pick(row: dict, keys: tuple) -> dict:
-    """Copy only the listed keys that the row has."""
     return {key: row[key] for key in keys if key in row}
 
 
 def _call_parts(fn, *args, **kwargs):
-    """Call a parts method on the station. A PartsError (matched by class name, so this
-    module never imports the MES client) becomes 502 with a fixed message: the exception
-    text can name hosts or credentials, so it is not sent to the browser."""
     try:
         return fn(*args, **kwargs)
     except Exception as exc:
@@ -252,21 +233,17 @@ def _call_parts(fn, *args, **kwargs):
 
 
 class _Handler(BaseHTTPRequestHandler):
-    # Filled in per server by make_server().
     station: Any = None
     users: UserStore | None = None
     sessions: SessionManager | None = None
-    # Taking data: None when disabled. Duck-typed like the session (see make_server).
     scan: Any = None
-    # mes_ticket mode (see make_server): the login mode, the MES session client and the
-    # MES role -> station role map. Unused in local mode.
     auth_mode: str = "local"
     mes_auth: Any = None
     role_map: Optional[dict] = None
-    _mes_sid: Optional[str] = None  # the MES session of the request being handled
+    _mes_sid: Optional[str] = None
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-        """No access log: nothing from a request (credentials included) is printed."""
+        pass
 
     def do_GET(self) -> None:
         self._run(self._get)
@@ -286,8 +263,6 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception:
             traceback.print_exc(file=sys.stderr)
             self._send_json(500, {"error": "internal error"})
-
-    # ----- routing -------------------------------------------------------
 
     def _get(self) -> None:
         path, _, query = self.path.partition("?")
@@ -351,8 +326,6 @@ class _Handler(BaseHTTPRequestHandler):
             raise _HttpError(404, "not found")
         return self._act(action)
 
-    # ----- endpoints -----------------------------------------------------
-
     def _state(self, query: dict) -> None:
         _, username, role = self._require()
         include_images = query.get("images", ["0"])[-1] in ("1", "true", "yes")
@@ -361,27 +334,24 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(snap, dict):
             raise RuntimeError("snapshot() must return a dict")
         body = dict(snap)
-        # "scan" is listed only when Taking data is enabled on this station and the role may use it.
         body["auth"] = {
             "username": username,
             "role": role,
             "actions": [a for a in ACTIONS if role_allows(role, a)
                         and (a != "scan" or self.scan is not None)],
         }
-        # Everyone may see that a scan holds the cameras (no scan details, no names).
         body["scan_active"] = self._scan_is_active()
         self._send_json(200, body)
 
     def _preview(self, query: dict) -> None:
-        """Live view frame: read-only. Never calls tick() or any action."""
-        self._require()  # any logged-in role may view (no action check)
+        self._require()
         camera = query.get("camera", [""])[-1]
         if not PREVIEW_CAMERA_RE.fullmatch(camera):
             raise _HttpError(400, "camera must be C1, C2, C3 or C4")
         try:
             jpeg = self.station.preview(camera)
         except Exception:
-            jpeg = None  # a preview error must never break the page
+            jpeg = None
         if not isinstance(jpeg, (bytes, bytearray)) or not jpeg:
             return self._send_empty(204)
         return self._send(200, bytes(jpeg), "image/jpeg")
@@ -402,7 +372,6 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"role": role}, extra=[("Set-Cookie", _cookie_header(token))])
 
     def _enter(self) -> None:
-        """mes_ticket: redeem a one-time ticket from the MES (fragment, POST body only)."""
         if not self._mes():
             raise _HttpError(404, "not found")
         if self.path.partition("?")[1]:
@@ -439,7 +408,6 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True}, extra=[("Set-Cookie", _expired_cookie_header())])
 
     def _parts_search(self, query: dict) -> None:
-        """Part-number search: any logged-in role. Returns only the allowed row keys."""
         self._require()
         q = query.get("q", [""])[-1].strip()
         if not 1 <= len(q) <= PART_SEARCH_MAX_CHARS:
@@ -464,7 +432,6 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, _pick(current, _PART_KEYS))
 
     def _part_select(self) -> None:
-        """Select a part. `by` is always the logged-in username, never the body."""
         _, username, _role = self._require("select_part")
         data = self._read_json()
         raw = data.get("part_number")
@@ -476,7 +443,6 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, _pick(result, _PART_KEYS))
 
     def _part_criteria(self) -> None:
-        """Active criteria (id, name, description) of the part being shown. Any logged-in role."""
         self._require()
         rows = _call_parts(self.station.part_criteria)
         if not isinstance(rows, list):
@@ -484,7 +450,6 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"criteria": [_pick(r, _CRITERIA_KEYS) for r in rows if isinstance(r, dict)]})
 
     def _defect_add(self) -> None:
-        """Propose a defect on the part being shown. The inspector is the login, never the body."""
         _, username, _role = self._require("propose_defect")
         data = self._read_json()
         criterion = data.get("criterion_id")
@@ -548,8 +513,6 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True})
 
     def _label_review(self, decision: str) -> None:
-        """Admin only. approve: make the pending proposal official, or set an official label when
-        'verdict' is sent. reject: reject the pending proposal with a reason."""
         _, username, _role = self._require("label_approve")
         data = self._read_json()
         part_id = _parse_part_id(data)
@@ -577,11 +540,6 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"pending": [_pick(r, _PENDING_LABEL_KEYS) for r in rows
                                           if isinstance(r, dict)]})
 
-    # ----- Taking data -----------------------------------------------------
-    # Every route: login (401), then the 'scan' role (403), then the feature (404 when
-    # scan is disabled). Scan refusals (busy, wrong state, bad input) are 400, or 409 for
-    # an InvalidTransition. Pictures are only ever sent by /api/scan/step-picture.
-
     def _scan_gate(self) -> tuple[str, str]:
         _, username, role = self._require("scan")
         if self.scan is None:
@@ -595,7 +553,6 @@ class _Handler(BaseHTTPRequestHandler):
         return scan.snapshot()["state"] in SCAN_ACTIVE_STATES
 
     def _scan_call(self, fn, *args, **kwargs):
-        """Run one scan action. Refusals become 400 with the station's own message."""
         try:
             return fn(*args, **kwargs)
         except InvalidTransition:
@@ -625,8 +582,6 @@ class _Handler(BaseHTTPRequestHandler):
             raise _HttpError(400, "label must be an object with verdict and defects")
         verdict = _parse_verdict(label_in).value
         defects = _parse_scan_defects(label_in.get("defects"))
-        # Only the verdict and defects come from the client. The label status and the
-        # labeller are set here, from the login: a supervisor's label is proposed, an admin's official.
         label = {
             "verdict": verdict,
             "defects": defects,
@@ -641,7 +596,6 @@ class _Handler(BaseHTTPRequestHandler):
         self._scan_reply({"scan_id": scan_id})
 
     def _default_part_number(self) -> str:
-        """The station's current part, used when the form leaves part_number empty."""
         try:
             current = _call_parts(self.station.current_part)
         except StationError:
@@ -684,7 +638,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _scan_finish(self) -> None:
         self._scan_gate()
         self._read_json()
-        self._scan_call(self.scan.finish)  # the folder path stays on the station
+        self._scan_call(self.scan.finish)
         self._scan_reply({"saved": True})
 
     def _scan_cancel(self) -> None:
@@ -705,7 +659,6 @@ class _Handler(BaseHTTPRequestHandler):
         self._scan_call(self.scan.reset)
         self._scan_reply()
 
-    # Approval of finished scans (admin): gate is the 'label_approve' action, then the feature.
     def _scan_review_gate(self) -> str:
         _, username, _role = self._require("label_approve")
         if self.scan is None:
@@ -723,7 +676,6 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"pending": self._scan_pending_rows()})
 
     def _scan_review(self) -> None:
-        """Approve or reject a proposed scan label. The reviewer is the login, never the body."""
         username = self._scan_review_gate()
         data = self._read_json()
         scan_id = data.get("scan_id")
@@ -747,7 +699,6 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"label": _to_jsonable(label), "pending": self._scan_pending_rows()})
 
     def _scan_step_picture(self, query: dict) -> None:
-        """The picture of the camera for the last saved step. 204 when there is none."""
         self._scan_gate()
         camera = query.get("camera", [""])[-1]
         if not PREVIEW_CAMERA_RE.fullmatch(camera):
@@ -760,8 +711,6 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_empty(204)
         ctype = _SCAN_IMAGE_TYPES.get(str(ext).lower(), "application/octet-stream")
         return self._send(200, bytes(data), ctype)
-
-    # ----- helpers -------------------------------------------------------
 
     def _cookie_token(self):
         raw = self.headers.get("Cookie")
@@ -779,18 +728,12 @@ class _Handler(BaseHTTPRequestHandler):
         return self.auth_mode == MES_MODE
 
     def _end_mes(self, session_id: str) -> None:
-        """End an MES session, best effort. Nothing from the MES reply reaches the browser."""
         try:
             self.mes_auth.end(session_id)
-        except Exception:  # the station session is gone either way; the MES expires it
+        except Exception:
             pass
 
     def _require(self, action: str | None = None):
-        """Return (token, username, role) or raise 401 / 403.
-
-        mes_ticket mode: every call asks the MES whether the bound session is still active.
-        The role is the one the MES gives now, mapped through role_map.
-        """
         token = self._cookie_token()
         got = self.sessions.get(token) if token else None
         if got is None:
@@ -875,29 +818,6 @@ def make_server(session, users: UserStore, sessions: SessionManager,
                 host: str = "127.0.0.1", port: int = 0, scan=None, *,
                 auth_mode: str = "local", mes_auth=None,
                 role_map: Optional[dict] = None) -> ThreadingHTTPServer:
-    """Build (but do not start) the UI server.
-
-    `session` must provide: snapshot(include_images=False) -> dict, press() -> bool,
-    resolve_review(by, new_verdict, reason), override(by, new_verdict, reason),
-    ack_alarm(), clear_fault(), tick(), preview(camera_id) -> bytes | None.
-    snapshot() may also carry prompt (str), press_ready (bool) and flip_wait_s (float),
-    and in part mode parts_mode, camera ({open, last_error}), part_number, part_selected,
-    model_version, can_inspect and block_reason. Part picker (used when parts_mode is 'mes'):
-    search_parts(q, limit) -> list[dict], select_part(part_number, by) -> dict,
-    current_part() -> dict. A PartsError (matched by class name) maps to 502.
-    InvalidTransition -> 409, ValueError -> 400.
-
-    `scan` (optional, Taking data): None when disabled, else a ScanSession or a wrapper
-    with start, press, done_side, mark, finish, cancel, clear_fault, reset,
-    step_picture(camera_id) -> (bytes, ext) | None and snapshot() -> dict. Disabled means
-    the scan routes answer 404 (after the login and role checks) and the 'scan' action is
-    not listed for anyone.
-
-    auth_mode 'mes_ticket': mes_auth is a MesSessionClient (redeem, validate, end) and role_map
-    maps MES roles to station roles. Logins come from GET /enter (the ticket in the URL
-    fragment) and POST /api/enter; local passwords are refused; every call validates the MES
-    session; press passes by= and station_session= to the session.
-    """
     if auth_mode not in ("local", MES_MODE):
         raise ValueError("auth_mode must be 'local' or 'mes_ticket'")
     if auth_mode == MES_MODE and (mes_auth is None or not role_map):
@@ -2698,6 +2618,5 @@ input[type="radio"], input[type="checkbox"] { width: auto; min-height: 0; margin
 """
 
 
-# mes_ticket: the same page, marked so the login form is replaced by "Log in again from the MES".
 _PAGE_MES = _PAGE.replace("<body>", '<body data-auth="mes">', 1)
 assert _PAGE_MES != _PAGE

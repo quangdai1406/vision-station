@@ -1,22 +1,3 @@
-"""HTTP server for the laptop inference service. Standard library only at import time.
-
-POST /v1/predict
-    headers: Authorization: Bearer <token>, Part-Number, Camera-Id, Side (TOP or BOTTOM),
-             Content-Type image/png or image/jpeg
-    body: the picture bytes (raw, not multipart)
-    200: {camera_id, side, score, defects:[{defect_class, score, box:[x,y,w,h]}], model_version}
-GET /v1/health (NO token)
-    200: {status, busy, in_flight}. busy is a JSON boolean; run_weekly_training.ps1 reads it.
-GET /v1/status (token)
-    200: {status, version, models:[{part_number, version}], busy, in_flight, gpu}
-GET /v1/models/<part_number> (token; the part number is percent-encoded, slashes as %2F)
-    200: {part_number, approved: true, model_version}  (sha256 verified, nothing is loaded)
-    404: {approved: false, reason} when no model is approved for the part
-    503: {approved: false, reason} when the approved version fails verification
-
-Scores are raw: the station applies t_low and t_img, never this service. The token is read from
-the environment variable named by --token-env and is never printed, logged or returned.
-"""
 from __future__ import annotations
 
 import argparse
@@ -41,7 +22,7 @@ SERVICE_VERSION = "1"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_TOKEN_ENV = "INFERENCE_TOKEN"
-DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024  # largest picture accepted; an engineering limit, not a quality one
+DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024
 PREDICT_PATH = "/v1/predict"
 HEALTH_PATH = "/v1/health"
 STATUS_PATH = "/v1/status"
@@ -56,7 +37,6 @@ def utc_now() -> str:
 
 
 def parse_predict_headers(headers: Any) -> tuple[str, str, Side]:
-    """(part_number, camera_id, side) from the request headers. ValueError names the bad header."""
     part = (headers.get("Part-Number") or "").strip()
     if not part or len(part) > _PART_MAX:
         raise ValueError(f"Part-Number header is required (1 to {_PART_MAX} characters)")
@@ -71,7 +51,6 @@ def parse_predict_headers(headers: Any) -> tuple[str, str, Side]:
 
 
 def gpu_info() -> dict:
-    """GPU state, best effort. Reports only what is already loaded: never imports torch."""
     torch = sys.modules.get("torch")
     if torch is None:
         return {"torch_loaded": False, "cuda_available": None}
@@ -84,8 +63,6 @@ def gpu_info() -> dict:
 
 
 class Service:
-    """Shared state for the handler threads: the token, the registry and the busy counter."""
-
     def __init__(self, registry: ModelRegistry, token: str, max_body_bytes: int) -> None:
         if not isinstance(token, str) or not token:
             raise ValueError("an access token is required")
@@ -129,7 +106,7 @@ class _Handler(BaseHTTPRequestHandler):
     sys_version = ""
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - base class signature
-        return  # the default would print to stderr with every header; we log in log_request
+        return
 
     def log_request(self, code: Any = "-", size: Any = "-") -> None:
         sys.stderr.write(f"{self.command} {self.path.split('?')[0]} {code}\n")
@@ -152,7 +129,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - http.server name
         path = self.path.split("?")[0]
         service = self.server.service
-        if path == HEALTH_PATH:  # unauthenticated: reveals only whether a request is in progress
+        if path == HEALTH_PATH:
             in_flight = service.in_flight()
             self._json(200, {"status": "ok", "busy": in_flight > 0, "in_flight": in_flight})
             return
@@ -175,11 +152,10 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def _model_lookup(self, raw_part: str) -> None:
-        """Which version is approved for the part. Verifies it; never loads it, never falls back."""
         if "/" in raw_part:
             self._json(400, {"error": "the part number must be percent-encoded (a slash is %2F)"})
             return
-        part = unquote(raw_part).strip()  # one decoding of the path segment; '+' stays '+'
+        part = unquote(raw_part).strip()
         if not part or len(part) > _PART_MAX:
             self._json(400, {"error": f"the part number must be 1 to {_PART_MAX} characters"})
             return
@@ -268,7 +244,6 @@ class _Handler(BaseHTTPRequestHandler):
 
 def build_server(registry: ModelRegistry, *, token: str, host: str = DEFAULT_HOST,
                  port: int = DEFAULT_PORT, max_body_bytes: int = DEFAULT_MAX_BODY_BYTES) -> _Server:
-    """A bound, not yet serving, server. port=0 picks a free port (tests use it)."""
     server = _Server((host, port), _Handler)
     server.service = Service(registry, token, max_body_bytes)
     return server
@@ -287,14 +262,12 @@ def _extractor_factory(spec: Optional[dict]) -> Callable[[], Any]:
 
 
 def default_loader(extractor_spec: Optional[dict]) -> Callable[[ms.ModelInfo], Any]:
-    """The production loader: the same model classes and decoder the station uses for PatchCore."""
-
     def load(info: ms.ModelInfo) -> Any:
         if info.type != "patchcore":
             raise ModelUnavailable(f"this service serves patchcore models, not {info.type}")
         from station.anomaly import cv2_rgb_decoder, register_patchcore_loader  # noqa: PLC0415 - lazy
 
-        decode = cv2_rgb_decoder()  # cv2 is imported here, at load time, not at startup
+        decode = cv2_rgb_decoder()
         register_patchcore_loader(_extractor_factory(extractor_spec))
         return ms.load_runtime_model(info, decode)
 

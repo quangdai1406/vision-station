@@ -1,4 +1,3 @@
-"""Tests for station.session.StationSession. Fakes only; time is injected, no sleeping."""
 import base64
 import unittest
 
@@ -35,8 +34,8 @@ class FakeCameras:
     def __init__(self, default_n=4):
         self.sides = []
         self.default_n = default_n
-        self.script = []  # per call: None -> default_n frames, int -> that many frames, list -> those frames, exception -> raise
-        self.on_capture = None  # optional hook, called at the start of each capture (e.g. to advance a fake clock)
+        self.script = []
+        self.on_capture = None
 
     def capture(self, side):
         self.sides.append(side)
@@ -94,8 +93,8 @@ class FakeStore:
     def __init__(self):
         self.saved = []
         self.events = []
-        self.save_script = []  # per save: None -> ok, exception -> raise
-        self.on_save = None    # optional hook, called before each save attempt
+        self.save_script = []
+        self.on_save = None
 
     def save_part(self, record):
         if self.on_save is not None:
@@ -145,8 +144,6 @@ class _Ids:
 
 
 class RecordingFuse:
-    """Fuse fake that accepts any result count and records the keyword arguments it was called with."""
-
     def __init__(self, verdict=Verdict.GOOD):
         self.verdict = verdict
         self.calls = []
@@ -158,15 +155,13 @@ class RecordingFuse:
         return PartVerdict(verdict=self.verdict, results=tuple(results), reason="fake")
 
 
-KEEP_DEFAULT = object()  # Harness(min_flip_s=KEEP_DEFAULT) builds the session without the argument (default 2.0)
+KEEP_DEFAULT = object()
 
 
 class PreviewCameras(FakeCameras):
-    """FakeCameras that also has a preview() passthrough."""
-
     def __init__(self, error=None, **kw):
         super().__init__(**kw)
-        self.error = error  # exception to raise from preview(), if set
+        self.error = error
         self.previews = []
 
     def preview(self, camera_id):
@@ -205,7 +200,6 @@ class Harness:
         return self.session.press()
 
     def complete_part(self, t0=0.0):
-        """Two accepted presses: TOP then BOTTOM."""
         assert self.press_at(t0) is True
         assert self.press_at(t0 + 1.0) is True
 
@@ -385,8 +379,8 @@ class DebounceTests(_Base):
     def test_ignored_press_does_not_extend_the_window(self):
         h = self.harness(fuse_verdict=Verdict.GOOD)
         self.assertTrue(h.press_at(0.0))
-        self.assertFalse(h.press_at(0.2))   # ignored, measured from the accepted press at 0.0
-        self.assertTrue(h.press_at(0.35))   # 0.35 s after the accepted press
+        self.assertFalse(h.press_at(0.2))
+        self.assertTrue(h.press_at(0.35))
         self.assertEqual(h.session.state, State.IDLE)
         self.assertEqual(h.session.counters["total"], 1)
 
@@ -431,7 +425,7 @@ class CameraFaultTests(_Base):
         self.assertIn("C2 timeout", faults[0][1]["error"])
         self.assertIn("C2 timeout", h.session.snapshot()["fault"])
 
-        self.assertFalse(h.press_at(5.0))  # presses ignored in FAULT
+        self.assertFalse(h.press_at(5.0))
         h.session.clear_fault()
         self.assertEqual(h.session.state, State.IDLE)
         self.assertEqual(h.outputs.calls[-1], "clear")
@@ -489,7 +483,7 @@ class RetakeTests(_Base):
 
         def frame_ok(frame):
             calls.append(frame)
-            return len(calls) != 1  # only the very first frame is blurred
+            return len(calls) != 1
 
         h = self.harness(fuse_verdict=Verdict.GOOD, frame_ok=frame_ok)
         h.complete_part(0.0)
@@ -500,7 +494,7 @@ class RetakeTests(_Base):
         h = self.harness(fuse_verdict=Verdict.GOOD, frame_ok=lambda f: False, max_retakes=2)
         self.assertTrue(h.press_at(0.0))
         self.assertEqual(h.session.state, State.FAULT)
-        self.assertEqual(h.cameras.sides, [Side.TOP] * 3)  # first try + 2 retakes
+        self.assertEqual(h.cameras.sides, [Side.TOP] * 3)
         self.assertIn("after 2 retake", h.session.snapshot()["fault"])
         self.assertEqual(h.store.saved, [])
         self.assertEqual(h.session.counters["total"], 0)
@@ -556,11 +550,11 @@ class SnapshotTests(_Base):
         self.assertEqual(r["side"], "TOP")
         self.assertEqual(r["defects"][0]["box"], [1, 2, 3, 4])
         self.assertEqual(set(r["defects"][0]), {"defect_class", "score", "box"})
-        self.assertIsNone(snap["verdict"])  # nothing judged yet
+        self.assertIsNone(snap["verdict"])
 
     def test_snapshot_images_metadata_is_present_without_b64(self):
         h = self.harness()
-        h.press_at(0.0)  # TOP only: 4 frames captured, inferred
+        h.press_at(0.0)
         snap = h.session.snapshot()
         self.assertEqual(len(snap["images"]), 4)
         img = snap["images"][0]
@@ -584,7 +578,7 @@ class SnapshotTests(_Base):
     def test_snapshot_verdict_values(self):
         h = self.harness(fuse_verdict=Verdict.BAD)
         h.complete_part(0.0)
-        self.assertEqual(h.session.snapshot()["verdict"], "BAD")  # shown before ack, not saved
+        self.assertEqual(h.session.snapshot()["verdict"], "BAD")
         self.assertIsNone(h.session.snapshot()["final_verdict"])
         h.session.ack_alarm()
         self.assertEqual(h.session.snapshot()["verdict"], "BAD")
@@ -607,13 +601,13 @@ class InvalidTransitionTests(_Base):
     def test_actions_in_wrong_state_raise(self):
         h = self.harness()
         with self.assertRaises(InvalidTransition):
-            h.session.ack_alarm()  # IDLE
+            h.session.ack_alarm()
         with self.assertRaises(InvalidTransition):
-            h.session.override("sup", Verdict.GOOD, "reason")  # IDLE
+            h.session.override("sup", Verdict.GOOD, "reason")
         with self.assertRaises(InvalidTransition):
-            h.session.resolve_review("sup", Verdict.GOOD, "reason")  # IDLE
+            h.session.resolve_review("sup", Verdict.GOOD, "reason")
         with self.assertRaises(InvalidTransition):
-            h.session.clear_fault()  # IDLE
+            h.session.clear_fault()
 
     def test_ack_and_override_not_allowed_in_supervisor_review(self):
         h = self.harness(fuse_verdict=Verdict.REVIEW)
@@ -698,7 +692,7 @@ class SaveFailureTests(_Base):
     def test_save_failure_on_good_goes_to_fault_counts_nothing_and_stays_dark(self):
         h = self.harness(fuse_verdict=Verdict.GOOD)
         h.store.save_script = [OSError("disk full")]
-        h.complete_part(0.0)  # must not raise
+        h.complete_part(0.0)
         s = h.session
         self.assertEqual(s.state, State.FAULT)
         self.assertEqual(h.outputs.calls[-1], "show_fault")
@@ -713,8 +707,8 @@ class SaveFailureTests(_Base):
         self.assertIn("disk full", snap["fault"])
         self.assertIsNone(snap["final_verdict"])
         self.assertEqual(snap["machine_verdict"], "GOOD")
-        self.assertIsNone(snap["verdict"])  # GOOD is not shown until it is saved
-        self.assertEqual(len(snap["results"]), 8)  # results kept for the retry
+        self.assertIsNone(snap["verdict"])
+        self.assertEqual(len(snap["results"]), 8)
 
     def test_clear_fault_retries_save_once_and_counts_once(self):
         h = self.harness(fuse_verdict=Verdict.GOOD)
@@ -747,9 +741,9 @@ class SaveFailureTests(_Base):
         self.assertNotIn("show_good", h.outputs.calls)
         self.assertEqual(s.counters, {"total": 0, "good": 0, "bad": 0})
         self.assertEqual(h.store.saved, [])
-        self.assertFalse(h.press_at(10.0))  # still in FAULT
+        self.assertFalse(h.press_at(10.0))
 
-        h.session.clear_fault()  # store has recovered
+        h.session.clear_fault()
         self.assertEqual(s.state, State.IDLE)
         self.assertEqual(s.counters, {"total": 1, "good": 1, "bad": 0})
         self.assertEqual(len(h.store.saved), 1)
@@ -831,12 +825,10 @@ class SaveFailureTests(_Base):
 
 
 class RaisingOutputs(FakeOutputs):
-    """OutputDriver whose named methods raise after recording the call."""
-
     def __init__(self, raising):
         super().__init__()
         self.raising = set(raising)
-        self.armed = False  # off until the test reaches the call it wants to fail
+        self.armed = False
 
     def _maybe_raise(self, name):
         self.calls.append(name)
@@ -885,7 +877,7 @@ class OutputFailureTests(_Base):
         h = self._harness(Verdict.GOOD, ("show_good",))
         self.assertTrue(h.press_at(0.0))
         h.outputs.armed = True
-        self.assertTrue(h.press_at(1.0))  # must not raise
+        self.assertTrue(h.press_at(1.0))
         self._assert_saved_despite_output_failure(h, "show_good", Verdict.GOOD)
         self.assertEqual(h.session.counters, {"total": 1, "good": 1, "bad": 0})
         self.assertEqual(len(h.completed), 1)
@@ -904,11 +896,10 @@ class OutputFailureTests(_Base):
         h = self._harness(Verdict.BAD, ("show_bad",))
         h.complete_part(0.0)
         h.outputs.armed = True
-        h.session.ack_alarm()  # must not raise
+        h.session.ack_alarm()
         self._assert_saved_despite_output_failure(h, "show_bad", Verdict.BAD)
         self.assertEqual(h.store.saved[0].disposition, "quarantine")
         self.assertEqual(h.session.counters, {"total": 1, "good": 0, "bad": 1})
-        # the remaining light is still attempted after show_bad raised
         self.assertIn("alarm_off", h.outputs.calls[-2:])
         self.assertEqual(len(h.completed), 1)
 
@@ -916,11 +907,10 @@ class OutputFailureTests(_Base):
         h = self._harness(Verdict.BAD, ("alarm_off",))
         h.complete_part(0.0)
         h.outputs.armed = True
-        h.session.override("sup-1", Verdict.GOOD, "re-measured")  # must not raise
+        h.session.override("sup-1", Verdict.GOOD, "re-measured")
         self._assert_saved_despite_output_failure(h, "alarm_off", Verdict.GOOD)
         self.assertEqual(h.store.saved[0].disposition, "released")
         self.assertEqual(h.session.counters, {"total": 1, "good": 1, "bad": 0})
-        # show_good is still attempted after alarm_off raised
         self.assertIn("show_good", h.outputs.calls)
         self.assertEqual(len(h.completed), 1)
 
@@ -928,7 +918,7 @@ class OutputFailureTests(_Base):
         h = self._harness(Verdict.BAD, ("show_bad",))
         h.complete_part(0.0)
         h.outputs.armed = True
-        h.session.override("sup-1", "BAD", "confirmed defect")  # must not raise
+        h.session.override("sup-1", "BAD", "confirmed defect")
         self._assert_saved_despite_output_failure(h, "show_bad", Verdict.BAD)
         self.assertEqual(h.session.counters, {"total": 1, "good": 0, "bad": 1})
         self.assertIn("alarm_off", h.outputs.calls)
@@ -941,8 +931,6 @@ class OutputFailureTests(_Base):
 
 
 class AlarmAndFaultLightFailureTests(_Base):
-    """show_bad / show_review / show_fault run after their state is set; a raise must not wedge the station."""
-
     def _harness(self, fuse_verdict, raising):
         h = self.harness(fuse_verdict=fuse_verdict)
         h.outputs = RaisingOutputs(raising)
@@ -958,9 +946,9 @@ class AlarmAndFaultLightFailureTests(_Base):
 
     def test_a_show_bad_raises_on_fuse_step_then_ack_saves_once(self):
         h = self._harness(Verdict.BAD, ("show_bad",))
-        h.outputs.armed = True  # fails only during the BAD fuse step
+        h.outputs.armed = True
         self.assertTrue(h.press_at(0.0))
-        self.assertTrue(h.press_at(1.0))  # must not raise out of press()
+        self.assertTrue(h.press_at(1.0))
         s = h.session
         self.assertEqual(s.state, State.VERDICT)
         self.assertEqual(s.snapshot()["verdict"], "BAD")
@@ -968,10 +956,10 @@ class AlarmAndFaultLightFailureTests(_Base):
         self.assertNotIn("show_fault", h.outputs.calls)
         event = self._outputs_failed(h, "show_bad")
         self.assertEqual(event[1]["part_id"], "part-1")
-        self.assertEqual(h.store.saved, [])  # not saved until the ack
+        self.assertEqual(h.store.saved, [])
         self.assertEqual(s.counters, {"total": 0, "good": 0, "bad": 0})
 
-        h.outputs.armed = False  # the driver is back for the operator's ack
+        h.outputs.armed = False
         s.ack_alarm()
         self.assertEqual(s.state, State.IDLE)
         self.assertEqual(len(h.store.saved), 1)
@@ -1006,7 +994,7 @@ class AlarmAndFaultLightFailureTests(_Base):
         h = self._harness(Verdict.GOOD, ("show_fault",))
         h.cameras.script = [CameraError("C2 timeout")]
         h.outputs.armed = True
-        self.assertTrue(h.press_at(0.0))  # must not raise out of press()
+        self.assertTrue(h.press_at(0.0))
         s = h.session
         self.assertEqual(s.state, State.FAULT)
         self.assertIn("C2 timeout", s.snapshot()["fault"])
@@ -1028,7 +1016,7 @@ class AlarmAndFaultLightFailureTests(_Base):
         h.session.ack_alarm()
         self.assertEqual(h.session.state, State.IDLE)
 
-        self.assertTrue(h.press_at(10.0))  # next part starts normally
+        self.assertTrue(h.press_at(10.0))
         self.assertEqual(h.session.state, State.WAIT_FLIP)
         self.assertEqual(h.session.snapshot()["part_id"], "part-2")
         self.assertTrue(h.press_at(11.0))
@@ -1050,15 +1038,15 @@ class FaultClearTests(_Base):
         h = self.harness(fuse_verdict=Verdict.GOOD)
         h.cameras.script = [None, CameraError("C4 dropped")]
         h.press_at(0.0)
-        h.press_at(1.0)  # bottom capture fails
+        h.press_at(1.0)
         self.assertEqual(h.session.state, State.FAULT)
         h.clock.t = 100.0
         h.session.clear_fault()
         self.assertEqual(h.session.state, State.WAIT_FLIP)
-        h.clock.t = 150.0  # 50 s after the clear: within the 60 s flip timeout
+        h.clock.t = 150.0
         self.assertFalse(h.session.tick())
         self.assertEqual(h.session.state, State.WAIT_FLIP)
-        h.clock.t = 160.5  # more than 60 s after the clear
+        h.clock.t = 160.5
         self.assertTrue(h.session.tick())
         self.assertEqual(h.session.state, State.IDLE)
 
@@ -1081,8 +1069,6 @@ def _events(h, kind):
 
 
 class PartialStationTests(_Base):
-    """Proof-of-concept station with fewer than 4 cameras (1 camera here)."""
-
     def partial(self, fuse_verdict=Verdict.GOOD, **kw):
         return self.harness(fuse_verdict=fuse_verdict, camera_ids=("C1",),
                             fuse=RecordingFuse(fuse_verdict), **kw)
@@ -1219,8 +1205,6 @@ class FullStationDefaultTests(_Base):
 
 
 class FlipGapTests(_Base):
-    """A BOTTOM press waits min_flip_s after the TOP capture finished; debounce runs from the end of a press."""
-
     def test_default_min_flip_rejects_0_5s_and_accepts_2_1s_after_top(self):
         h = self.harness(fuse_verdict=Verdict.GOOD, min_flip_s=KEEP_DEFAULT)
         s = h.session
@@ -1236,8 +1220,6 @@ class FlipGapTests(_Base):
         self.assertEqual(s.counters["total"], 1)
 
     def test_second_press_right_after_slow_top_capture_is_not_taken_as_bottom(self):
-        # Regression for the real bug: the TOP capture takes 5 s, so a press that
-        # arrives just after it finished used to pass a debounce measured from its start.
         h = self.harness(fuse_verdict=Verdict.GOOD, min_flip_s=KEEP_DEFAULT)
         h.cameras.on_capture = lambda side: h.clock.advance(5.0)
         s = h.session
@@ -1245,10 +1227,10 @@ class FlipGapTests(_Base):
         self.assertEqual(h.clock.t, 5.0)
         self.assertEqual(s.state, State.WAIT_FLIP)
 
-        self.assertFalse(h.press_at(5.0))  # 0 s after the TOP finished: inside the debounce
+        self.assertFalse(h.press_at(5.0))
         self.assertEqual(_events(h, "press_ignored")[-1]["reason"], "debounce")
 
-        self.assertFalse(h.press_at(5.5))  # 0.5 s after: past the debounce, inside the 2.0 s gap
+        self.assertFalse(h.press_at(5.5))
         ignored = _events(h, "press_ignored")[-1]
         self.assertEqual(ignored["reason"], "flip_too_soon")
         self.assertAlmostEqual(ignored["seconds_remaining"], 1.5)
@@ -1256,7 +1238,7 @@ class FlipGapTests(_Base):
         self.assertEqual(h.cameras.sides, [Side.TOP])
         self.assertEqual(s.counters["total"], 0)
 
-        self.assertTrue(h.press_at(7.1))  # 2.1 s after the TOP finished
+        self.assertTrue(h.press_at(7.1))
         self.assertEqual(s.state, State.IDLE)
         self.assertEqual(h.cameras.sides, [Side.TOP, Side.BOTTOM])
         self.assertEqual(s.counters["total"], 1)
@@ -1270,12 +1252,12 @@ class FlipGapTests(_Base):
 
     def test_debounce_runs_from_the_end_of_the_previous_press(self):
         h = self.harness(fuse_verdict=Verdict.GOOD)
-        h.cameras.on_capture = lambda side: h.clock.advance(1.0)  # each capture takes 1 s
-        self.assertTrue(h.press_at(0.0))   # finishes at 1.0
-        self.assertFalse(h.press_at(1.1))  # 0.1 s after the finish; from the start it would pass
+        h.cameras.on_capture = lambda side: h.clock.advance(1.0)
+        self.assertTrue(h.press_at(0.0))
+        self.assertFalse(h.press_at(1.1))
         self.assertEqual(_events(h, "press_ignored")[-1]["reason"], "debounce")
         self.assertEqual(h.cameras.sides, [Side.TOP])
-        self.assertTrue(h.press_at(1.5))   # 0.5 s after the finish
+        self.assertTrue(h.press_at(1.5))
         self.assertEqual(h.session.state, State.IDLE)
 
     def test_negative_min_flip_raises_value_error(self):
@@ -1286,11 +1268,11 @@ class FlipGapTests(_Base):
         h = self.harness(fuse_verdict=Verdict.GOOD, min_flip_s=KEEP_DEFAULT)
         h.cameras.script = [None, CameraError("C4 dropped")]
         h.press_at(0.0)
-        self.assertTrue(h.press_at(3.0))  # BOTTOM capture fails
+        self.assertTrue(h.press_at(3.0))
         self.assertEqual(h.session.state, State.FAULT)
         h.session.clear_fault()
         self.assertEqual(h.session.state, State.WAIT_FLIP)
-        h.clock.t = 3.5  # past the debounce measured from the failed press
+        h.clock.t = 3.5
         snap = h.session.snapshot()
         self.assertIs(snap["press_ready"], True)
         self.assertEqual(snap["flip_wait_s"], 0.0)
@@ -1364,7 +1346,7 @@ class PreviewTests(_Base):
         self.assertEqual(cams.previews, ["C2"])
 
     def test_preview_is_none_without_a_preview_method(self):
-        h = self.harness()  # FakeCameras has no preview()
+        h = self.harness()
         self.assertIsNone(h.session.preview("C1"))
 
     def test_preview_is_none_for_an_unknown_camera_id(self):
@@ -1385,7 +1367,7 @@ class PreviewTests(_Base):
     def test_preview_changes_no_state_counters_outputs_or_events(self):
         cams = PreviewCameras()
         h = self.harness(cameras=cams)
-        h.press_at(0.0)  # TOP captured, waiting for the flip
+        h.press_at(0.0)
         s = h.session
 
         def fingerprint():
@@ -1403,8 +1385,6 @@ class PreviewTests(_Base):
 
 
 class PartSelectionTests(_Base):
-    """Part number and model chosen at run time (multi-part station)."""
-
     def _part_model(self, version):
         m = FakeModel()
         m.version = version
@@ -1523,7 +1503,7 @@ class PartSelectionTests(_Base):
         self.assertEqual(ignored["reason"], "no_part_or_model")
         self.assertEqual(ignored["block_reason"], "No approved model for PN-1")
 
-        s.set_blocked("   ")  # blank clears, like None
+        s.set_blocked("   ")
         self.assertIs(s.can_inspect, True)
         self.assertEqual(s.block_reason, "")
         self.assertEqual(s.snapshot()["block_reason"], "")

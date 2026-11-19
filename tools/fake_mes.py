@@ -1,32 +1,3 @@
-"""HOME TRIAL fake MES: a local stand-in for the machine API, for testing at home.
-
-This is NOT the real MES. It answers the same routes the station uses (part search, part
-lookup, criteria, inspection events) so the station can be exercised without the factory
-network. Standard library only.
-
-Run (PowerShell or bash), with the token in an environment variable, never on the command line:
-  python3 -m tools.fake_mes --token-env STATION_MES_TOKEN --port 3000 [--host 127.0.0.1]
-      [--parts FILE.json] [--criteria FILE.json] [--out DIR]
-
-The token is read only from the environment variable named by --token-env. It is checked
-against the Authorization header on every request and is never written to a file or printed.
-
-Routes (all need "Authorization: Bearer <token>", else 401):
-  GET  /api/machine/parts/search?q=&limit=     list of part objects (limit clamped 1..50)
-  GET  /api/machine/parts/<part_number>        one part, or 404
-  GET  /api/machine/criteria/<part_number>     list of criteria, or 404
-  POST /api/machine/inspection-events          multipart/form-data; needs Idempotency-Key
-       first time for a key: 201 {"id": n}; same key again: 200 {"id": n} (a replay)
-       missing Idempotency-Key: 400
-
---parts FILE.json: a JSON list of part objects with "part_number", or an object keyed by
-part number. --criteria FILE.json: an object mapping part number to a list of criteria in the
-tools/criteria.py format. Without them, a built-in sample part with two visual criteria is used.
-
-Every accepted event (not replays) is appended as one JSON line to OUT/events.jsonl: the key,
-the text fields, and the name and byte size of each photo. Photo bytes and the token are not
-written. On restart the existing events.jsonl is read so keys keep their ids.
-"""
 from __future__ import annotations
 
 import argparse
@@ -73,11 +44,11 @@ SAMPLE_CRITERIA: dict[str, list[dict[str, Any]]] = {
 
 
 class FakeMesError(Exception):
-    """A configuration problem with the fake MES inputs. Never contains the token."""
+    pass
 
 
 class MultipartError(Exception):
-    """The request body is not a multipart/form-data message this fake can read."""
+    pass
 
 
 def _read_json(path: str) -> Any:
@@ -90,7 +61,6 @@ def _read_json(path: str) -> Any:
 
 
 def load_parts(path: str) -> dict[str, dict[str, Any]]:
-    """Read a parts file (a list of parts, or an object keyed by part number)."""
     data = _read_json(path)
     if isinstance(data, dict):
         items = []
@@ -118,7 +88,6 @@ def load_parts(path: str) -> dict[str, dict[str, Any]]:
 
 
 def load_criteria(path: str) -> dict[str, list[dict[str, Any]]]:
-    """Read a criteria file: an object mapping part number to a list of criteria."""
     data = _read_json(path)
     if not isinstance(data, dict):
         raise FakeMesError(f"{path}: expected an object mapping part number to criteria")
@@ -130,7 +99,6 @@ def load_criteria(path: str) -> dict[str, list[dict[str, Any]]]:
 
 
 def parse_multipart(content_type: str, body: bytes) -> tuple[dict[str, str], list[tuple[str, str, bytes]]]:
-    """Return (text fields, photos as (field name, filename, bytes)) from a multipart body."""
     if not content_type.lower().startswith("multipart/form-data"):
         raise MultipartError("Content-Type must be multipart/form-data")
     try:
@@ -169,7 +137,7 @@ def _parse_limit(text: str | None) -> int:
 
 class _Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-        pass  # quiet: request lines can carry search text; headers are never logged
+        pass
 
     def _send_json(self, status: int, payload: Any, extra: dict[str, str] | None = None) -> None:
         data = json.dumps(payload).encode("utf-8")
@@ -221,7 +189,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return self._send_json(400, {"error": "bad Content-Length"})
         if length < 0 or length > MAX_BODY_BYTES:
             return self._send_json(413, {"error": "request body too large"})
-        body = self.rfile.read(length)  # read before answering so the connection stays clean
+        body = self.rfile.read(length)
         if not self._authorized():
             return self._unauthorized()
         if urllib.parse.urlsplit(self.path).path != EVENTS_PATH:
@@ -238,8 +206,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 
 class FakeMesServer(http.server.ThreadingHTTPServer):
-    """The fake MES. Use port 0 in tests; read the bound port from base_url."""
-
     daemon_threads = True
 
     def __init__(self, token: str, *, parts: dict[str, dict[str, Any]] | None = None,
@@ -255,7 +221,7 @@ class FakeMesServer(http.server.ThreadingHTTPServer):
         self.out_dir = Path(out_dir or DEFAULT_OUT_DIR)
         self.events_path = self.out_dir / "events.jsonl"
         self.lock = threading.Lock()
-        self.accepted: dict[str, int] = {}  # Idempotency-Key -> event id
+        self.accepted: dict[str, int] = {}
         self.next_id = 0
         self.replays = 0
         self._thread: threading.Thread | None = None
@@ -275,14 +241,13 @@ class FakeMesServer(http.server.ThreadingHTTPServer):
                 try:
                     rec = json.loads(line)
                 except ValueError:
-                    continue  # a partial last line from a crash is ignored
+                    continue
                 if isinstance(rec, dict) and isinstance(rec.get("key"), str) and isinstance(rec.get("id"), int):
                     self.accepted[rec["key"]] = rec["id"]
                     self.next_id = max(self.next_id, rec["id"])
 
     def accept_event(self, key: str, fields: dict[str, str],
                      photos: list[tuple[str, str, bytes]]) -> tuple[int, dict[str, int]]:
-        """Store one inspection event. Returns (status, payload) for the HTTP answer."""
         with self.lock:
             if key in self.accepted:
                 self.replays += 1

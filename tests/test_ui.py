@@ -1,4 +1,3 @@
-"""HTTP tests for station.ui using a fake session on 127.0.0.1, port 0."""
 import base64
 import collections
 import http.client
@@ -18,7 +17,6 @@ from station.auth import SessionManager, UserStore, hash_password
 from station.contracts import InvalidTransition, Verdict
 from station.ui import make_server
 
-# Throwaway test credentials only.
 OP_USER, OP_PW = "op-test", "op-test-pass-1"
 SUP_USER, SUP_PW = "sup-test", "sup-test-pass-1"
 ADM_USER, ADM_PW = "adm-test", "adm-test-pass-1"
@@ -31,23 +29,18 @@ JPEG_BYTES = b"\xff\xd8\xff-fake-jpeg-frame"
 
 
 class FakeSession:
-    """Duck-typed session. snapshot() returns the shape the real session returns."""
-
     def __init__(self):
         self.calls = []
         self.errors = {}
         self.press_result = True
         self.verdict = None
-        # None means the key is absent, as in a snapshot from before the change.
         self.partial_station = None
         self.camera_ids = None
         self.prompt = "Flip the part, then press Enter"
         self.press_ready = True
         self.flip_wait_s = 0.0
-        # False leaves prompt, press_ready and flip_wait_s out of snapshot().
         self.new_keys = True
         self.preview_bytes = JPEG_BYTES
-        # Part picker: when set, these keys are merged into snapshot() (parts_mode 'mes').
         self.parts_snapshot = None
         self.last_label = {"session_id": "S-9", "part_id": "P-7", "part_number": "AISI-100",
                            "label_status": "proposed", "verdict": "BAD",
@@ -175,7 +168,7 @@ class FakeSession:
 
 
 class PartsError(Exception):
-    """Stand-in for the MES client's error. The UI matches it by class name only."""
+    pass
 
 
 class UiTestCase(unittest.TestCase):
@@ -493,7 +486,6 @@ class PageTests(UiTestCase):
         self.assertIn("self.failed = true", html)
         self.assertIn("image failed to load", html)
         self.assertIn("this.failed = false", html)
-        # clearing the cache key would make hasImage() false and re-request images every poll
         self.assertNotIn('self.key = ""', html)
         self.assertIn("!(retry && this.failed)", html)
 
@@ -538,12 +530,10 @@ class PageTests(UiTestCase):
         self.assertIn('id="poc"', html)
         self.assertIn("partial_station", html)
         self.assertIn("PROOF OF CONCEPT: ", html)
-        # the sentence is split across JS string literals; check each fragment
         self.assertIn("This station does not meet the 8-image rule. ", html)
         self.assertIn("Results are not for production decisions.", html)
         self.assertIn("el.poc.textContent", html)
         self.assertIn("el.poc.hidden = !partial", html)
-        # the banner sits above the verdict
         self.assertLess(html.index('id="poc"'), html.index('id="verdict"'))
 
     def test_tiles_built_from_camera_ids_with_c1_to_c4_default(self):

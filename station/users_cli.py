@@ -1,9 +1,3 @@
-"""`python -m station users add <username> <role>`: create or update a station login.
-
-The password is read with getpass (asked twice), hashed with auth.hash_password and
-written to the users JSON file. Neither the password nor the hash is printed.
-The file is written atomically with mode 0600.
-"""
 from __future__ import annotations
 
 import argparse
@@ -33,7 +27,6 @@ def _valid_username(name: str) -> bool:
 def _users_path(args: argparse.Namespace, err: TextIO) -> Optional[pathlib.Path]:
     if args.users_file:
         return pathlib.Path(args.users_file)
-    # Imported here so that `users` works without reading the whole config schema first.
     from station.app import ConfigError, load_config
 
     try:
@@ -48,7 +41,7 @@ def _users_path(args: argparse.Namespace, err: TextIO) -> Optional[pathlib.Path]
 def _load_existing(path: pathlib.Path) -> dict:
     if not path.exists():
         return {}
-    data = json.loads(path.read_text(encoding="utf-8"))  # raises on corrupt JSON: never overwrite it
+    data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"{path} must hold a JSON object")
     return data

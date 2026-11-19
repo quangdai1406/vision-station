@@ -1,23 +1,3 @@
-"""Copy saved part folders from the Pi to the laptop evidence store.
-
-Standard library only. ``sync_part`` copies one part folder (8 pictures, part.json,
-manifest.sha256) written by station/storage.py, keeping its layout under the
-destination ``store`` folder: ``<dest>/<line>/YYYY/MM/DD/<part_id>/``. The local copy is
-never deleted. Every file is hashed against manifest.sha256 before copying and again
-inside a temporary folder after copying; only then is the folder renamed into place.
-
-``SyncQueue`` keeps the parts still to copy in ``<local>/evidence_sync_queue.jsonl``
-(one JSON object per line, rewritten atomically). An item is marked done only after
-``sync_part`` returns; failed items stay pending for the next run.
-
-CLI (run from the project root)::
-
-    python3 -m station.evidence_sync run --local <station root> --dest <laptop store folder>
-    python3 -m station.evidence_sync status --local <station root>
-
-``--local`` is the station data folder that holds ``store/`` and the queue file.
-``--dest`` is the laptop folder that holds the ``L1/`` tree (the trainer's ``store/``).
-"""
 from __future__ import annotations
 
 import argparse
@@ -36,7 +16,7 @@ from typing import Optional, Sequence
 
 PART_JSON = "part.json"
 MANIFEST = "manifest.sha256"
-PURGED_FILE = "purged.json"  # tombstone written by trainer/purge.py
+PURGED_FILE = "purged.json"
 STORE_DIR = "store"
 QUEUE_NAME = "evidence_sync_queue.jsonl"
 PENDING = "pending"
@@ -49,13 +29,13 @@ _MONTH_DAY = re.compile(r"\d{2}")
 
 
 class SyncError(RuntimeError):
-    """A part could not be copied and verified. The message never contains a secret."""
+    pass
 
 
 @dataclass
 class _Source:
     manifest: bytes
-    entries: list  # [(file name, sha256)] for the pictures
+    entries: list
     part_json_sha: str
 
 
@@ -64,10 +44,8 @@ class SyncReport:
     synced: int = 0
     failed: int = 0
     pending: int = 0
-    errors: list = field(default_factory=list)  # "<part folder>: <reason>"
+    errors: list = field(default_factory=list)
 
-
-# ------------------------------------------------------------------ helpers
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -92,7 +70,6 @@ def _plain_name(name: str) -> bool:
 
 
 def _layout(part_dir: pathlib.Path) -> pathlib.Path:
-    """Relative path ``<line>/YYYY/MM/DD/<part_id>`` below the store folder. Raises SyncError."""
     parts = part_dir.parts
     if len(parts) < 6 or parts[-6] != STORE_DIR:
         raise SyncError(f"not a part folder in the store layout: {part_dir.name}")
@@ -130,7 +107,6 @@ def _parse_manifest(data: bytes) -> list:
 
 
 def _read_source(part_dir: pathlib.Path) -> _Source:
-    """Check the local part against its own manifest. Nothing is copied or changed."""
     if not part_dir.is_dir() or part_dir.is_symlink():
         raise SyncError(f"part folder not found: {part_dir.name}")
     manifest_path = part_dir / MANIFEST
@@ -151,7 +127,6 @@ def _read_source(part_dir: pathlib.Path) -> _Source:
 
 
 def _copy_file(src: pathlib.Path, dst: pathlib.Path) -> None:
-    """Copy bytes and flush them to disk. The hash is checked by the caller."""
     with open(src, "rb") as fin, open(dst, "wb") as fout:
         for chunk in iter(lambda: fin.read(1 << 20), b""):
             fout.write(chunk)
@@ -167,7 +142,6 @@ def _write_bytes(path: pathlib.Path, data: bytes) -> None:
 
 
 def _verify_folder(folder: pathlib.Path, src: _Source) -> None:
-    """Every listed picture and part.json must hash as recorded; the manifest must match."""
     for name, digest in src.entries:
         path = folder / name
         _require_regular(path)
@@ -182,11 +156,9 @@ def _verify_folder(folder: pathlib.Path, src: _Source) -> None:
 
 
 def _adopt_existing(final: pathlib.Path, src: _Source) -> str:
-    """The destination folder already exists: accept it only if it is the same part."""
     if final.is_symlink() or not final.is_dir():
         raise SyncError(f"destination exists and is not a folder: {final.name}")
     if (final / PURGED_FILE).is_file():
-        # Pictures were deleted on purpose after a verified training run: never recreate them.
         return str(final)
     manifest_path = final / MANIFEST
     if not manifest_path.is_file() or manifest_path.read_bytes() != src.manifest:
@@ -195,25 +167,11 @@ def _adopt_existing(final: pathlib.Path, src: _Source) -> str:
     return str(final)
 
 
-# ----------------------------------------------------------------- copying
-
 def planned_destination(part_dir, dest_root) -> str:
-    """The laptop path a part will have after sync_part: ``<dest_root>/<line>/YYYY/MM/DD/<part_id>``.
-
-    Pure: nothing is read or written. sync_part returns the same string. Raises SyncError when
-    part_dir is not in the store layout.
-    """
     return str(pathlib.Path(dest_root) / _layout(pathlib.Path(part_dir)))
 
 
 def sync_part(part_dir, dest_root) -> str:
-    """Copy one saved part to ``dest_root`` (the laptop store folder); return the final path.
-
-    Idempotent: a part already there with the same manifest is left alone. Raises
-    SyncError when the destination is unreachable, the local part or the copy fails
-    verification, or the destination holds a different part. No final folder is left
-    behind after a failed copy.
-    """
     part_dir = pathlib.Path(part_dir)
     dest_root = pathlib.Path(dest_root)
     rel = _layout(part_dir)
@@ -222,9 +180,8 @@ def sync_part(part_dir, dest_root) -> str:
     except OSError as exc:
         raise SyncError(f"local read failed: {part_dir.name}: {exc.strerror or type(exc).__name__}") from exc
     if not dest_root.is_dir():
-        # Do not create the folder: a missing SMB mount must not turn into a local folder.
         raise SyncError("destination is not reachable")
-    final = dest_root / rel  # == planned_destination(part_dir, dest_root)
+    final = dest_root / rel
     if os.path.lexists(final):
         return _adopt_existing(final, src)
 
@@ -249,8 +206,6 @@ def sync_part(part_dir, dest_root) -> str:
     return str(final)
 
 
-# ------------------------------------------------------------------- queue
-
 def _write_atomic(path: pathlib.Path, data: bytes) -> None:
     fd, tmp_name = tempfile.mkstemp(prefix=f"{_TMP_PREFIX}queue-", dir=str(path.parent))
     try:
@@ -266,8 +221,6 @@ def _write_atomic(path: pathlib.Path, data: bytes) -> None:
 
 
 class SyncQueue:
-    """Parts waiting to be copied to the laptop, kept in a JSON-lines file."""
-
     def __init__(self, folder) -> None:
         self.folder = pathlib.Path(folder)
         self.path = self.folder / QUEUE_NAME
@@ -299,7 +252,7 @@ class SyncQueue:
 
     def enqueue(self, part_dir) -> None:
         key = str(pathlib.Path(part_dir))
-        _layout(pathlib.Path(part_dir))  # refuse anything that is not a store part
+        _layout(pathlib.Path(part_dir))
         items = self._load()
         if any(item["part_dir"] == key for item in items):
             return
@@ -335,12 +288,10 @@ class SyncQueue:
             else:
                 item.update(state=DONE, archive_ref=ref, last_error=None, done_utc=_now())
                 report.synced += 1
-            self._save(items)  # each item is recorded as soon as it is settled
+            self._save(items)
         report.pending = sum(1 for item in items if item["state"] == PENDING)
         return report
 
-
-# --------------------------------------------------------------------- CLI
 
 def _status(queue: SyncQueue) -> int:
     items = queue._load()

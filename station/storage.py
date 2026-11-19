@@ -1,15 +1,3 @@
-"""Storage for finished inspection parts and the append-only event log.
-
-Standard library only. Layout under ``root``:
-
-    station.db
-    store/{line}/{YYYY}/{MM}/{DD}/{part_id}/
-        {site}_{line}_{YYYYMMDD}_{HHMMSS}_{part_id}_{camera_id}_{side}.{ext}
-        part.json
-        manifest.sha256   (sha256sum text format, images only)
-
-Plan reference: 26_1023_inspection_system_plan.md (storage section).
-"""
 from __future__ import annotations
 
 import contextlib
@@ -39,11 +27,11 @@ from station.contracts import (
 
 PART_JSON = "part.json"
 MANIFEST = "manifest.sha256"
-COLLECTED = "collected"  # disposition of a part saved in collect mode: images kept, no verdict
-OPERATOR_LABEL_EVENT = "operator_label"  # event kind for every set or change of a label
+COLLECTED = "collected"
+OPERATOR_LABEL_EVENT = "operator_label"
 MAX_CRITERION_CHARS = 64
 MAX_REJECT_REASON_CHARS = 200
-LABEL_ACTIONS = ("propose", "approve", "reject", "set_official")  # the 'action' in each label event
+LABEL_ACTIONS = ("propose", "approve", "reject", "set_official")
 _META_FILES = frozenset({PART_JSON, MANIFEST})
 _TMP_PREFIX = ".tmp-"
 _BAD_PATH_CHARS = frozenset("/\\\x00")
@@ -86,7 +74,6 @@ END;
 
 
 def _component(value: str, name: str) -> str:
-    """Reject values that cannot safely be used as one path component."""
     if (
         not isinstance(value, str)
         or value in ("", ".", "..")
@@ -124,7 +111,6 @@ def _dump_json(doc: dict) -> bytes:
 
 
 def check_criterion_id(value: object) -> str:
-    """A MES criterion id or a free class name: non-empty, short, printable. Returns it stripped."""
     if not isinstance(value, str):
         raise ValueError("criterion_id must be a string")
     text = value.strip()
@@ -146,7 +132,6 @@ def _check_who_when(by: object, at: object, what: str) -> None:
 
 
 def check_reject_reason(value: object) -> str:
-    """A short printable reason for rejecting a proposal. Returns it stripped."""
     if not isinstance(value, str):
         raise ValueError("reject_reason must be a string")
     text = value.strip()
@@ -160,7 +145,6 @@ def check_reject_reason(value: object) -> str:
 
 
 def check_label(label: OperatorLabel) -> None:
-    """Validate an operator label. Raises ValueError; never changes the label."""
     if not isinstance(label, OperatorLabel):
         raise ValueError("operator_label must be an OperatorLabel")
     verdict = Verdict(label.verdict)
@@ -190,20 +174,17 @@ def check_label(label: OperatorLabel) -> None:
         if label.approved_by is not None:
             _check_who_when(label.approved_by, label.approved_at, "approved")
         return
-    # rejected: an admin rejected the proposal, with a reason
     _check_who_when(label.approved_by, label.approved_at, "approved")
     check_reject_reason(label.reject_reason)
 
 
 def label_status(label: Optional[dict]) -> Optional[str]:
-    """Status of a part.json operator_label dict. A label with no status key is 'official'."""
     if not isinstance(label, dict):
         return None
     return label.get("status", LABEL_OFFICIAL)
 
 
 def _label_doc(label: Optional[OperatorLabel]) -> Optional[dict]:
-    """The part.json form of a validated label (None stays None)."""
     if label is None:
         return None
     criterion = None if label.criterion_id is None else label.criterion_id.strip()
@@ -226,7 +207,6 @@ def _label_doc(label: Optional[OperatorLabel]) -> Optional[dict]:
 
 
 def _replace_file(path: pathlib.Path, data: bytes) -> None:
-    """Atomically replace one file: write a temp file beside it, fsync, then os.replace."""
     fd, tmp_name = tempfile.mkstemp(prefix=f"{_TMP_PREFIX}label-", dir=str(path.parent))
     try:
         with os.fdopen(fd, "wb") as fh:
@@ -254,7 +234,7 @@ def _insert_rows(conn: sqlite3.Connection, doc: dict, path: str) -> None:
             path,
         ),
     )
-    if cur.rowcount == 0:  # session already recorded; keep the original rows
+    if cur.rowcount == 0:
         return
     conn.executemany(
         "INSERT INTO images (session_id, file, camera_id, side, seq, sha256) "
@@ -281,8 +261,6 @@ class Store:
         line: str = "L1",
         allow_partial: bool = False,
     ) -> None:
-        # allow_partial is for proof-of-concept stations with fewer than 4
-        # cameras only. The default keeps the 8-image, 4-camera rule.
         self.root = pathlib.Path(root)
         self.site = _component(site, "site")
         self.line = _component(line, "line")
@@ -294,26 +272,16 @@ class Store:
         with self._db() as conn:
             conn.executescript(_SCHEMA)
 
-    # ------------------------------------------------------------------ db
     @contextlib.contextmanager
     def _db(self) -> Iterator[sqlite3.Connection]:
-        # One connection per call: nothing is shared between threads.
         conn = sqlite3.connect(str(self.db_path), timeout=30)
         try:
-            with conn:  # commits on success, rolls back on error
+            with conn:
                 yield conn
         finally:
             conn.close()
 
-    # --------------------------------------------------------------- parts
     def save_part(self, record: PartRecord, defect_proposals: Optional[list] = None) -> pathlib.Path:
-        """Write one finished part.
-
-        Default: exactly 8 frames and 8 results (4 cameras x 2 sides).
-        With allow_partial: an even count from 2 to 8, where TOP and BOTTOM
-        cover the same camera ids, each (camera_id, side) pair once.
-        defect_proposals: optional list of JSON-safe dicts, stored in part.json.
-        """
         frames = list(record.frames)
         results = list(record.results)
         if self.allow_partial:
@@ -344,8 +312,6 @@ class Store:
         if set(by_key) != set(keys) or len(by_key) != expected:
             raise ValueError("results must match frames one-to-one")
         if Verdict(record.final_verdict) is Verdict.REVIEW and record.disposition != COLLECTED:
-            # A collected part (collect mode) is saved with no judgement: REVIEW is its
-            # final verdict and it is never counted as GOOD or BAD.
             raise ValueError("final_verdict must be GOOD or BAD (REVIEW is resolved first)")
         if record.operator_label is not None:
             if record.disposition != COLLECTED:
@@ -359,7 +325,7 @@ class Store:
         with self._lock:
             known = self._known_path(record.session_id)
             if known is not None:
-                return known  # idempotent: never rewrite recorded evidence
+                return known
             part_dir = (
                 self.store_dir
                 / self.line
@@ -381,7 +347,6 @@ class Store:
         return pathlib.Path(row[0]) if row else None
 
     def _adopt(self, part_dir: pathlib.Path, record: PartRecord) -> pathlib.Path:
-        """A finished directory exists but has no DB row (crash after rename)."""
         try:
             doc = json.loads((part_dir / PART_JSON).read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
@@ -408,7 +373,7 @@ class Store:
         part_id = record.part_id
         camera_count = len({f.camera_id for f in frames})
 
-        staged: list[tuple[str, bytes]] = []  # (file name, bytes) in capture order
+        staged: list[tuple[str, bytes]] = []
         images: list[dict] = []
         for frame in frames:
             side = Side(frame.side).value
@@ -474,8 +439,6 @@ class Store:
             "images": images,
         }
         if defect_proposals:
-            # Human defect proposals (plan S3). Only in part.json: not an operator_label, so training
-            # never reads them as a label. The manifest lists pictures only, so it is unchanged.
             doc["defect_proposals"] = [dict(p) for p in defect_proposals]
         manifest = "".join(
             f"{img['sha256']}  {img['file']}\n" for img in images
@@ -491,7 +454,7 @@ class Store:
             _write_durable(tmp / PART_JSON, _dump_json(doc))
             _write_durable(tmp / MANIFEST, manifest)
             os.chmod(tmp, 0o755)
-            os.rename(tmp, part_dir)  # atomic publish of the whole part
+            os.rename(tmp, part_dir)
         except BaseException:
             shutil.rmtree(tmp, ignore_errors=True)
             raise
@@ -501,7 +464,6 @@ class Store:
         return part_dir
 
     def verify_part(self, part_dir: pathlib.Path) -> list[str]:
-        """Return a list of problems; an empty list means the part is intact."""
         part_dir = pathlib.Path(part_dir)
         if not part_dir.is_dir():
             return [f"missing part directory: {part_dir}"]
@@ -558,7 +520,6 @@ class Store:
     def archive_ref(self, part_dir: pathlib.Path) -> str:
         return str(part_dir)
 
-    # -------------------------------------------------------------- events
     def append_event(self, kind: str, payload: dict, session_id: str | None = None) -> int:
         if not kind:
             raise ValueError("kind is required")
@@ -573,7 +534,6 @@ class Store:
             new_id = cur.lastrowid
         return int(new_id)
 
-    # ------------------------------------------------------------- queries
     def counters(self) -> dict:
         with self._db() as conn:
             rows = conn.execute(
@@ -602,9 +562,7 @@ class Store:
             for r in rows
         ]
 
-    # ------------------------------------------------------- operator labels
     def last_collected_session_id(self) -> Optional[str]:
-        """Session id of the newest collected part. REVIEW is stored only for collected parts."""
         with self._db() as conn:
             row = conn.execute(
                 "SELECT session_id FROM parts WHERE final_verdict = ? ORDER BY id DESC LIMIT 1",
@@ -622,7 +580,6 @@ class Store:
         return row[0] if row else None
 
     def _collected_doc_locked(self, session_id: str) -> tuple[pathlib.Path, bytes, dict]:
-        """(part dir, raw part.json bytes, parsed doc) of a collected part. Caller holds the lock."""
         part_dir = self._known_path(session_id)
         if part_dir is None:
             raise ValueError("no saved part for this session")
@@ -638,12 +595,10 @@ class Store:
         return part_dir, raw, doc
 
     def collected_part_doc(self, session_id: str) -> dict:
-        """The part.json of a collected part (read only). Raises ValueError otherwise."""
         with self._lock:
             return json.loads(json.dumps(self._collected_doc_locked(session_id)[2]))
 
     def collected_labels(self, status: Optional[str] = None) -> list[dict]:
-        """Collected parts that carry a label (with that status, if given), oldest first."""
         with self._db() as conn:
             rows = conn.execute(
                 "SELECT session_id, path FROM parts WHERE final_verdict = ? ORDER BY id",
@@ -666,13 +621,6 @@ class Store:
 
     def set_operator_label(self, session_id: str, label: OperatorLabel,
                            action: str = "set_official") -> Optional[dict]:
-        """Write one label on a collected part. Returns the previous label (or None).
-
-        Atomic: only part.json is replaced (temp file + os.replace). Images and
-        manifest.sha256 are never touched. Every write is logged as an 'operator_label'
-        event with its action (propose, approve, reject, set_official); if that log write
-        fails, part.json is restored.
-        """
         check_label(label)
         if action not in LABEL_ACTIONS:
             raise ValueError(f"unknown label action {action!r}")
@@ -691,7 +639,7 @@ class Store:
                     session_id=session_id,
                 )
             except BaseException:
-                _replace_file(part_json, raw)  # the change is not logged, so it is not kept
+                _replace_file(part_json, raw)
                 raise
         return previous
 

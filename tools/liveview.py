@@ -1,12 +1,3 @@
-"""Live view of the 4 station cameras in a browser, for aiming and lighting.
-
-Run:   python -m tools.liveview            (needs opencv-python; imported lazily)
-Open:  http://127.0.0.1:8090/   (on the Pi screen)
-
-Stop the station first: only one program can hold a camera at a time.
-Binds to 127.0.0.1 by default (no login). Use --host only on a network you trust.
-Nothing is saved. The 'Save snapshot' link writes 4 PNGs to ~/Pictures/vision-liveview/.
-"""
 import argparse
 import os
 import signal
@@ -16,7 +7,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from tools import ToolDependencyError
 
-cv2 = None  # loaded by _require_cv2() so importing this module needs no opencv
+DOC_TEXT = """Live view of the 4 station cameras in a browser, for aiming and lighting.
+
+Run:   python -m tools.liveview            (needs opencv-python; imported lazily)
+Open:  http://127.0.0.1:8090/   (on the Pi screen)
+
+Stop the station first: only one program can hold a camera at a time.
+Binds to 127.0.0.1 by default (no login). Use --host only on a network you trust.
+Nothing is saved. The 'Save snapshot' link writes 4 PNGs to ~/Pictures/vision-liveview/.
+"""
+
+cv2 = None
 
 
 def _require_cv2():
@@ -158,7 +159,7 @@ def make_handler(cams):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=DOC_TEXT, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--devices", type=int, nargs="+", default=[0, 2, 4, 6])
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
@@ -175,7 +176,6 @@ def main():
     def stop_now(signum, frame):
         raise KeyboardInterrupt
 
-    # A background launch can leave SIGINT ignored; take both signals explicitly.
     signal.signal(signal.SIGINT, stop_now)
     signal.signal(signal.SIGTERM, stop_now)
     print("Live view: http://%s:%d/   Ctrl-C to stop" % (a.host, a.port), flush=True)

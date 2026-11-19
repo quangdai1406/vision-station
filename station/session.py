@@ -1,73 +1,3 @@
-"""One inspection session: from the first press of a part to a completed record.
-
-Plan reference: 26_1023_inspection_system_plan.md (sections 3, 5, 7).
-Standard library only. Cameras, model, outputs and storage are injected.
-
-Flow: IDLE --press--> (TOP capture, infer) WAIT_FLIP --press--> (BOTTOM capture,
-infer, fuse) --> IDLE (GOOD), VERDICT (BAD), SUPERVISOR_REVIEW (REVIEW).
-Any failure while capturing or inferring goes to FAULT.
-
-Completion order (every path that ends a part: machine GOOD, ack of BAD,
-override, review resolution):
-  1. store.save_part(record) runs first.
-  2. Only after it succeeds are the part counted and the lights changed.
-     Green is never shown for a part that was not saved.
-
-Save failures (decided here):
-  - If save_part raises, the session goes to FAULT (show_fault, state FAULT,
-    'fault' event, snapshot fault text). Nothing is counted and no light is
-    changed to green. Frames, results, machine verdict and the pending decision
-    (final verdict, override, disposition) are kept in `_pending`.
-  - clear_fault() retries that same save once (same part_id and session_id, so a
-    store that keys on session_id can deduplicate). If the retry succeeds the
-    part is saved and counted once and the station returns to IDLE. If it fails
-    again the station stays in FAULT with the new error text. The station does
-    not return to the pre-completion state (VERDICT / SUPERVISOR_REVIEW /
-    INFER_BOTTOM): the operator's decision is kept and only the save is retried.
-
-on_complete failures (decided here):
-  - on_complete runs after a successful save. If it raises, the part stays saved
-    and counted, an 'on_complete_failed' event is logged, the lights are updated
-    as for a normal completion and the station returns to IDLE. No fault. The
-    outbox is expected to retry the upload.
-
-Output failures (decided here):
-  - The lights run after a successful save. If an OutputDriver call raises, the
-    part stays saved and counted, the station returns to IDLE, an 'outputs_failed'
-    event with the error text is logged, the remaining lights are still tried and
-    on_complete still runs. No fault.
-  - The BAD and REVIEW alarms (show_bad, show_review) run after the state is set
-    to VERDICT / SUPERVISOR_REVIEW, and show_fault runs after the state is set to
-    FAULT. If one raises, the state is kept, an 'outputs_failed' event is logged,
-    and nothing is raised out of press(). The operator can still ack, override or
-    resolve, and the part is saved on completion.
-
-Camera set: camera_ids defaults to all four cameras (the full station). A subset
-is a proof-of-concept partial station: it is flagged in snapshot() and in the
-'press' and 'verdict' events (partial_station, camera_ids), and is_partial is True.
-
-Presses (decided here):
-  - Debounce: a press within debounce_s of the END of the previous accepted press
-    is ignored. Measuring from the start would let a double tap through when the
-    TOP capture is slower than the debounce.
-  - Flip gap: a BOTTOM press is ignored until min_flip_s has passed since the TOP
-    capture and inference finished (press_ignored, reason 'flip_too_soon'). This is
-    an engineering setting, not a quality limit. 0 disables it. A return to WAIT_FLIP
-    after a BOTTOM fault does not wait again.
-  - preview(camera_id) is a read-only passthrough to the cameras for the live view.
-
-Part selection (decided here):
-  - The part number and model may be chosen at run time with set_part() (IDLE
-    only). They apply to the NEXT part. A session may start with no part ('' and
-    model None): it cannot inspect until a part is chosen.
-  - set_blocked(reason) stops inspection with a shown reason (e.g. the part has
-    no approved model). set_blocked(None) clears it. set_part clears it.
-  - clear_part() returns to 'no part' and also clears any block reason.
-  - A press while IDLE and not can_inspect is ignored (press_ignored,
-    reason 'no_part_or_model') with no capture.
-
-Snapshot: see StationSession.snapshot for the exact shape the UI reads.
-"""
 from __future__ import annotations
 
 import base64
@@ -100,7 +30,7 @@ from station.contracts import (
 )
 
 
-COLLECTED_LABEL = "COLLECTED"  # what the UI shows for a collected part: saved, not judged
+COLLECTED_LABEL = "COLLECTED"
 
 
 @dataclass(frozen=True)
@@ -108,7 +38,7 @@ class _PendingCompletion:
     final: Verdict
     override: Optional[Override]
     disposition: Optional[str]
-    lights: tuple[str, ...]  # OutputDriver methods to call only after a successful save
+    lights: tuple[str, ...]
 
 
 def _default_session_id() -> str:
@@ -186,7 +116,6 @@ class StationSession:
         collect_only: bool = False,
     ) -> None:
         self._camera_ids = _validate_camera_ids(camera_ids)
-        # Collect mode: images are captured and saved, but nothing is fused or judged.
         self._collect_only = bool(collect_only)
         self._expected_images = images_for(self._camera_ids)
         self._cameras = cameras
@@ -200,8 +129,6 @@ class StationSession:
         self._lot = lot
         self._operator = operator
         self._supervisor = supervisor
-        # mes_ticket mode: the inspector who pressed the top side (None: the configured operator
-        # is used) and the MES session of each part, kept until the part is handed to on_complete.
         self._part_operator: Optional[str] = None
         self._station_session_by_part: dict[str, str] = {}
         self._material_handler = material_handler
@@ -225,22 +152,16 @@ class StationSession:
             for key in self.counters:
                 self.counters[key] = int(initial_counters.get(key, 0))
 
-        self._last_press: Optional[float] = None  # start of the last accepted press (flip timeout)
-        self._last_done: Optional[float] = None  # end of the last accepted press (debounce)
-        self._top_done_at: Optional[float] = None  # when the TOP capture and inference finished
+        self._last_press: Optional[float] = None
+        self._last_done: Optional[float] = None
+        self._top_done_at: Optional[float] = None
         self._fault: Optional[str] = None
         self._fault_return: Optional[State] = None
         self._block_reason: str = ""
-        # Human defect proposals of a completed part, handed to the MES post once (see proposals_for).
         self._completed_proposals: dict[str, list[ProposalRecord]] = {}
         self._clear_part()
 
-    # ------------------------------------------------------------------ public
-
     def press(self, by: Optional[str] = None, station_session: Optional[str] = None) -> bool:
-        """One press. by / station_session are the logged-in inspector and their MES session
-        (mes_ticket mode); the part is recorded under the inspector who pressed the top side.
-        A different inspector at the flip faults the part: it is never recorded under their name."""
         if self.state is State.IDLE and not self.can_inspect:
             self._log("press_ignored", {"reason": "no_part_or_model", "state": self.state.value,
                                         "block_reason": self._block_reason},
@@ -289,18 +210,11 @@ class StationSession:
                           session_id=self._session_id)
                 self._run_bottom()
         finally:
-            self._last_done = self._clock()  # debounce runs from the end of this press, faults included
+            self._last_done = self._clock()
         return True
 
     def propose_defect(self, proposal: DefectProposal, *, by: str, criteria_ids) -> bool:
-        """Add a human defect proposal to the part being shown (VERDICT or SUPERVISOR_REVIEW).
-
-        by is the logged-in inspector (never the request body). criteria_ids: the part's
-        ACTIVE criteria. Returns True when it replaced an earlier proposal for the same criterion.
-        Proposals only ever move the verdict toward BAD (see _finish).
-        """
         if self._machine is Verdict.GOOD or self._final is Verdict.GOOD:
-            # Owner decision: GOOD timing and the green light stay as they are. Only BAD and REVIEW parts.
             raise ValueError("proposing a defect on a part the model passed is not supported yet")
         if self.state not in (State.VERDICT, State.SUPERVISOR_REVIEW):
             raise InvalidTransition(f"propose_defect is not allowed in {self.state.value}")
@@ -318,7 +232,6 @@ class StationSession:
         return replaced
 
     def remove_defect(self, criterion_id: str) -> bool:
-        """Remove the proposal for one criterion (VERDICT or SUPERVISOR_REVIEW). True if one was removed."""
         if self.state not in (State.VERDICT, State.SUPERVISOR_REVIEW):
             raise InvalidTransition(f"remove_defect is not allowed in {self.state.value}")
         rows, removed = remove_proposal(self._proposals, criterion_id)
@@ -329,7 +242,6 @@ class StationSession:
         return removed
 
     def proposals_for(self, part_id: str) -> list[ProposalRecord]:
-        """The defect proposals of a completed part, once (the MES post takes them). [] otherwise."""
         return self._completed_proposals.pop(str(part_id), [])
 
     def ack_alarm(self) -> None:
@@ -371,7 +283,6 @@ class StationSession:
                      lights=lights)
 
     def tick(self) -> bool:
-        """Void a part whose flip press never came. Returns True if a session was voided."""
         if self.state is not State.WAIT_FLIP or self._last_press is None:
             return False
         if self._clock() - self._last_press <= self._flip_timeout_s:
@@ -384,7 +295,6 @@ class StationSession:
         return True
 
     def clear_fault(self) -> None:
-        """Leave FAULT. A failed save is retried once; other faults return to their pre-fault state."""
         if self.state is not State.FAULT:
             raise InvalidTransition(f"clear_fault is not allowed in {self.state.value}")
         self._outputs.clear()
@@ -394,23 +304,18 @@ class StationSession:
                                     "retry_save": pending is not None},
                   session_id=self._session_id)
         if pending is not None:
-            self._try_complete()  # on failure it re-enters FAULT with the new error
+            self._try_complete()
             return
         self._fault = None
         self._fault_return = None
         if back is State.IDLE:
-            self._clear_part()  # the part was never completed; drop it
+            self._clear_part()
         elif back is State.WAIT_FLIP:
-            self._last_press = self._clock()  # restart the flip timeout
-            self._top_done_at = -math.inf  # the part is already flipped: no minimum flip gap again
+            self._last_press = self._clock()
+            self._top_done_at = -math.inf
         self.state = back
 
     def set_part(self, part_number: str, model, model_version: str) -> None:
-        """Choose the part and its approved model for the NEXT part. IDLE only.
-
-        Clears any block reason. Raises ValueError for an empty part number or a
-        missing model.
-        """
         if self.state is not State.IDLE:
             raise InvalidTransition(f"set_part is not allowed in {self.state.value}")
         number = str(part_number or "").strip()
@@ -426,7 +331,6 @@ class StationSession:
         self._log("part_selected", {"part_number": number, "model_version": version}, session_id=None)
 
     def clear_part(self) -> None:
-        """Forget the chosen part and model (and any block reason). IDLE only."""
         if self.state is not State.IDLE:
             raise InvalidTransition(f"clear_part is not allowed in {self.state.value}")
         self._part_number = ""
@@ -436,7 +340,6 @@ class StationSession:
         self._log("part_cleared", {}, session_id=None)
 
     def set_blocked(self, reason: Optional[str]) -> None:
-        """Block inspection with a reason shown to the operator; None or blank clears it. IDLE only."""
         if self.state is not State.IDLE:
             raise InvalidTransition(f"set_blocked is not allowed in {self.state.value}")
         self._block_reason = "" if reason is None else str(reason).strip()
@@ -451,7 +354,6 @@ class StationSession:
 
     @property
     def can_inspect(self) -> bool:
-        """True when a part number and model are chosen and nothing blocks inspection."""
         return bool(self._part_number) and self._model is not None and not self._block_reason
 
     @property
@@ -459,22 +361,6 @@ class StationSession:
         return self._block_reason
 
     def snapshot(self, include_images: bool = False) -> dict[str, Any]:
-        """State for the UI.
-
-        Keys: state, counters {total, good, bad}, part_id, machine_verdict,
-        final_verdict (set only once the part is saved), verdict (what the big
-        indicator shows: REVIEW in SUPERVISOR_REVIEW, 'COLLECTED' for a collected
-        part (collect mode), else final_verdict, else machine_verdict; GOOD is
-        never shown before it is saved; None when no part), fault, results (one per captured image, so far), images
-        (one metadata entry per captured frame, up to expected_images, with score
-        and defects merged in from the matching result; 'b64' only when
-        include_images), partial_station (bool) and camera_ids (list of str).
-        Also prompt (str: the instruction for the current state, '' when none),
-        press_ready (bool: a press would be accepted now) and flip_wait_s (float:
-        seconds before a BOTTOM press is accepted, rounded to 0.1, 0.0 otherwise).
-        Also part_number (str), part_selected (bool), model_version (str),
-        can_inspect (bool) and block_reason (str).
-        """
         now = self._clock()
         wait = self._flip_wait(now)
         results = self._all_results()
@@ -513,22 +399,15 @@ class StationSession:
             "model_version": self._model_version,
             "can_inspect": self.can_inspect,
             "block_reason": self._block_reason,
-            # Human defect proposals of the part being shown (none once IDLE).
             "defect_proposals": ([] if self.state is State.IDLE
                                  else [r.as_dict() for r in self._proposals]),
         }
 
     @property
     def is_partial(self) -> bool:
-        """True for a proof-of-concept station (fewer than the 4 cameras of the full station)."""
         return not is_full_station(self._camera_ids)
 
     def preview(self, camera_id: str) -> Optional[bytes]:
-        """Live-view frame for one camera. Read-only: changes no state, counters, outputs or events.
-
-        Returns None if the cameras object has no preview(), the id is not one of
-        this session's cameras, or the call raises (the error is not logged).
-        """
         if camera_id not in self._camera_ids:
             return None
         try:
@@ -539,13 +418,10 @@ class StationSession:
         except Exception:
             return None
 
-    # ----------------------------------------------------------------- helpers
-
     def _debounce_ok(self, now: float) -> bool:
         return self._last_done is None or now - self._last_done >= self._debounce_s
 
     def _flip_wait(self, now: float) -> float:
-        """Seconds still to wait before a BOTTOM press is accepted (0.0 when none)."""
         if self.state is not State.WAIT_FLIP or self._top_done_at is None:
             return 0.0
         return max(0.0, self._min_flip_s - (now - self._top_done_at))
@@ -590,7 +466,7 @@ class StationSession:
         if self._final is not None:
             return self._final.value
         if self._machine is None or self._machine is Verdict.GOOD:
-            return None  # a machine GOOD is not shown until it is saved
+            return None
         return self._machine.value
 
     def _run_bottom(self) -> None:
@@ -601,12 +477,11 @@ class StationSession:
         self._fuse_and_route()
 
     def _run_side(self, side: Side, fail_state: State) -> bool:
-        """Capture and infer one side. On failure, enter FAULT and return False."""
         try:
             frames = self._capture_side(side)
             self.state = State.INFER_TOP if side is Side.TOP else State.INFER_BOTTOM
             results = [self._model.predict(f) for f in frames]
-        except Exception as exc:  # CameraError, StationError or anything from the model
+        except Exception as exc:
             self._fail(exc, stage=side.value, return_state=fail_state)
             return False
         if side is Side.TOP:
@@ -670,30 +545,24 @@ class StationSession:
         if pv.verdict is Verdict.GOOD:
             self._finish(Verdict.GOOD, override=None, disposition=None, lights=("show_good",))
         elif pv.verdict is Verdict.BAD:
-            self.state = State.VERDICT  # set before the light: the operator must be able to ack
+            self.state = State.VERDICT
             self._light("show_bad")
         else:
-            self.state = State.SUPERVISOR_REVIEW  # set before the light: resolve_review must work
+            self.state = State.SUPERVISOR_REVIEW
             self._light("show_review")
 
     def _route_collected(self, results: list[ImageResult]) -> None:
-        """Collect mode: save the part with no verdict. Never green, never a model GOOD or BAD.
-
-        The part is stored with final verdict REVIEW and disposition 'collected', which
-        storage accepts only for this disposition. The outputs are cleared, not lit.
-        """
         if len(results) != self._expected_images:
             self._fail(StationError(f"need {self._expected_images} results, have {len(results)}"),
                        stage="collect", return_state=State.WAIT_FLIP)
             return
-        self._machine = Verdict.REVIEW  # neutral: no model judgement was made
+        self._machine = Verdict.REVIEW
         self._log("collected", {"part_id": self._part_id, "images": len(results),
                                 **self._station_fields()},
                   session_id=self._session_id)
         self._finish(Verdict.REVIEW, override=None, disposition=COLLECTED, lights=("clear",))
 
     def _light(self, name: str) -> None:
-        """Call one OutputDriver method for a state already set. A failure is logged, never raised."""
         try:
             getattr(self._outputs, name)()
         except Exception as exc:
@@ -703,13 +572,6 @@ class StationSession:
 
     def _finish(self, final: Verdict, override: Optional[Override], disposition: Optional[str],
                 lights: tuple[str, ...]) -> None:
-        """Save and count a completed part exactly once, then light the outputs and return to IDLE.
-
-        On a save failure the session enters FAULT and keeps the decision in `_pending`.
-        A human defect proposal on the part makes a GOOD outcome BAD (quarantine, alarm); it
-        never turns a BAD back to GOOD. The override record is dropped then (the 'override'
-        event is already logged).
-        """
         if self._proposals and final is Verdict.GOOD:
             self._log("defect_proposal_forces_bad", {"part_id": self._part_id,
                                                      "proposals": len(self._proposals)},
@@ -721,7 +583,6 @@ class StationSession:
         self._try_complete()
 
     def _try_complete(self) -> bool:
-        """Attempt the save of `_pending`. Returns True if the part was saved."""
         p = self._pending
         if p is None:
             return False
@@ -745,11 +606,9 @@ class StationSession:
         self._override = p.override
         self._disposition = p.disposition
         self.counters["total"] += 1
-        if p.disposition != COLLECTED:  # collected parts are counted in total only
+        if p.disposition != COLLECTED:
             self.counters["good" if p.final is Verdict.GOOD else "bad"] += 1
         self.state = State.IDLE
-        # Every light is attempted even if an earlier one raises (e.g. alarm_off
-        # still runs when show_bad raises). A light failure never undoes the save.
         light_errors: list[str] = []
         for name in p.lights:
             try:
@@ -801,7 +660,6 @@ class StationSession:
                   session_id=self._session_id)
 
     def station_session_for(self, part_id: str) -> Optional[str]:
-        """The MES session the part was started in (mes_ticket mode), once. None otherwise."""
         return self._station_session_by_part.pop(part_id, None)
 
     @staticmethod
@@ -815,7 +673,6 @@ class StationSession:
         return Verdict(new_verdict)
 
     def _image_keys(self) -> list[tuple[str, Side]]:
-        """(camera_id, side) of each of the part's images, TOP and BOTTOM for every camera."""
         return [(cid, side) for cid in self._camera_ids for side in (Side.TOP, Side.BOTTOM)]
 
     def _all_frames(self) -> list[Frame]:
@@ -843,7 +700,7 @@ class StationSession:
         self._override: Optional[Override] = None
         self._disposition: Optional[str] = None
         self._pending: Optional[_PendingCompletion] = None
-        self._proposals: list[ProposalRecord] = []  # cleared when the next part starts
+        self._proposals: list[ProposalRecord] = []
         self._fault = None
         self._fault_return = None
 

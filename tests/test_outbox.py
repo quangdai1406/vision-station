@@ -1,4 +1,3 @@
-"""Tests for station/outbox.py: durable queue, retry timing and ordering."""
 from __future__ import annotations
 
 import pathlib
@@ -10,8 +9,6 @@ from station.outbox import Outbox
 
 
 class ScriptedClient:
-    """Stands in for MesClient. Returns queued results in order; records every call."""
-
     def __init__(self, *results: PostResult):
         self.queue = list(results)
         self.calls: list[dict] = []
@@ -70,23 +67,19 @@ class OutboxTests(unittest.TestCase):
         self.enqueue("sess-1")
         client = ScriptedClient(retryable(), retryable(), ok())
 
-        # attempt 1 fails at t=1000: attempts=1, next = 1000 + 5 * 2**1 = 1010
         counts = self.box.drain(client, now=1000.0, base_delay_s=5.0, max_delay_s=600.0)
         self.assertEqual(counts, {"sent": 0, "failed_permanent": 0, "retry_later": 1})
         item = self.box.list_items("pending")[0]
         self.assertEqual((item["attempts"], item["next_attempt"]), (1, 1010.0))
         self.assertIn("500", item["last_error"])
 
-        # not due yet: nothing is posted
         self.assertEqual(self.box.drain(client, now=1009.9), {"sent": 0, "failed_permanent": 0, "retry_later": 0})
         self.assertEqual(len(client.calls), 1)
 
-        # attempt 2 fails at t=1010: next = 1010 + 5 * 2**2 = 1030
         self.box.drain(client, now=1010.0, base_delay_s=5.0, max_delay_s=600.0)
         item = self.box.list_items("pending")[0]
         self.assertEqual((item["attempts"], item["next_attempt"]), (2, 1030.0))
 
-        # attempt 3 succeeds at t=1030
         self.assertEqual(self.box.drain(client, now=1030.0)["sent"], 1)
         self.assertEqual(self.box.pending_count(), 0)
 
@@ -94,9 +87,9 @@ class OutboxTests(unittest.TestCase):
         self.enqueue("sess-1")
         client = ScriptedClient(retryable(), retryable())
         self.box.drain(client, now=0.0, base_delay_s=5.0, max_delay_s=12.0)
-        self.assertEqual(self.box.list_items("pending")[0]["next_attempt"], 10.0)  # 5 * 2**1
+        self.assertEqual(self.box.list_items("pending")[0]["next_attempt"], 10.0)
         self.box.drain(client, now=10.0, base_delay_s=5.0, max_delay_s=12.0)
-        self.assertEqual(self.box.list_items("pending")[0]["next_attempt"], 22.0)  # capped: 10 + 12
+        self.assertEqual(self.box.list_items("pending")[0]["next_attempt"], 22.0)
 
     def test_ordering_is_kept_when_first_item_fails_retryably(self):
         self.enqueue("sess-A")
@@ -105,7 +98,7 @@ class OutboxTests(unittest.TestCase):
 
         counts = self.box.drain(client, now=0.0)
         self.assertEqual(counts, {"sent": 0, "failed_permanent": 0, "retry_later": 1})
-        self.assertEqual([c["key"] for c in client.calls], ["sess-A"])  # B was not attempted
+        self.assertEqual([c["key"] for c in client.calls], ["sess-A"])
         self.assertEqual(self.box.pending_count(), 2)
 
         counts = self.box.drain(client, now=10.0)
@@ -120,7 +113,6 @@ class OutboxTests(unittest.TestCase):
         counts = self.box.drain(client, now=0.0)
         self.assertEqual(counts, {"sent": 1, "failed_permanent": 1, "retry_later": 0})
 
-        # later drains never post sess-A again
         self.box.drain(client, now=1e9)
         self.assertEqual([c["key"] for c in client.calls], ["sess-A", "sess-B"])
         failed = self.box.failed_permanent_items()
@@ -134,7 +126,7 @@ class OutboxTests(unittest.TestCase):
         self.enqueue("sess-1")
         self.box.close()
 
-        box2 = Outbox(self.root)  # new process, same root
+        box2 = Outbox(self.root)
         try:
             self.assertEqual(box2.pending_count(), 1)
             client = ScriptedClient(ok(event_id=5))
@@ -142,7 +134,7 @@ class OutboxTests(unittest.TestCase):
         finally:
             box2.close()
 
-        self.box = Outbox(self.root)  # restart again: sent state is kept
+        self.box = Outbox(self.root)
         self.assertEqual(self.box.pending_count(), 0)
         self.assertEqual(self.box.list_items("sent")[0]["mes_event_id"], 5)
 
@@ -153,7 +145,7 @@ class OutboxTests(unittest.TestCase):
         self.assertEqual(len(self.box.list_items()), 1)
         client = ScriptedClient(ok())
         self.box.drain(client, now=0.0)
-        self.assertEqual(client.calls[0]["fields"], {"verdict": "BAD"})  # first enqueue kept
+        self.assertEqual(client.calls[0]["fields"], {"verdict": "BAD"})
         self.assertEqual(len(client.calls), 1)
 
     def test_unsafe_session_id_is_rejected(self):
@@ -168,7 +160,7 @@ class OutboxTests(unittest.TestCase):
         created = self.box.list_items()[0]["created_at"]
         self.assertAlmostEqual(self.box.oldest_pending_age_s(now=created + 30.0), 30.0, places=6)
 
-        self.enqueue("sess-2")  # newer item does not change the oldest age
+        self.enqueue("sess-2")
         self.assertAlmostEqual(self.box.oldest_pending_age_s(now=created + 45.0), 45.0, places=6)
 
         self.box.drain(ScriptedClient(ok(), ok()), now=created + 50.0)

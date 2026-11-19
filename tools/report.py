@@ -1,14 +1,3 @@
-"""Plain-language repeatability report for capture session folders.
-
-CLI:  python -m tools.report SESSION_DIR [SESSION_DIR ...] [--out report_dir]
-      [--outlier-sigma K] [--outlier-floor-gray F] [--skip-first N] [--min-shift-response R]
-
-Reads session.json and frames_dev<N>.npz (see tools/FORMAT.md) and writes
-report.json, report.md and summary.csv. The report is descriptive only: it gives
-measurements and their plain meaning, no pass/fail verdict and no acceptance limit.
-Numpy is needed; it is imported lazily so that the module itself loads without it.
-"""
-
 import argparse
 import csv
 import json
@@ -21,14 +10,9 @@ from tools import ToolDependencyError
 
 SCHEMA = 1
 MODES = ("stationary", "placement")
-# Stationary noise floor is measured WITHOUT alignment: phase-correlation alignment against a
-# single noisy frame can fit sensor noise and would hide real mount vibration.
 NOISE_FLOOR_BASIS = ("per-frame residual against the median frame of the series, "
                      "no alignment, stationary part")
 
-# Frame-outlier rule for stationary sessions. A frame is flagged when
-#   |mean_i - median(means)| > max(K * 1.4826 * MAD, F).
-# K and F are engineering settings for SPOTTING bad frames; they are not quality thresholds.
 MAD_SCALE = 1.4826
 DEFAULT_OUTLIER_SIGMA = 5.0
 DEFAULT_OUTLIER_FLOOR_GRAY = 2.0
@@ -44,7 +28,6 @@ OUTLIER_FORMULA = "flagged when |mean - median| > max(K x 1.4826 x MAD, F)"
 OUTLIER_RULE_TEXT = ("a rule to help you spot frames taken before the camera settled or "
                      "disturbed by light changes, not a quality threshold")
 
-# Camera controls shown in section 2: (label, key in readback / applied_ok).
 CONTROLS = [
     ("Autofocus", "autofocus"),
     ("Focus", "focus"),
@@ -54,11 +37,9 @@ CONTROLS = [
     ("White balance", "white_balance"),
     ("Gain", "gain"),
 ]
-# The capture tool always requests these auto controls off.
 AUTO_CONTROL_KEYS = ("autofocus", "auto_exposure", "auto_wb")
 AUTO_REQUESTED_TEXT = "off (always requested)"
 
-# Metrics compared across sessions/devices: (csv column, label, digits).
 COMPARE_METRICS = [
     ("brightness_range_pct", "Brightness range (% of mean)", 2),
     ("sharpness_cv", "Sharpness variation (cv)", 4),
@@ -98,7 +79,7 @@ LIMITATIONS = [
 
 
 class ReportInputError(ValueError):
-    """A session folder is missing files or its metadata cannot be used."""
+    pass
 
 
 def _numpy():
@@ -115,8 +96,6 @@ def _analysis():
     from tools import analysis
     return analysis
 
-
-# ---------------------------------------------------------------- reading sessions
 
 def _read_session_json(session_dir):
     path = session_dir / "session.json"
@@ -168,21 +147,14 @@ def _camera_info(meta, dev):
 
 
 def _noise_metrics(analysis, stack):
-    """Metrics that stationary variants share: brightness, temporal noise, unaligned residual."""
     return {
         "brightness": analysis.brightness_stats(stack),
         "temporal_noise": analysis.temporal_noise(stack),
-        # No alignment for a stationary part (see NOISE_FLOOR_BASIS).
         "residual_unaligned": analysis.residual_scores(stack, align=False),
     }
 
 
 def flag_outliers(means, sigma, floor):
-    """Flag frames whose mean brightness is far from the median of the series.
-
-    Returns (positions, median, mad, limit); positions index into means.
-    A frame is flagged when |mean - median| > max(sigma * 1.4826 * MAD, floor).
-    """
     np = _numpy()
     m = np.asarray(means, dtype=np.float64)
     med = float(np.median(m))
@@ -193,7 +165,6 @@ def flag_outliers(means, sigma, floor):
 
 
 def _shift_estimate(analysis, np, stack, min_response):
-    """Apparent drift from phase correlation; reported only if the median peak response is high."""
     n = int(stack.shape[0])
     base = {"frames": n, "min_response": float(min_response), "median_response": None,
             "estimate_ok": False, "reported": False}
@@ -242,7 +213,6 @@ def _stationary_entry(analysis, np, gray, opts):
         clean = used[np.asarray(keep, dtype=np.intp)]
         if clean.shape[0] >= 2:
             excluding = {"frames": int(clean.shape[0]), **_noise_metrics(analysis, clean)}
-    # Apparent drift is estimated on the frames left after removing flagged outliers.
     shift = _shift_estimate(analysis, np, used if clean is None else clean,
                             opts["min_shift_response"])
     return {
@@ -301,7 +271,6 @@ def _summarize_device(analysis, np, session_dir, meta, mode, dev, opts):
 
 
 def summarize_session(session_dir, settings=None):
-    """Return a JSON-ready dict with all measurements for one session folder."""
     analysis = _analysis()
     np = _numpy()
     opts = dict(DEFAULT_SETTINGS)
@@ -332,10 +301,7 @@ def summarize_session(session_dir, settings=None):
     }
 
 
-# ---------------------------------------------------------------- building the report
-
 def _plain(obj):
-    """Convert numpy and non-finite values into JSON-safe Python values."""
     if isinstance(obj, dict):
         return {str(k): _plain(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -456,7 +422,6 @@ def _noise_floor(summaries):
         for dev in s["devices"]:
             e = s["per_device"][str(dev)]
             sh = e.get("shift_estimate") or {}
-            # Drift is shown only when the estimate is reported (see _shift_estimate).
             drift = sh if sh.get("reported") else {}
             rows.append(_noise_floor_row(s, dev, "all_frames", e["frames_used"],
                                          e["residual_unaligned"], drift))
@@ -488,8 +453,6 @@ def build_report(summaries, settings=None):
     }
 
 
-# ---------------------------------------------------------------- formatting
-
 def _f(value, digits=2):
     if value is None:
         return "n/a"
@@ -515,7 +478,6 @@ def _applied_text(value):
 
 
 def _not_confirmed(cam, key):
-    """True when a control was requested but the camera did not confirm it."""
     if cam["applied_ok"].get(key) is False:
         return True
     if key in AUTO_CONTROL_KEYS:
@@ -859,7 +821,6 @@ def render_markdown(report):
 
 
 def write_report(session_dirs, out_dir, settings=None):
-    """Summarize the sessions and write report.json, report.md and summary.csv to out_dir."""
     opts = dict(DEFAULT_SETTINGS)
     opts.update(settings or {})
     summaries = [summarize_session(d, opts) for d in session_dirs]

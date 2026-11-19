@@ -1,20 +1,3 @@
-"""Per-part model versions on disk, with human approval.
-
-Layout under the store root::
-
-    <root>/<safe_part>/<version>/<model file>
-    <root>/<safe_part>/<version>/manifest.json
-    <root>/<safe_part>/current.json       the approved version (written only by approve/rollback)
-    <root>/<safe_part>/approvals.jsonl    append-only history of approve and rollback
-
-A station may inspect a part only with that part's approved version. A model is never
-approved automatically: approve() needs a named person and a reason. current() raises
-ModelError rather than falling back when current.json points at a missing or tampered
-version.
-
-Standard library only. Model files are loaded through LOADERS, so importing this module
-needs neither numpy nor the golden model.
-"""
 from __future__ import annotations
 
 import hashlib
@@ -47,7 +30,7 @@ Loader = Callable[["ModelInfo", Any], Any]
 
 
 class ModelError(StationError):
-    """A model version is missing, unverified, not approved, or tampered with."""
+    pass
 
 
 @dataclass(frozen=True)
@@ -55,23 +38,14 @@ class ModelInfo:
     part_number: str
     version: str
     type: str
-    path: Path  # the model file inside the version folder
+    path: Path
     manifest: dict
     approved_by: str
     approved_utc: str
     reason: str
 
 
-# ---------------------------------------------------------------------------
-# Naming and small file helpers
-# ---------------------------------------------------------------------------
-
 def safe_part(part_number: str) -> str:
-    """Folder name for a part number. Always ends in '-' + 8 hex chars of sha256(part_number).
-
-    The suffix is on every name, so two different part numbers that clean to the same text
-    still get different folders, and the mapping is unambiguous.
-    """
     if not isinstance(part_number, str) or not part_number.strip():
         raise ValueError("part number must be a non-empty string")
     base = re.sub(r"[^A-Za-z0-9._-]", "_", part_number.strip())
@@ -129,7 +103,6 @@ def _sha256_file(path: Path) -> str:
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
-    """Write to a temp file in the same folder, fsync, then os.replace. No .tmp is left behind."""
     try:
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
     except OSError as exc:
@@ -163,7 +136,6 @@ def _json_text(data: Any) -> str:
 
 
 def _append_line(path: Path, line: str) -> None:
-    """One write call, O_APPEND, trailing newline included in the data."""
     data = line.encode("utf-8")
     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
     try:
@@ -186,14 +158,7 @@ def _load_manifest(vdir: Path) -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
-# ---------------------------------------------------------------------------
-# Store
-# ---------------------------------------------------------------------------
-
 class ModelStore:
-    """Model versions for many parts under one root. Nothing is cached: every call reads the disk,
-    so two instances on the same root see each other's changes."""
-
     def __init__(self, root: Any) -> None:
         self.root = Path(root)
 
@@ -211,10 +176,6 @@ class ModelStore:
         manifest: dict,
         now_utc: str,
     ) -> Path:
-        """Copy a model file into a new version folder as a 'candidate'. Never changes current.json.
-
-        Returns the path of the copied model file. Refuses to overwrite an existing version.
-        """
         pdir = self._part_dir(part_number)
         _check_version(version)
         src = Path(model_file)
@@ -241,7 +202,6 @@ class ModelStore:
         vdir = pdir / version
         if vdir.exists():
             raise ModelError(f"version {version} already exists for part {part_number}")
-        # Everything is built in a staging folder, then renamed into place.
         record = {
             "schema": SCHEMA,
             "part_number": part_number,
@@ -249,7 +209,7 @@ class ModelStore:
             "type": mtype,
             "created_utc": created,
             "model_file": name,
-            "sha256": None,  # filled in after the copy
+            "sha256": None,
             "camera_ids": list(camera_ids),
             "trained_on": dict(trained_on),
             "metrics": dict(metrics),
@@ -279,7 +239,6 @@ class ModelStore:
         return vdir / name
 
     def list_versions(self, part_number: str) -> list[dict]:
-        """Manifests of this part's versions, sorted by created_utc then version."""
         pdir = self._part_dir(part_number)
         if not pdir.is_dir():
             return []
@@ -294,7 +253,6 @@ class ModelStore:
         return out
 
     def verify(self, part_number: str, version: str) -> list[str]:
-        """Problems with one version. An empty list means it is intact."""
         try:
             vdir = self._version_dir(part_number, version)
         except (ModelError, ValueError) as exc:
@@ -326,17 +284,11 @@ class ModelStore:
         return problems
 
     def approve(self, part_number: str, version: str, by: str, reason: str, now_utc: str) -> ModelInfo:
-        """A named person makes this version the approved one for the part."""
         by_text = _required_text(by, "by")
         reason_text = _required_text(reason, "reason")
         return self._activate(part_number, version, by_text, reason_text, now_utc, "approve")
 
     def rollback(self, part_number: str, by: str, reason: str, now_utc: str) -> ModelInfo:
-        """Re-approve the nearest version below the current one on the activation stack that
-        still verifies. Versions rolled back from are off the stack, so they never come back.
-
-        Raises ModelError when nothing is approved now or no earlier version can be used.
-        """
         by_text = _required_text(by, "by")
         reason_text = _required_text(reason, "reason")
         _required_text(now_utc, "now_utc")
@@ -345,7 +297,6 @@ class ModelStore:
             raise ModelError(f"no approved model for part {part_number}: nothing to roll back from")
         current_version = current_data["version"]
         stack = self._stack(part_number)
-        # Nearest first.
         candidates: list[str] = (
             list(reversed(stack[: stack.index(current_version)])) if current_version in stack else []
         )
@@ -357,7 +308,6 @@ class ModelStore:
         )
 
     def current(self, part_number: str) -> Optional[ModelInfo]:
-        """The approved model, None if nothing was ever approved, ModelError if it is unusable."""
         data = self._read_current_raw(part_number)
         if data is None:
             return None
@@ -378,7 +328,6 @@ class ModelStore:
                      data["approved_utc"], data["reason"])
 
     def approvals(self, part_number: str) -> list[dict]:
-        """The approval log for a part, oldest first."""
         path = self._part_dir(part_number) / APPROVALS_NAME
         if not path.exists():
             return []
@@ -400,19 +349,11 @@ class ModelStore:
         return out
 
     def history(self, part_number: str) -> list[str]:
-        """The activation stack for a part, oldest first and the current version last.
-
-        Built by replaying the approval log; 'failed' lines cancel the attempt they name.
-        """
         return self._stack(part_number)
-
-    # -- internals ----------------------------------------------------------
 
     def _stack(self, part_number: str) -> list[str]:
         stack = _replay(self.approvals(part_number))
         current = self._read_current_raw(part_number)
-        # The log is written before current.json, so after a crash it can lead by one
-        # unfinished line. current.json is the truth for what is active.
         if current is not None and current["version"] in stack:
             stack = stack[: stack.index(current["version"]) + 1]
         return stack
@@ -431,7 +372,7 @@ class ModelStore:
             _append_line(self._part_dir(part_number) / APPROVALS_NAME,
                          json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n")
         except ModelError:
-            pass  # best effort: the stack is still anchored to current.json
+            pass
 
     def _read_current_raw(self, part_number: str) -> Optional[dict]:
         path = self._part_dir(part_number) / CURRENT_NAME
@@ -468,7 +409,7 @@ class ModelStore:
         previous = self._read_current_raw(part_number)
         previous_version = previous["version"] if previous else None
         manifest = _load_manifest(vdir)
-        if manifest is None:  # verify() passed, so this is a race with an outside edit
+        if manifest is None:
             raise ModelError(f"manifest for version {version} changed while approving")
         old_status = manifest.get("status")
         entry = {
@@ -480,10 +421,8 @@ class ModelStore:
             "utc": now,
             "previous_version": previous_version,
         }
-        # 1. The intended action goes to the log first, so the log never lags current.json.
         _append_line(self._part_dir(part_number) / APPROVALS_NAME,
                      json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n")
-        # 2. Then switch current.json. If the switch fails, a 'failed' line cancels the intent.
         manifest_changed = False
         try:
             manifest["status"] = "approved"
@@ -503,12 +442,11 @@ class ModelStore:
                 try:
                     _write_text_atomic(vdir / MANIFEST_NAME, _json_text(manifest))
                 except Exception:
-                    pass  # best effort; the status is not what decides what is active
+                    pass
             self._log_failed_switch(part_number, version, action, now, exc)
             raise ModelError(
                 f"could not switch the approved model for part {part_number} to version {version}: {exc}"
             ) from exc
-        # 3. Retire the old version. Cosmetic: current.json already names the new one.
         if previous_version is not None and previous_version != version:
             try:
                 self._set_status(part_number, previous_version, "retired")
@@ -521,13 +459,6 @@ _ACTIVATIONS = ("approve", "rollback")
 
 
 def _replay(entries: list[dict]) -> list[str]:
-    """The activation stack (oldest first, current last) from the raw approval log.
-
-    approve: the version moves to the top of the stack.
-    rollback: the version rolled back from is dropped and the stack is cut down to the version
-    rolled back to, so everything above it goes.
-    failed: cancels the nearest earlier unresolved approve/rollback for the same version.
-    """
     cancelled: set[int] = set()
     open_intents: list[int] = []
     for idx, entry in enumerate(entries):
@@ -569,15 +500,10 @@ def _info(part_number: str, version: str, vdir: Path, manifest: dict,
     )
 
 
-# ---------------------------------------------------------------------------
-# Runtime loaders
-# ---------------------------------------------------------------------------
-
 LOADERS: dict[str, Loader] = {}
 
 
 def register_loader(type_name: str, fn: Loader) -> None:
-    """Register how to turn a model file of this type into the station's InferenceModel."""
     _check_type(type_name)
     LOADERS[type_name] = fn
 
@@ -592,7 +518,6 @@ register_loader("golden", _load_golden)
 
 
 def load_runtime_model(info: ModelInfo, decode: Any) -> Any:
-    """Build the station's model object for an approved version. ModelError if no loader fits."""
     fn = LOADERS.get(info.type)
     if fn is None:
         raise ModelError(f"no loader for model type {info.type}: is the optional package installed?")

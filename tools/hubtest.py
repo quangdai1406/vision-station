@@ -1,87 +1,3 @@
-"""USB hub feasibility test for several webcams. Run on the user's Windows PC.
-
-    py -m tools.hubtest --devices 0 1 2 3 [--width 1920 --height 1080] [--rounds 5]
-        [--warmup 5] [--backend default|dshow] [--out hubtest_report.json]
-
-Question: do the cameras behind one USB hub deliver pictures when they are used one
-after another, and does simultaneous capture work on this hub? Three modes, each run
-for --rounds rounds. The camera handling imitates station/cameras.py (same backend,
-same CAP_PROP_BUFFERSIZE, same warm-up after open, same stale-frame flush before each
-picture):
-
-  sequential_open_per_shot  (Test A1) per device, in order: open, warm up, flush, one
-                            picture, release.
-  sequential_keep_open      (Test A2) open all devices once, warm up each, then per device
-                            in order, every round: flush, one picture.
-  simultaneous              (Test B, all at once) open all, warm up, flush all, grab all,
-                            then retrieve all: the way station/cameras.py captures. Expected
-                            to fail on a hub; a pass is also fine and is then recommended
-                            first. A failure is reported and the run keeps going.
-
-Backend: the station calls cv2.VideoCapture(index) with no backend, so the default is
-"default". "dshow" (cv2.CAP_DSHOW) is selectable; when it is chosen, one warning line says
-it differs from the station. Run both backends if the first one fails.
-
-Each camera is handled on its own: one failure never stops the others, and every failure
-is recorded with its camera index. Warm-up and flush grabs are discarded; their failures
-are not counted, the picture step reports them. A picture counts as OK when it is non-empty
-and not all black. The 4 pictures of one side are taken one after another, so the part must
-stay still on the fixture for the whole side.
-
-Nothing is judged against a threshold here. The summary reports counts and times. The
-recommendation follows only recommend(): the first mode in MODE_ORDER in which every
-round and every camera succeeded.
-
-Timings (seconds, from the monotonic clock):
-  open_s         opening and setting the camera (not the warm-up).
-  first_frame_s  open-per-shot: from opening the camera to its picture (includes warm-up).
-                 keep-open: from the flush to the picture. simultaneous: from the start of
-                 the grab-all step to this camera's picture.
-  round_s        wall time of one round, i.e. one picture from each device. Round 1 of
-                 keep-open includes opening and warm-up; the summary reports it separately
-                 (round1_s) from the mean of rounds 2 and later (later_round_s_mean).
-  Operator wait: keep-open uses rounds 2 and later; open-per-shot and simultaneous use the
-                 full cycle (opening and warm-up included), mean of all rounds.
-
-Exit codes: 0 when the run finished and the report was written (camera failures are data,
-not an error); 1 when the report could not be written, including when it could not be turned
-into JSON (ValueError or TypeError from json); 2 when cv2 or numpy is missing or an argument
-is wrong. This tool installs nothing.
-
-Sample pictures: the first picture of each camera from Test A1 round 1 is saved as PNG
-next to --out (<stem>_cam<N>_first.png) so the operator can see which corner each index
-shows. A failed save is skipped quietly.
-
-JSON report, schema 1, written atomically to --out:
-{
-  "schema": 1,
-  "tool": "tools.hubtest",
-  "started_utc": "2026-10-25T09:00:00Z",
-  "finished_utc": "2026-10-25T09:05:00Z",
-  "devices": [0, 1, 2, 3],
-  "requested": {"width": 1920, "height": 1080, "rounds": 5, "warmup": 5, "backend": "default"},
-  "station_backend": "default",
-  "modes": {
-    "sequential_open_per_shot": {
-      "title": "Test A1 - ...",
-      "fatal_error": null,
-      "rounds": [
-        {"round": 1, "round_s": 4.2,
-         "cameras": [{"device": 0, "open_s": 0.3, "first_frame_s": 1.1, "ok": true,
-                      "mean_grey": 118.2, "width": 1920, "height": 1080,
-                      "error": null, "release_error": null}]}
-      ],
-      "summary": {"pictures_ok": 20, "pictures_total": 20, "slowest_s": 1.5,
-                  "fastest_s": 0.9, "round_s_mean": 4.1, "round1_s": 4.2,
-                  "later_round_s_mean": 4.0}
-    },
-    "sequential_keep_open": {...same shape...},
-    "simultaneous": {...same shape...}
-  },
-  "recommended_mode": "sequential_keep_open",
-  "sample_pictures": {"0": "hubtest_report_cam0_first.png", "1": null, "2": null, "3": null}
-}
-"""
 from __future__ import annotations
 
 import argparse
@@ -103,21 +19,13 @@ SCHEMA_VERSION = 1
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
 DEFAULT_ROUNDS = 5
-# Same value as the station (station/cameras.py OPEN_WARMUP_FRAMES): grabs read and
-# discarded right after each open. Engineering setting, not a threshold.
 DEFAULT_WARMUP = OPEN_WARMUP_FRAMES
-# Same as the station (STALE_FLUSH_FRAMES): grabs dropped before each picture.
 FLUSH_FRAMES = STALE_FLUSH_FRAMES
-# The station opens cameras with cv2.VideoCapture(index) and no backend name
-# (station/cameras.py OpenCvCameraSet.open and _open_for_shot).
 STATION_BACKEND = "default"
-# The station sets CAP_PROP_BUFFERSIZE to 1 after configuring a device, errors ignored
-# (station/cameras.py _open_one).
 STATION_BUFFER_FRAMES = 1
 DEFAULT_OUT = "hubtest_report.json"
 INSTALL_HINT = "py -m pip install opencv-python numpy"
 NOT_INSTALLED_NOTE = "this tool installs nothing; install it yourself with: " + INSTALL_HINT
-# The order in which the recommendation rule looks at the modes.
 MODE_ORDER = ("simultaneous", "sequential_keep_open", "sequential_open_per_shot")
 RUN_ORDER = ("sequential_open_per_shot", "sequential_keep_open", "simultaneous")
 MODE_TITLES = {
@@ -130,7 +38,6 @@ MODE_NAMES = {
     "sequential_keep_open": "sequential keep-open",
     "sequential_open_per_shot": "sequential open-per-shot",
 }
-# What the operator waits for in one round, per mode (used in the wait line).
 MODE_CYCLE = {
     "sequential_open_per_shot": "full per-shot cycle: open, warm-up, picture, release",
     "simultaneous": "full round: open, warm-up, all pictures",
@@ -151,7 +58,7 @@ def utc_now_iso() -> str:
 
 
 class ReportWriteError(Exception):
-    """The report could not be turned into JSON, so nothing was written (exit 1)."""
+    pass
 
 
 def _import_numpy() -> Any:
@@ -219,7 +126,6 @@ def _open_camera(cv2: Any, dev: int, api: Any, width: int, height: int,
                 cap.release()
         cam["open_s"] = clock() - start
         return None
-    # Best effort, as the station does: a short driver queue. Errors ignored.
     with contextlib.suppress(Exception):
         cap.set(cv2.CAP_PROP_BUFFERSIZE, STATION_BUFFER_FRAMES)
     cam["open_s"] = clock() - start
@@ -227,10 +133,6 @@ def _open_camera(cv2: Any, dev: int, api: Any, width: int, height: int,
 
 
 def _warm_up(cap: Any, n: int) -> None:
-    """Read and discard n frames after open (grab and retrieve, as the station does).
-
-    Best effort: failures here are not counted, the picture step reports them.
-    """
     for _ in range(n):
         try:
             cap.grab()
@@ -240,10 +142,6 @@ def _warm_up(cap: Any, n: int) -> None:
 
 
 def _flush_stale_all(caps: Sequence[Any], n: int) -> None:
-    """Drop n stale grabs per device before a picture, in the station's order (untimed).
-
-    Failures are ignored here; the real grab reports them.
-    """
     for _ in range(n):
         for cap in caps:
             try:
@@ -266,7 +164,6 @@ def _grab_one(dev: int, cap: Any, cam: dict) -> bool:
 
 def _retrieve_one(cv2: Any, np: Any, dev: int, cap: Any, cam: dict,
                   clock: Callable[[], float], start: float) -> Any:
-    """Retrieve one picture and check it. Returns the image when it is OK, else None."""
     try:
         ok, image = cap.retrieve()
     except Exception as exc:
@@ -351,7 +248,6 @@ def _run_keep_open(plan: _Plan) -> tuple[list, dict]:
     rounds: list[dict] = []
     try:
         for rnd in range(1, plan.rounds + 1):
-            # Round 1 includes opening and warm-up: the operator waits for those too.
             round_start = session_start if rnd == 1 else plan.clock()
             cams: list[dict] = []
             for dev in plan.devices:
@@ -432,10 +328,6 @@ def _summarise(rounds: list) -> dict:
 
 
 def recommend(modes: dict) -> Optional[str]:
-    """First mode in MODE_ORDER with no fatal error in which every round and every camera succeeded.
-
-    Returns the mode key, or None when no mode worked. No time limit or threshold is applied.
-    """
     for key in MODE_ORDER:
         mode = modes.get(key) or {}
         rounds = mode.get("rounds") or []
@@ -454,10 +346,6 @@ def _save_picture(cv2: Any, path: Path, image: Any) -> bool:
 
 
 def write_report_atomic(path: Path, report: dict) -> None:
-    """Write the JSON report to a temporary file in the same folder, then replace the target.
-
-    Raises ReportWriteError when json cannot encode the report (ValueError or TypeError).
-    """
     try:
         data = json.dumps(report, indent=2, allow_nan=False) + "\n"
     except (ValueError, TypeError) as exc:
@@ -488,12 +376,6 @@ def run_hubtest(
     clock: Callable[[], float] = time.monotonic,
     out: Callable[[str], Any] = print,
 ) -> dict:
-    """Run Tests A1, A2 and B, write the sample pictures and the JSON report, return the report.
-
-    Raises ValueError for bad arguments, ToolDependencyError when cv2 or numpy is missing
-    (before any camera is opened) and ReportWriteError when the report cannot be encoded.
-    Camera failures never raise; they are in the report.
-    """
     devices = [int(d) for d in devices]
     if not devices:
         raise ValueError("at least one device is required")
@@ -531,7 +413,7 @@ def run_hubtest(
         fatal: Optional[str] = None
         try:
             rounds_done, extra = _RUNNERS[key](plan)
-        except Exception as exc:  # safety net: a bug must not lose the other tests
+        except Exception as exc:
             rounds_done, extra, fatal = [], {}, _err_text(exc)
             out(f"{title} stopped unexpectedly: {fatal}")
         if key == "sequential_open_per_shot":
@@ -579,7 +461,6 @@ def _problems(mode: dict) -> list[tuple[int, int, str]]:
 
 
 def wait_text(report: dict) -> str:
-    """The 'Operator wait' line for the recommended mode, with the basis of the figure."""
     n = len(report["devices"])
     key = report["recommended_mode"]
     if key is None:

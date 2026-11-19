@@ -1,7 +1,3 @@
-"""Tests for station/fusion.py. Run from the project root:
-
-    python3 -m unittest
-"""
 import math
 import unittest
 
@@ -23,7 +19,6 @@ def img(cam: str, score: float, side: Side = Side.TOP, defects=()) -> ImageResul
 
 
 def part(scores: dict) -> list:
-    """Build 8 results (C1..C4 x TOP/BOTTOM). `scores` maps (cam, side) -> score."""
     out = []
     for side in (Side.TOP, Side.BOTTOM):
         for cam in ("C1", "C2", "C3", "C4"):
@@ -104,7 +99,7 @@ class FuseTests(unittest.TestCase):
 
     def test_correct_count_accepted(self):
         self.assertEqual(len(all_good_part()), IMAGES_PER_PART)
-        fuse(all_good_part(), TH)  # does not raise
+        fuse(all_good_part(), TH)
 
     def test_order_preserved(self):
         results = part({("C1", Side.TOP): 0.5, ("C4", Side.BOTTOM): 0.1})
@@ -114,7 +109,6 @@ class FuseTests(unittest.TestCase):
             [(r.camera_id, r.side) for r in pv.results],
             [(r.camera_id, r.side) for r in results],
         )
-        # Reversed input comes back reversed, not sorted.
         rev = list(reversed(results))
         self.assertEqual(fuse(rev, TH).results, tuple(rev))
 

@@ -459,7 +459,6 @@ class ActivationStackTests(_StoreCase):
         statuses = {m["version"]: m["status"] for m in self.store.list_versions(PART)}
         self.assertEqual(statuses, {"v1": "approved", "v2": "candidate"})
 
-        # The failed line does not block a later, successful approval.
         self.store.approve(PART, "v2", "Lan", "retry", NOW2)
         self.assertEqual(self.store.current(PART).version, "v2")
         self.assertEqual(self.store.history(PART), ["v1", "v2"])

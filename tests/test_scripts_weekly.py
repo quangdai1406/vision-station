@@ -1,9 +1,3 @@
-"""Static checks for the Windows weekly-training scripts (standard library only).
-
-These do not run PowerShell. They check the files exist, the example config parses with
-placeholders, and the safety rules hold: no promote or purge invocation outside comments,
-no password literal, and the Sunday 06:00 schedule is stated.
-"""
 from __future__ import annotations
 
 import json
@@ -30,7 +24,6 @@ def _read(path: Path) -> str:
 
 
 def _code_lines(text: str) -> list[str]:
-    """Lines that are not comments (a line whose first non-space character is '#')."""
     return [line for line in text.splitlines() if not line.lstrip().startswith("#")]
 
 
@@ -84,8 +77,6 @@ class ExampleConfigTest(unittest.TestCase):
 
 
 class ExtractorContractTest(unittest.TestCase):
-    """The JSON the .ps1 writes for the trainer must pass trainer.weekly._load_config."""
-
     def test_filled_example_is_accepted_by_the_trainer(self) -> None:
         import json
         import tempfile
@@ -94,7 +85,6 @@ class ExtractorContractTest(unittest.TestCase):
         from trainer.weekly import _load_config
 
         cfg = json.loads(_read(EXAMPLE_JSON))["extractor"]
-        # what run_weekly_training.ps1 writes: arch, input_hw as [h, w] ints, weights_path, device
         filled = {"arch": "resnet18", "input_hw": [480, 640], "weights_path": "weights.pth", "device": "cuda"}
         self.assertEqual(set(filled), set(cfg))
         with tempfile.TemporaryDirectory() as tmp:
@@ -133,8 +123,8 @@ class SafetyRulesTest(unittest.TestCase):
 
     def test_run_script_checks_onedrive_online_only_attributes(self) -> None:
         text = _read(RUN_PS1)
-        self.assertIn("0x00400000", text)  # FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
-        self.assertIn("0x00040000", text)  # FILE_ATTRIBUTE_RECALL_ON_OPEN
+        self.assertIn("0x00400000", text)
+        self.assertIn("0x00040000", text)
 
     def test_run_script_requires_min_counts_without_defaults(self) -> None:
         text = _read(RUN_PS1)
@@ -160,8 +150,6 @@ class SafetyRulesTest(unittest.TestCase):
 
 
 class BackupAndLoadTest(unittest.TestCase):
-    """L2: nightly pg_dump backup, below-normal trainer priority, inference busy check, docs."""
-
     def test_new_files_exist(self) -> None:
         for path in (BACKUP_PS1, INSTALL_BACKUP_PS1, BACKUP_EXAMPLE_JSON, LAPTOP_DOC):
             with self.subTest(path=str(path)):
@@ -230,8 +218,6 @@ class BackupAndLoadTest(unittest.TestCase):
         self.assertLess(text.index("Invoke-RestMethod"), text.index("Running the trainer"))
 
     def test_busy_check_reads_busy_from_the_health_url_without_a_token(self) -> None:
-        # /v1/health is unauthenticated and carries busy; the script must read .busy from it
-        # and must not send a token (the details live behind /v1/status).
         text = _read(RUN_PS1)
         self.assertRegex(text, r"Invoke-RestMethod -Uri \$healthUrl")
         self.assertRegex(text, r"\$health\.busy")

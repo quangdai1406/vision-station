@@ -1,5 +1,3 @@
-"""Tests for tools/analysis.py (numpy-only repeatability metrics) with synthetic data."""
-
 import math
 import os
 import tempfile
@@ -18,7 +16,6 @@ if HAS_NUMPY:
 
 
 def _texture(H, W, seed, cut=40.0):
-    """Broadband random texture in float, roughly 25..225 (Gaussian spectral envelope)."""
     rng = np.random.default_rng(seed)
     spec = np.fft.fft2(rng.standard_normal((H, W)))
     fy = np.fft.fftfreq(H)[:, None] * H
@@ -29,7 +26,6 @@ def _texture(H, W, seed, cut=40.0):
 
 
 def _fourier_shift(img, dx, dy):
-    """Circular sub-pixel shift: result(x) = img(x - dx, y - dy)."""
     H, W = img.shape
     fy = np.fft.fftfreq(H)[:, None]
     fx = np.fft.fftfreq(W)[None, :]
@@ -50,7 +46,7 @@ class TestBrightness(unittest.TestCase):
     def test_known_ramp_slope_is_recovered(self):
         T, H, W = 10, 8, 8
         base = np.full((H, W), 100.0)
-        g = np.stack([base + 0.75 * t for t in range(T)])  # float input
+        g = np.stack([base + 0.75 * t for t in range(T)])
         r = analysis.brightness_stats(g)
         self.assertAlmostEqual(r["slope_per_frame"], 0.75, places=9)
         self.assertAlmostEqual(r["min"], 100.0)
@@ -77,7 +73,7 @@ class TestSharpness(unittest.TestCase):
         rng = np.random.default_rng(1)
         sharp = rng.integers(0, 256, size=(64, 64)).astype(np.float64)
         blurred = sharp.copy()
-        for _ in range(3):  # repeated 3x3 box blur
+        for _ in range(3):
             p = np.pad(blurred, 1, mode="edge")
             blurred = sum(p[i:i + 64, j:j + 64] for i in range(3) for j in range(3)) / 9.0
         g = np.stack([sharp, blurred]).astype(np.float64)
@@ -128,7 +124,6 @@ class TestTemporalNoise(unittest.TestCase):
         rng = np.random.default_rng(4)
         T, H, W = 40, 60, 80
         g = np.full((T, H, W), 100.0)
-        # Noise only in the window x in [10, 30), y in [5, 25).
         g[:, 5:25, 10:30] += rng.normal(0.0, 3.0, size=(T, 20, 20))
         noisy = analysis.temporal_noise(g, roi=(10, 5, 20, 20))
         quiet = analysis.temporal_noise(g, roi=(50, 40, 20, 15))
@@ -152,8 +147,7 @@ class TestTemporalNoise(unittest.TestCase):
 class TestEstimateShifts(unittest.TestCase):
     def test_integer_shift_recovered_with_sign_convention(self):
         ref = _texture(96, 128, seed=5)
-        # np.roll moves content right for +shift on axis 1 and down for +shift on axis 0.
-        frame_moved = np.roll(ref, shift=(-3, 7), axis=(0, 1))  # dy=-3 (up), dx=+7 (right)
+        frame_moved = np.roll(ref, shift=(-3, 7), axis=(0, 1))
         g = np.stack([ref, frame_moved])
         r = analysis.estimate_shifts(g, ref_index=0)
         self.assertEqual(r[0]["dx"], 0.0)
@@ -204,9 +198,7 @@ class TestResidual(unittest.TestCase):
         frames = 128.0 + rng.normal(0.0, 2.0, size=(T, H, W))
         g = np.clip(np.rint(frames), 0, 255).astype(np.uint8)
         r = analysis.residual_scores(g, align=False)
-        # Each frame minus a per-pixel median of T noisy frames: the difference has
-        # variance sigma^2 + var(median), with var(median) ~ (pi/2) sigma^2 / T.
-        var_q = 2.0 ** 2 + 1.0 / 12.0  # including uint8 rounding
+        var_q = 2.0 ** 2 + 1.0 / 12.0
         var_diff = var_q + (math.pi / 2.0) * var_q / T
         expected = math.sqrt(2.0 / math.pi) * math.sqrt(var_diff) / 255.0
         self.assertAlmostEqual(r["mean"] / expected, 1.0, delta=0.05)

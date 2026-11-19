@@ -1,9 +1,3 @@
-"""HTTP tests for the Taking-data endpoints and page (station.ui, plan step 4).
-
-Fakes only: the cameras are fake, the inspection session is FakeSession from test_ui.
-The scan session and the scan store are real (a temporary folder), so a saved scan is
-checked with station.scanstore.verify_scan. No real camera, no ~/vision-home.
-"""
 import http.client
 import json
 import os
@@ -42,9 +36,6 @@ ROUTES = [
 
 
 class FakeCams:
-    """Each capture returns one picture per camera: data is 'TOP-C1-<capture number>'.
-    A scripted exception is raised instead of a capture."""
-
     def __init__(self):
         self.script = []
         self.count = 0
@@ -168,7 +159,6 @@ class ScanAuthTests(ScanHttpBase):
                               token=self.tokens["op"])
             self.assertEqual(reply.status, 403, path)
             self.assertNotIn(b"Traceback", reply.body)
-        # Nothing was started by the refused requests.
         self.assertEqual(self.scan.snapshot()["state"], "IDLE")
 
     def test_supervisor_and_admin_may_use_the_routes(self):
@@ -232,7 +222,7 @@ class ScanFlowTests(ScanHttpBase):
         self.assertTrue(self.ok(role, "/api/scan/press")["accepted"])
         self.assertTrue(self.ok(role, "/api/scan/press")["accepted"])
         self.assertEqual(self.ok(role, "/api/scan/done-side")["scan"]["state"], "WAIT_FLIP")
-        self.assertTrue(self.ok(role, "/api/scan/press")["accepted"])  # flip, BOTTOM step 1
+        self.assertTrue(self.ok(role, "/api/scan/press")["accepted"])
         self.assertEqual(self.ok(role, "/api/scan/done-side")["scan"]["state"], "SAVING")
         return self.ok(role, "/api/scan/finish")
 
@@ -240,7 +230,7 @@ class ScanFlowTests(ScanHttpBase):
         started = self.ok("sup", "/api/scan/start", start_body(toy="toy-8"))
         self.assertEqual(started["scan_id"], "SC-1")
         self.assertEqual(started["scan"]["state"], "SCAN_SIDE")
-        self.assertEqual(started["scan"]["part_number"], "AISI-100")  # the station's current part
+        self.assertEqual(started["scan"]["part_number"], "AISI-100")
         self.assertEqual(self.state()["prompt"], started["scan"]["prompt"])
         self.assertTrue(self.ok("sup", "/api/scan/press")["accepted"])
         self.assertTrue(self.ok("sup", "/api/scan/press")["accepted"])
@@ -263,7 +253,7 @@ class ScanFlowTests(ScanHttpBase):
         per_side = {}
         for image in doc["images"]:
             per_side[image["side"]] = per_side.get(image["side"], 0) + 1
-        self.assertEqual(per_side, {"TOP": 8, "BOTTOM": 4})  # 2 steps x 4 cameras, 1 x 4
+        self.assertEqual(per_side, {"TOP": 8, "BOTTOM": 4})
         self.assertEqual(self.ok("sup", "/api/scan/reset")["scan"]["state"], "IDLE")
 
     def test_admin_label_is_official(self):
@@ -338,7 +328,6 @@ class ScanFlowTests(ScanHttpBase):
         self.ok("sup", "/api/scan/press")
         self.ok("sup", "/api/scan/mark",
                 {"camera_id": "C3", "side": "BOTTOM", "step": 1, "visible": True})
-        # An earlier step can still be changed until finish.
         self.ok("sup", "/api/scan/mark",
                 {"camera_id": "C2", "side": "TOP", "step": 1, "visible": True})
         self.ok("sup", "/api/scan/mark",
@@ -524,7 +513,6 @@ def good_mark():
 
 class InspectionGuardTests(ScanHttpBase):
     def test_inspection_press_is_refused_while_a_scan_is_active(self):
-        # The real StationApp guard methods, bound to a stub that holds only what they use.
         stub = types.SimpleNamespace(
             _scan_session=self.scan,
             store=types.SimpleNamespace(append_event=lambda *a, **k: None),
@@ -568,10 +556,8 @@ class ScanPageTests(ScanHttpBase):
 
     def test_live_view_and_step_pictures_stay_on_during_a_scan(self):
         html = self.page()
-        # The live view is not hidden while a scan runs; it pauses only while saving or in a fault.
         self.assertNotIn('$("live").hidden', html)
         self.assertIn('scanSnap.state === "SCAN_SIDE" || scanSnap.state === "WAIT_FLIP"', html)
-        # Step pictures are listed for GOOD scans too; only BAD scans get the defect checkbox.
         self.assertNotIn('if (s.label_verdict !== "BAD" || count < 1', html)
         self.assertIn("if (isBad) {", html)
 
@@ -581,13 +567,12 @@ class ScanPageTests(ScanHttpBase):
         self.assertIn("scanAllowed = !!allowed.scan;", html)
         self.assertIn("$(\"scan-open\").hidden = !scanAllowed;", html)
         self.assertIn("if (scanAllowed) { refreshScan(); }", html)
-        # The server's list is what the browser sees: scan only for the roles that may use it.
         self.assertNotIn("scan", json.loads(self.get("op", "/api/state").body)["auth"]["actions"])
         self.assertIn("scan", json.loads(self.get("sup", "/api/state").body)["auth"]["actions"])
 
     def test_enter_key_goes_to_the_scan_while_it_runs(self):
         html = self.page()
-        key = html.index('addEventListener("keydown"')  # the inspection key handler
+        key = html.index('addEventListener("keydown"')
         self.assertIn("if (scanIsActive()) {", html[key:])
         self.assertLess(html.index("if (scanIsActive()) {", key),
                         html.index("if (inPressLockout()) { setPressStatus(MSG_WAIT_CAPTURE); return; }", key))
@@ -602,8 +587,6 @@ class ScanPageTests(ScanHttpBase):
         self.assertNotIn("document.write", block)
 
     def test_scan_review_buttons_do_not_trigger_the_part_label_handler(self):
-        # A data-action="label_approve" button also fires the page-wide handler, which would
-        # approve the collected part's label for the same click.
         html = self.page()
         start = html.index("function renderScanReview(rows)")
         end = html.index("function refreshScanReview()")
@@ -628,7 +611,6 @@ class ScanPageTests(ScanHttpBase):
                       'aria-label="Scans waiting for approval" hidden>', html)
         self.assertIn('<span id="scan-review-count" role="status"></span>', html)
         self.assertIn('<button type="button" id="scan-review-open" class="secondary">Review</button>', html)
-        # First thing in the logged-in area: after the app section opens, before the state card.
         app = html.index('<section id="app" hidden>')
         self.assertLess(app, html.index('id="scan-review-banner"'))
         self.assertLess(html.index('id="scan-review-banner"'), html.index('id="poc"'))
@@ -660,7 +642,6 @@ class ScanPageTests(ScanHttpBase):
         html = self.page()
         self.assertIn("function reviewBannerWanted() {", html)
         self.assertIn("return reviewAllowed && scanAllowed;", html)
-        # Hidden without the feature or the role: the stop path clears the banner and count.
         stop = html.index("function stopReviewBanner()")
         self.assertIn('$("scan-review-banner").hidden = true;', html[stop:stop + 300])
         self.assertIn('$("scan-review-count").textContent = "";', html[stop:stop + 300])
@@ -671,19 +652,15 @@ class ScanPageTests(ScanHttpBase):
         start = html.index("function startReviewBanner()")
         end = html.index("function stopReviewBanner()")
         block = html[start:end]
-        # One timer only, not started without label_approve and Taking data.
         self.assertIn("if (reviewTimer !== null || !reviewBannerWanted()) { return; }", block)
         self.assertEqual(block.count("setInterval("), 1)
         self.assertIn("REVIEW_BANNER_MS);", block)
-        # Each tick is skipped unless the role may review, the page is shown and visible.
         self.assertIn("if (!reviewBannerWanted() || el.app.hidden || document.visibilityState !== \"visible\") { return; }",
                       block)
         self.assertIn("refreshScanReview();", block)
-        # Started on the first render after login, stopped on logout and on 401 (showLogin).
         self.assertIn("startReviewBanner();", html)
         logout = html.index("function showLogin()")
         self.assertIn("stopReviewBanner();", html[logout:html.index("function handleError", logout)])
-        # The review banner is the only interval on the page (the rest use setTimeout).
         self.assertEqual(html.count("setInterval("), 1)
 
     def test_review_open_button_shows_the_panel_and_scrolls_to_review(self):
@@ -709,7 +686,6 @@ class ScanPageTests(ScanHttpBase):
             self.skipTest("node not available")
         block = self.scan_block(self.page())
         self.assertIn("function renderScanPanel()", block)
-        # Wrapped in a function so the block is checked as the script part it is.
         source = "(function () {\n" + block + "\n})();\n"
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "scan_block.js")
@@ -725,8 +701,6 @@ PROPOSED_GOOD = {"verdict": "GOOD", "defects": [], "status": "proposed",
 
 
 class ScanReviewSessionTests(unittest.TestCase):
-    """ScanSession.pending_reviews and ScanSession.review on a real store (fake cameras)."""
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -741,7 +715,6 @@ class ScanReviewSessionTests(unittest.TestCase):
 
     def take(self, verdict="GOOD", defects=None, toy="toy-1", status="proposed",
              taken_by=SUP_USER, when=NOW):
-        """One finished scan: TOP step 1, flip, BOTTOM step 1, saved."""
         self.stamp[0] = when
         label = {"verdict": verdict, "defects": [] if defects is None else defects,
                  "status": status, "labelled_by": taken_by, "labelled_at": when}
