@@ -15,11 +15,10 @@ HAS_NUMPY = importlib.util.find_spec("numpy") is not None
 if HAS_NUMPY:
     import numpy as np
 
-SHAPE = (80, 96)  # grey test images; feature grid is (10, 12)
+SHAPE = (80, 96)
 
 
 class BlockExtractor:
-    """Fake extractor: 8x8 block statistics -> (H/8, W/8, 4) = mean, max, min, std."""
 
     name = "fake-block-8-v1"
     stride = 8
@@ -54,7 +53,6 @@ def _frame(arr, camera="C1", side=Side.TOP):
 
 
 def _good(level=120, seed=0, shape=SHAPE):
-    """Still good scene: level plus 0/1 grey noise."""
     rng = np.random.RandomState(seed)
     return (level + rng.randint(0, 2, shape)).astype(np.uint8)
 
@@ -81,7 +79,7 @@ def _overlap_fraction(box, blob):
 class CoresetTests(unittest.TestCase):
     def test_same_seed_gives_same_indices(self):
         rng = np.random.RandomState(1)
-        feats = rng.randn(500, 200).astype(np.float32)  # projected: C > 128
+        feats = rng.randn(500, 200).astype(np.float32)
         a = anomaly.greedy_coreset(feats, 40, seed=3)
         b = anomaly.greedy_coreset(feats, 40, seed=3)
         np.testing.assert_array_equal(a, b)
@@ -115,7 +113,7 @@ class NumpyBackendTests(unittest.TestCase):
         q = rng.randn(37, 6).astype(np.float32) * 3 + 50
         b = rng.randn(23, 6).astype(np.float32) * 3 + 50
         brute = np.sqrt(((q[:, None, :].astype(np.float64) - b[None].astype(np.float64)) ** 2).sum(-1)).min(1)
-        for max_bytes in (4 * 23 * 2, 4 * 5, 10 ** 9):  # forces many blocks, then one block
+        for max_bytes in (4 * 23 * 2, 4 * 5, 10 ** 9):
             backend = anomaly.NumpyBackend(max_chunk_bytes=max_bytes)
             got = backend.nn_distance(q, b)
             self.assertEqual(got.dtype, np.float32)
@@ -185,8 +183,6 @@ class PatchCoreTests(unittest.TestCase):
 
     def test_holdout_sets_norm_ref_and_source(self):
         builder = self._train()
-        # two held-out images: this fixture's block statistics are so discrete that one
-        # float16 held-out image can match the float16 bank exactly (raw score 0)
         builder.add_holdout(_frame(_good(seed=100)))
         builder.add_holdout(_frame(_good(seed=101)))
         model = builder.build("pc-h")
@@ -342,14 +338,12 @@ def _block_feats(seed, level=120):
 
 
 class _OtherDimExtractor(BlockExtractor):
-    """Same name and input size, but 3 features per cell instead of 4."""
 
     def extract(self, image):
         return super().extract(image)[..., :3]
 
 
 def _write_legacy_v1(path, model):
-    """Write a file in the patchcore-v1 layout (no holdout features, no parent, no input_hw)."""
     arrays = {}
     entries = []
     for key in model.keys():
@@ -506,7 +500,6 @@ class IncrementalTests(unittest.TestCase):
 
     def test_recalibration_uses_old_holdout_features_without_old_pictures(self):
         model = _fit(holdout_seeds=(100, 101))
-        # the old training and held-out pictures are gone: only new pictures are passed in
         updated = _update(model, seeds=range(10, 13), level=120)
         info = updated.describe()["banks"]["C1/TOP"]
         self.assertEqual(info["norm_ref_source"], "holdout")
@@ -536,9 +529,8 @@ class IncrementalTests(unittest.TestCase):
                 self.assertEqual(fa.read(), fc.read())
             self.assertEqual(loaded.parent_version, "v1")
             self.assertEqual(loaded.describe()["banks"]["C1/TOP"]["holdout_images"], 2)
-            # the loaded model can be updated again with only new pictures
             again = _update(loaded, seeds=[40], level=122, version="v3")
-            self.assertEqual(again.describe()["banks"]["C1/TOP"]["images_seen"], 8)  # 4 + 3 + 1
+            self.assertEqual(again.describe()["banks"]["C1/TOP"]["images_seen"], 8)
 
     def test_legacy_v1_file_scores_but_refuses_update(self):
         model = _fit()
@@ -560,9 +552,9 @@ class IncrementalTests(unittest.TestCase):
 class Cv2RgbDecoderTests(unittest.TestCase):
     def test_bgr_is_converted_to_rgb(self):
         bgr = np.zeros((4, 5, 3), dtype=np.uint8)
-        bgr[..., 0] = 10  # blue
-        bgr[..., 1] = 20  # green
-        bgr[..., 2] = 30  # red
+        bgr[..., 0] = 10
+        bgr[..., 1] = 20
+        bgr[..., 2] = 30
         cv2 = _FakeCv2(bgr)
         frame = Frame(camera_id="C1", side=Side.TOP, seq=0, timestamp_utc="2026-10-24T08:30:00Z",
                       data=b"encoded-bytes")

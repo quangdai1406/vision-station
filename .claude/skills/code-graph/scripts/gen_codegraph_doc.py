@@ -1,12 +1,3 @@
-"""Write docs/CODEGRAPH.md from the code graph (standard library only, any repo).
-
-    python3 .claude/skills/code-graph/scripts/gen_codegraph_doc.py          # rebuild + rewrite
-    python3 .claude/skills/code-graph/scripts/gen_codegraph_doc.py --check  # exit 1 if stale
-
-The raw graph (.codegraph/graph.json) is never committed; this overview is. Output has no
-timestamps, so --check is exact. Blind spots (what static imports cannot show) are read from
-.claude/skills/code-graph/blind_spots.txt, one bullet per line; keep them current by hand.
-"""
 from __future__ import annotations
 
 import json
@@ -17,12 +8,12 @@ from collections import defaultdict
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parents[3]  # <root>/.claude/skills/code-graph/scripts
+ROOT = HERE.parents[3]
 CG = HERE / "codegraph.py"
 GRAPH = ROOT / ".codegraph" / "graph.json"
 OUT = ROOT / "docs" / "CODEGRAPH.md"
 BLIND = HERE.parent / "blind_spots.txt"
-NOTES_FILE = HERE.parent / "notes.txt"  # optional: extra lines for the 'How to run' section
+NOTES_FILE = HERE.parent / "notes.txt"
 
 
 def build_graph() -> dict:
@@ -32,7 +23,6 @@ def build_graph() -> dict:
 
 
 def purpose_of(path: Path) -> str:
-    """First docstring line (Python) or first // comment line (JS/TS)."""
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:

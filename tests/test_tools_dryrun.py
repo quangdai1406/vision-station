@@ -1,9 +1,3 @@
-"""Chained dry run of the repeatability tools, plus checks on the operator protocol.
-
-The capture, report and threshold runs need numpy (skipped without it). They use the
-FakeCv2 from tests/test_tools_capture.py, so no camera or opencv is needed. Every output
-goes into a temporary folder. The protocol checks need no numpy.
-"""
 from __future__ import annotations
 
 import contextlib
@@ -17,7 +11,7 @@ from pathlib import Path
 
 try:
     import numpy as np
-except ImportError:  # pragma: no cover - numpy is needed only for the chained runs
+except ImportError:
     np = None
 
 from tests.test_tools_capture import FakeCv2
@@ -34,7 +28,6 @@ NOTE_SENTENCE = "Candidate values from labelled samples only"
 
 
 def _quiet(fn, argv):
-    """Run a CLI main() and return (exit code, stdout text)."""
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
         code = fn(argv)
@@ -42,7 +35,6 @@ def _quiet(fn, argv):
 
 
 def _capture(out_dir, name, mode, **overrides):
-    """A tiny capture with the fake camera: small frames, no waiting, no flush-delay."""
     kwargs = dict(
         mode=mode,
         devices=[0],
@@ -201,7 +193,6 @@ class ThresholdsDryRunTests(unittest.TestCase):
         self.assertIn(NOTE_SENTENCE, text)
         self.assertIn("## Candidate values", report)
         self.assertIn("Model version: dryrun-1", report)
-        # t_img is the lowest bad score; the 90th percentile of 10 good scores is the 9th value.
         self.assertIn("`0.6`", report)
         self.assertIn("`0.28`", report)
         result = json.loads(js.read_text(encoding="utf-8"))
@@ -237,11 +228,6 @@ class ProtocolDocTests(unittest.TestCase):
         return DOC.read_text(encoding="utf-8")
 
     def _doc_commands(self):
-        """(tool name, command text) for every `py -m tools.<name>` in the protocol.
-
-        The command text runs to the end of the line, or to a closing backtick for an
-        inline command in prose.
-        """
         commands = []
         for line in self._doc_text().splitlines():
             for match in re.finditer(r"py -m tools\.([a-z_]+)", line):
@@ -261,7 +247,6 @@ class ProtocolDocTests(unittest.TestCase):
         self.assertTrue(commands, "no 'py -m tools.<name>' lines found in the protocol")
         for name, _ in commands:
             self.assertIn(name, self.TOOLS, f"protocol names unknown tool tools.{name}")
-        # Every use of -m tools. in the doc must be written as 'py -m tools.<name>'.
         for line in self._doc_text().splitlines():
             self.assertNotRegex(line, r"(?<!py )-m tools\.", line)
         used = {name for name, _ in commands}

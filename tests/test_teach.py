@@ -1,4 +1,3 @@
-"""Tests for `python -m station teach` (station/teach.py). Fake cameras, no hardware."""
 from __future__ import annotations
 
 import contextlib
@@ -25,7 +24,6 @@ def _decode(frame):
 
 
 class _Inputs:
-    """Fake input(): records calls; raises exc on call number fail_at (1-based)."""
 
     def __init__(self, fail_at=None, exc=EOFError):
         self.calls = 0
@@ -67,7 +65,6 @@ class _TeachCase(unittest.TestCase):
 
 
 class TeachArgumentTests(_TeachCase):
-    """No numpy needed: every case stops before a model is built."""
 
     def test_model_kind_not_golden_exits_2(self):
         path = self.write_config(kind="marker")
@@ -108,7 +105,6 @@ class TeachArgumentTests(_TeachCase):
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             rc = cli.main(["teach", "--config", str(path)])
         self.assertEqual(rc, 2)
-        # the config itself requires model.path for the golden kind
         self.assertIn("model.path", err.getvalue())
 
     def test_refuses_to_overwrite_without_force(self):
@@ -180,7 +176,6 @@ class TeachRunTests(_TeachCase):
 
         self.assertIn("  C1/TOP: 6 frames", lines)
         self.assertIn("  C1/BOTTOM: 6 frames", lines)
-        # 2 parts x 2 sides x 3 rounds = 12 rounds, a pause between each pair of rounds.
         self.assertEqual(sleeps, [teach.DEFAULT_PAUSE_S] * 11)
 
     def test_prompts_appear_in_order_top_then_bottom_per_part(self):

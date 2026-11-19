@@ -1,17 +1,3 @@
-"""Client for the MES part search and per-part inspection criteria.
-
-Standard library only. The MES bearer token goes only in the Authorization header and is
-never put in an error message or a file.
-
-Proxies: as in tools/criteria.py, environment proxies are bypassed by default so the token
-goes straight to the MES. Pass use_env_proxy=True only when the MES is reachable only
-through a corporate proxy (a token over plain http is then visible to that proxy).
-
-Redirects are not followed, so the token is never sent to another host.
-
-build_part_config() mirrors tools/criteria.py (same slug and collision rules). The functions
-are copied here on purpose: station code must not import tools/.
-"""
 from __future__ import annotations
 
 import http.client
@@ -30,15 +16,14 @@ CHECK_TYPES = ("visual", "measurement")
 SEARCH_LIMIT_MIN = 1
 SEARCH_LIMIT_MAX = 50
 QUERY_MAX_LENGTH = 100
-_MISSING = object()  # sentinel: the MES answered 404 for a lookup that may be absent
+_MISSING = object()
 
 
 class PartsError(StationError):
-    """The MES could not supply part data. The message never contains the token."""
+    pass
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Do not follow redirects: the token must not be sent to another host."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -78,7 +63,6 @@ def _expect_list_of_dicts(data: Any, what: str) -> list[dict]:
 
 
 class MesPartsClient:
-    """Read-only client for the MES part search, part lookup and criteria endpoints."""
 
     def __init__(self, base_url: str, token: str, *, timeout_s: float = 10.0,
                  use_env_proxy: bool = False) -> None:
@@ -107,7 +91,7 @@ class MesPartsClient:
                 body = resp.read()
         except urllib.error.HTTPError as exc:
             code = exc.code
-            exc.close()  # release the connection; the body is not used
+            exc.close()
             if code == 404 and missing_ok:
                 return _MISSING
             raise PartsError(_scrub(_http_message(code, what), self._token)) from None
@@ -124,7 +108,6 @@ class MesPartsClient:
             raise PartsError(f"MES returned something other than JSON for {what}") from None
 
     def search(self, q: str, limit: int = 20) -> list[dict]:
-        """Parts matching q. limit is clamped to 1..50. ValueError for an empty or over-long q."""
         if not isinstance(q, str):
             raise ValueError("search text must be a string")
         text = q.strip()
@@ -140,7 +123,6 @@ class MesPartsClient:
         return _expect_list_of_dicts(data, "part search")
 
     def get_part(self, part_number: str) -> dict | None:
-        """One part, or None when the MES answers 404."""
         part = _part_text(part_number)
         path = "/api/machine/parts/" + urllib.parse.quote(part, safe="")
         data = self._get_json(path, what=f"part {part}", missing_ok=True)
@@ -151,16 +133,12 @@ class MesPartsClient:
         return data
 
     def criteria(self, part_number: str) -> list[dict]:
-        """Inspection criteria for a part. A 404 raises PartsError (no criteria for that part)."""
         part = _part_text(part_number)
         path = "/api/machine/criteria/" + urllib.parse.quote(part, safe="")
         data = self._get_json(path, what=f"criteria for part {part}")
         return _expect_list_of_dicts(data, f"criteria for part {part}")
 
 
-# ---------------------------------------------------------------------------
-# Criteria -> station config (mirrors tools/criteria.py)
-# ---------------------------------------------------------------------------
 
 def _validate(data: Any, source: str) -> list[dict]:
     if not isinstance(data, list):
@@ -208,7 +186,6 @@ def _safe_id(key: str) -> str:
 
 
 def slugify(name: str) -> str:
-    """Lowercase ASCII snake_case from a criteria name. Raises ValueError if nothing is left."""
     if not isinstance(name, str):
         raise ValueError("criteria name must be a string")
     folded = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
@@ -219,7 +196,6 @@ def slugify(name: str) -> str:
 
 
 def derive_class_names(criteria: list[dict]) -> dict[str, str]:
-    """Defect-class name for every criterion id. Colliding names get '_<id>' on every member."""
     criteria = _validate(criteria, "criteria")
     base: dict[str, str | None] = {}
     for c in criteria:
@@ -244,7 +220,6 @@ def derive_class_names(criteria: list[dict]) -> dict[str, str]:
 
 
 def split_by_type(criteria: list[dict]) -> tuple[list[dict], list[dict]]:
-    """(active visual, active measurement). Inactive criteria are in neither list."""
     criteria = _validate(criteria, "criteria")
     visual = [c for c in criteria if c["active"] and c["check_type"] == "visual"]
     measurement = [c for c in criteria if c["active"] and c["check_type"] == "measurement"]
@@ -252,13 +227,6 @@ def split_by_type(criteria: list[dict]) -> tuple[list[dict], list[dict]]:
 
 
 def build_part_config(criteria: list[dict]) -> dict[str, Any]:
-    """Station config pieces for one part, derived from the MES criteria.
-
-    criteria_ids: every active criterion id (the MES needs a result for each).
-    class_to_criterion: active visual criteria only, {defect class: criterion id}.
-    measurement_criteria: active measurement criteria, which the camera does not check.
-    warnings: things Quality or the station owner must decide.
-    """
     entries = _validate(criteria, "criteria")
     names = derive_class_names(entries)
     visual, measurement = split_by_type(entries)
@@ -275,7 +243,6 @@ def build_part_config(criteria: list[dict]) -> dict[str, Any]:
         "criteria_ids": [_key(c) for c in entries if c["active"]],
         "class_to_criterion": {names[_key(c)]: _key(c) for c in visual},
         "measurement_criteria": [{"id": _key(c), "name": c["criteria_name"]} for c in measurement],
-        # Active criteria for the defect picker: name and description as the MES gives them.
         "criteria": [{"id": _key(c), "name": c["criteria_name"],
                       "description": c["criteria_description"]} for c in entries if c["active"]],
         "warnings": warnings,

@@ -1,9 +1,3 @@
-"""Tests for the scan part of tools/export_evidence.py (scans/ next to store/).
-
-Fake scans are written with the real station.scanstore.ScanStore. Run from the project root:
-
-    python3 -m unittest discover -s tests
-"""
 import contextlib
 import io
 import json
@@ -29,7 +23,6 @@ GOOD_LABEL = {
 
 
 def snapshot(root):
-    """Map every file under root to its bytes, for before/after comparisons."""
     out = {}
     for dirpath, _dirs, files in os.walk(root):
         for name in files:
@@ -82,7 +75,7 @@ class ScanCopyTests(ScanExportTestCase):
         self.assertEqual((sc["found"], sc["copied"], sc["skipped"], sc["failed"]), (2, 2, 0, 0))
         for scan_id, day in (("S-1", "2026-10-23"), ("S-2", "2026-10-25")):
             dst = self._dest_scan(scan_id, day)
-            self.assertEqual(verify_scan(dst), [])  # station verifier agrees
+            self.assertEqual(verify_scan(dst), [])
             self.assertEqual(load_scan(dst)["scan_id"], scan_id)
 
     def test_scan_json_is_copied_and_listed_in_manifest(self):
@@ -152,7 +145,7 @@ class ScanCheckTests(ScanExportTestCase):
         writer = self.scans.begin_scan(
             "S-3", "PN-1", "TOY-3", dict(GOOD_LABEL), "op-1", list(CAMS), "2026-10-23T09:00:00Z"
         )
-        writer.add_picture("C1", "TOP", 1, b"half written")  # never finished: stays staged
+        writer.add_picture("C1", "TOP", 1, b"half written")
         report = self._export()
         sc = report["scans"]["counts"]
         self.assertEqual((sc["found"], sc["copied"], sc["incomplete"]), (3, 2, 1))

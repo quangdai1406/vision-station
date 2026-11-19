@@ -41,15 +41,6 @@ def make_record(session_id, part_id, part_number, started, final, *, machine=Non
 
 
 class PurgeFixture(unittest.TestCase):
-    """Parts of PN-1 (day 2026-10-01 unless noted):
-
-    P-G1  S-G1  GOOD            trained                      -> purged
-    P-G2  S-G2  GOOD            trained, but holdout         -> kept (holdout)
-    P-G3  S-G3  GOOD            not in any training run      -> kept
-    P-BAD S-BAD BAD             listed in training           -> kept (BAD)
-    P-OVR S-OVR GOOD/BAD+ovr    listed in training           -> kept (overridden)
-    P-OTH S-OTH GOOD (PN-2)     trained, other part number   -> not touched
-    """
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -72,7 +63,6 @@ class PurgeFixture(unittest.TestCase):
         model_file.write_bytes(b"model bytes v1")
         ModelStore(self.models_root).add_candidate(
             "PN-1", "cand-1", model_file, {"type": "golden"}, "2026-10-08T00:00:00Z")
-        # Purge needs the candidate to be approved (see ApprovalGateTests).
         ModelStore(self.models_root).approve(
             "PN-1", "cand-1", "Admin Test", "fixture approval", "2026-10-08T01:00:00Z")
         self.report = self.root / "weekly-2026-10-08.json"
@@ -315,8 +305,6 @@ class TestArguments(PurgeFixture):
 
 
 class ApprovalGateTests(PurgeFixture):
-    """Next week's training starts from the APPROVED model and only reads pictures newer than it.
-    Pictures used by a candidate nobody approved would be lost for good, so purge refuses."""
 
     def _second_candidate(self):
         model_file = self.root / "model2.bin"

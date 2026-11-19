@@ -1,59 +1,3 @@
-"""Delete the pictures of GOOD parts that a verified training run already used.
-
-``python3 -m trainer purge --store PATH --models PATH --part PN --weekly-report FILE [--confirm]``
-
-Dry run is the default: it prints what would be deleted and deletes nothing.
-Only ``--confirm`` deletes. Standard library only.
-
-Weekly report (JSON, written by trainer/weekly.py). Read defensively; this is the
-key set this module relies on::
-
-    {
-      "parts": [
-        {
-          "part_number": "PN-1",                 # required, str
-          "candidate_version": "2026-10-19-a",   # required, str: ModelStore version trained
-          "training_succeeded": true,            # required, bool
-          "trained_session_ids": ["S-A1", ...],  # required, list of str: session_id of each
-                                                 #   part used as a GOOD training input
-          "holdout_session_ids": ["S-A9", ...]   # optional, list of str
-        }
-      ],
-      "holdout_session_ids": ["S-A9", ...]       # optional, top level, list of str
-    }
-
-A session is protected if it appears in ANY holdout list (top level or per entry).
-Entries for other part numbers are ignored, except for their holdout lists. A report
-with no entry for --part, a malformed entry for --part, or a succeeded entry whose
-candidate is missing from the ModelStore, fails verification, or is not on the approved
-history (never promoted, or rolled back) REFUSES the whole run
-(exit 1, nothing deleted).
-
-Eligible pictures (all must hold, else the part is kept):
-  - the part is classified GOOD under the strict policy (trainer.dataset.classify):
-    final GOOD, machine GOOD, override null;
-  - it is not a partial station, and its verdicts are not REVIEW (supervisor review);
-  - its session_id is in trained_session_ids of a succeeded entry for the same part
-    number whose candidate verifies, and it is not a holdout session;
-  - every picture listed in part.json is a plain file name listed in
-    manifest.sha256 with the same sha256, is a regular file (not a symlink), and
-    still hashes to that sha256.
-
-A part with one changed, symlinked or unlisted picture is kept as a whole (a
-half-purged part would be left behind). BAD and overridden parts are never touched.
-part.json, manifest.sha256 and any file not listed as a picture are never deleted.
-
-Per purged part, purged.json is written atomically BEFORE any picture is deleted::
-
-    {"schema": 1, "tool": "trainer.purge/1", "utc": "...Z", "part_number", "part_id",
-     "session_id", "candidate_version", "report": "<report file name>",
-     "files": [{"name", "sha256", "size"}, ...]}
-
-part.json is left untouched. Re-running is idempotent: a part whose pictures are all
-gone is counted as already purged; a part interrupted half-way has its remaining
-listed pictures deleted and the tombstone's file list merged.
-trainer/dataset.py skips tombstoned parts with a note.
-"""
 from __future__ import annotations
 
 import argparse
@@ -93,14 +37,13 @@ _META_NAMES = frozenset({PART_JSON, MANIFEST, PURGED_FILE})
 
 
 class PurgeRefusal(Exception):
-    """The whole run must stop; nothing may be deleted."""
+    pass
 
 
 class _PartSkip(Exception):
-    """This one part must be kept; the reason is reported."""
+    pass
 
 
-# ----------------------------------------------------------------- data
 @dataclass(frozen=True)
 class PurgeFile:
     name: str
@@ -116,8 +59,8 @@ class PurgePart:
     session_id: str
     part_dir: pathlib.Path
     candidate_version: str
-    files: tuple  # tuple of PurgeFile, pictures still present and verified
-    previous_tombstone: Optional[dict]  # purged.json already there (interrupted run)
+    files: tuple
+    previous_tombstone: Optional[dict]
 
     @property
     def bytes(self) -> int:
@@ -157,7 +100,6 @@ class PurgeResult:
     errors: list = field(default_factory=list)
 
 
-# ----------------------------------------------------------------- helpers
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -185,7 +127,6 @@ def _load_report(path) -> Any:
 
 
 def _parse_report(report: Any, part_number: str) -> tuple[list, set]:
-    """Return (entries for part_number, every protected holdout session id)."""
     if not isinstance(report, dict):
         raise PurgeRefusal("weekly report is not a JSON object")
     top_holdout = report.get("holdout_session_ids", [])
@@ -212,7 +153,6 @@ def _parse_report(report: Any, part_number: str) -> tuple[list, set]:
 
 def _verified_sessions(model_store: ModelStore, part_number: str, entries: list,
                        plan: PurgePlan) -> dict:
-    """session_id -> candidate_version, for succeeded runs whose candidate verifies."""
     sessions: dict = {}
     for entry in entries:
         version = entry.get("candidate_version")
@@ -234,8 +174,6 @@ def _verified_sessions(model_store: ModelStore, part_number: str, entries: list,
             raise PurgeRefusal(
                 f"candidate {version} for part {part_number} does not verify: " + "; ".join(problems)
             )
-        # The next weekly run starts from the APPROVED model and reads only pictures newer
-        # than it, so pictures used by a candidate nobody approved would be lost for good.
         if version not in model_store.history(part_number):
             raise PurgeRefusal(
                 f"candidate {version} for part {part_number} is not approved (or was rolled back): "
@@ -266,7 +204,6 @@ def _manifest_map(part_dir: pathlib.Path) -> dict:
 
 
 def _label_sample(doc: dict, part_dir: pathlib.Path) -> PartSample:
-    """A PartSample without images: enough for trainer.dataset.classify."""
     return PartSample(
         part_number=doc["part_number"], part_id=doc["part_id"], session_id=doc["session_id"],
         started_utc=doc["started_utc"], machine_verdict=doc["machine_verdict"],
@@ -290,7 +227,6 @@ def _read_tombstone(part_dir: pathlib.Path) -> dict:
 
 def _pictures(part_dir: pathlib.Path, store_dir: pathlib.Path, doc: dict,
               tombstone: Optional[dict]) -> list:
-    """Verified pictures still present. Raises _PartSkip for anything that keeps the part."""
     refs = []
     seen: set = set()
     for entry in doc["images"]:
@@ -321,7 +257,7 @@ def _pictures(part_dir: pathlib.Path, store_dir: pathlib.Path, doc: dict,
             raise _PartSkip(f"kept: picture is a symlink: {name}")
         if not path.exists():
             if tombstone is not None:
-                continue  # deleted by an earlier, interrupted purge
+                continue
             raise _PartSkip(f"kept: picture missing: {name}")
         if not path.is_file():
             raise _PartSkip(f"kept: not a regular file: {name}")
@@ -376,11 +312,6 @@ def _consider(plan: PurgePlan, part_dir: pathlib.Path, store_dir: pathlib.Path, 
 
 
 def plan_purge(store, models, *, part_number: str, report_path) -> PurgePlan:
-    """Work out what could be deleted. Reads the store and models; deletes nothing.
-
-    store: the folder that holds store/ (or store/ itself). models: the ModelStore root
-    (or a ModelStore). A refusal is returned as plan.refusal, never raised.
-    """
     plan = PurgePlan(part_number=str(part_number), report_name=pathlib.Path(report_path).name)
     try:
         if not isinstance(part_number, str) or not part_number.strip():
@@ -459,7 +390,6 @@ def _tombstone(part: PurgePart, report_name: str, now: str) -> dict:
 
 
 def execute_purge(plan: PurgePlan, *, now_utc: Optional[str] = None) -> PurgeResult:
-    """Write each part's tombstone, then delete its pictures. Refuses a refused plan."""
     if plan.refusal is not None:
         raise PurgeRefusal(plan.refusal)
     now = now_utc or _utc_now()
@@ -483,7 +413,6 @@ def execute_purge(plan: PurgePlan, *, now_utc: Optional[str] = None) -> PurgeRes
     return result
 
 
-# ----------------------------------------------------------------- CLI
 def add_arguments(sub: Any) -> None:
     p = sub.add_parser(
         "purge",

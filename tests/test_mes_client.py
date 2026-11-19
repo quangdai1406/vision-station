@@ -1,4 +1,3 @@
-"""Tests for station/mes_client.py: request building and posting to a local fake MES."""
 from __future__ import annotations
 
 import email.parser
@@ -119,7 +118,7 @@ class BuildRequestTests(unittest.TestCase):
         self.assertEqual(sorted(by_name), ["defectPhoto_crit_dent", "defectPhoto_crit_scratch"])
         self.assertEqual(by_name["defectPhoto_crit_scratch"], ("C2_TOP.png", b"C2-TOP"))
         self.assertEqual(by_name["defectPhoto_crit_dent"], ("C4_BOTTOM.png", b"C4-BOTTOM"))
-        self.assertEqual(len(files), 2)  # never the other images
+        self.assertEqual(len(files), 2)
 
     def test_unknown_class_falls_back_to_default(self):
         defects = {("C1", Side.TOP): [Defect("crack", 0.9, (0, 0, 5, 5))]}
@@ -141,8 +140,8 @@ class BuildRequestTests(unittest.TestCase):
             build_request(record, make_cfg(), archive_ref="a")
 
     def test_bad_part_without_defects_uses_default_and_highest_frame(self):
-        results = make_results(scores={("C3", Side.BOTTOM): 0.4})  # score with no defect listed
-        record = make_record(results)  # supervisor resolved REVIEW to BAD
+        results = make_results(scores={("C3", Side.BOTTOM): 0.4})
+        record = make_record(results)
         cfg = make_cfg(default_criterion_id="crit_label")
         fields, files = build_request(record, cfg, archive_ref="a")
 
@@ -150,7 +149,7 @@ class BuildRequestTests(unittest.TestCase):
         self.assertEqual(json.loads(fields["checklistResults"])["crit_label"], "fail")
         self.assertEqual(len(files), 1)
         self.assertEqual(files[0][0], "defectPhoto_crit_label")
-        self.assertEqual(files[0][1], "C3_BOTTOM.png")  # highest-score frame overall
+        self.assertEqual(files[0][1], "C3_BOTTOM.png")
         self.assertEqual(files[0][2], b"C3-BOTTOM")
 
     def test_bad_part_without_defects_and_without_default_raises(self):
@@ -159,8 +158,6 @@ class BuildRequestTests(unittest.TestCase):
             build_request(record, make_cfg(), archive_ref="a")
 
     def test_bad_by_score_with_only_a_proposal_fails_the_proposed_criterion(self):
-        # The model names no defect class (anomaly model). The proposal alone is the failed criterion;
-        # the default is not used when the proposals already name one.
         record = make_record(make_results())
         cfg = make_cfg(default_criterion_id="crit_label")
         proposal = DefectProposal("crit_dent", "C4", Side.BOTTOM, "dent near the edge")
@@ -241,7 +238,7 @@ def parse_multipart(content_type: str, body: bytes) -> dict[str, list[tuple[str 
 
 
 class _Handler(BaseHTTPRequestHandler):
-    def do_POST(self):  # noqa: N802 (http.server naming)
+    def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
         self.server.seen.append({
@@ -257,7 +254,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def log_message(self, format, *args):  # noqa: A002
+    def log_message(self, format, *args):
         pass
 
 
@@ -344,7 +341,7 @@ class MesClientPostTests(unittest.TestCase):
         probe = socket.socket()
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-        probe.close()  # nothing listens on this port now
+        probe.close()
         client = MesClient(make_cfg(base_url=f"http://127.0.0.1:{port}", timeout_s=2.0))
         record = make_record(make_results(), final=Verdict.GOOD, machine=Verdict.GOOD)
         fields, files = build_request(record, client.cfg, archive_ref="a")

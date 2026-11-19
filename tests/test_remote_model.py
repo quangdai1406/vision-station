@@ -1,4 +1,3 @@
-"""Tests for station/remote_model.py: the station's client for the laptop inference service (S2)."""
 from __future__ import annotations
 
 import json
@@ -77,7 +76,6 @@ class PredictSuccessTests(RemoteTestCase):
         self.assertEqual(headers["Authorization"], f"Bearer {FAKE_LAPTOP_TOKEN}")
 
     def test_approval_check_does_not_depend_on_health(self) -> None:
-        # The loaded-models list in /v1/health is not the approval check any more.
         self.laptop.health_status = 503
         self.laptop.health_raw = b'{"error": "down"}'
         self.assertEqual(self.model().check_approved(), "2026-11-01-a")
@@ -174,7 +172,7 @@ class FailureTests(RemoteTestCase):
     def test_model_version_changed_mid_session_raises(self) -> None:
         model = self.model()
         self.assertEqual(model.check_approved(), "2026-11-01-a")
-        self.laptop.models[PART] = "2026-11-02-b"  # a promotion on the laptop
+        self.laptop.models[PART] = "2026-11-02-b"
         with self.assertRaisesRegex(StationError, "model version"):
             model.predict(frame())
 
@@ -186,7 +184,6 @@ class FailureTests(RemoteTestCase):
 
 class TokenSafetyTests(RemoteTestCase):
     def test_token_is_never_in_an_error_text(self) -> None:
-        # The laptop echoes the token back in its error body; the station must not repeat it.
         self.laptop.predict_status = 500
         self.laptop.predict_raw = json.dumps({"error": f"bad header {FAKE_LAPTOP_TOKEN}"}).encode("utf-8")
         with self.assertRaises(StationError) as ctx:
@@ -223,7 +220,6 @@ class ConstructionTests(unittest.TestCase):
 
 class SafetyTests(unittest.TestCase):
     def test_review_range_score_from_the_laptop_is_never_green(self) -> None:
-        # t_low <= score < t_img is REVIEW: the remote model must not change that rule.
         th = Thresholds(t_low=0.5, t_img=0.8)
         result = ImageResult(camera_id="C1", side=Side.TOP, score=0.6)
         self.assertIs(classify_image(result, th), Verdict.REVIEW)

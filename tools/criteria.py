@@ -1,18 +1,3 @@
-"""MES inspection criteria for a part -> station config pieces and a sample-collection checklist.
-
-Standard library only. The MES token is read from an environment variable, sent only as
-the Authorization header to the MES, and never printed or written to a file.
-
-Proxies: by default the MES is contacted directly and environment proxy settings
-(HTTP_PROXY, http_proxy, ...) are ignored. This is the safe default for a local or LAN MES:
-the bearer token goes straight to the MES and no proxy sees it. Use --use-env-proxy only when
-the MES is reachable only through a corporate proxy. A bearer token sent over plain http
-through a proxy is visible to that proxy, so prefer an https MES URL whenever a proxy is used.
-
-Usage:
-  python -m tools.criteria --base-url URL --token-env NAME --part PART [--out-dir DIR] [--use-env-proxy]
-  python -m tools.criteria --from-json FILE --part PART [--out-dir DIR]
-"""
 
 import argparse
 import csv
@@ -49,23 +34,19 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class CriteriaError(Exception):
-    """Criteria data is missing or malformed."""
+    pass
 
 
 class CriteriaFetchError(CriteriaError):
-    """The MES could not supply the criteria. The message never contains the token."""
+    pass
 
 
 class CriteriaFileError(CriteriaError):
-    """The offline criteria JSON file is missing, unreadable or malformed."""
+    pass
 
 
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
 
 def _validate(data, source):
-    """Check a criteria list and return normalised copies of its entries."""
     if not isinstance(data, list):
         raise CriteriaError(f"{source}: expected a JSON list of criteria, got {type(data).__name__}")
     out = []
@@ -119,12 +100,8 @@ def _safe_id(key):
     return re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_") or "x"
 
 
-# ---------------------------------------------------------------------------
-# Fetch and load
-# ---------------------------------------------------------------------------
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Do not follow redirects: the token must not be sent to another host."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -153,12 +130,6 @@ def _http_message(code, part):
 
 
 def fetch_criteria(base_url, token, part_number, timeout_s=10.0, use_env_proxy=False):
-    """GET {base_url}/api/machine/criteria/<part> with a bearer token and return the normalised list.
-
-    use_env_proxy=False (default): environment proxies are bypassed; the token goes straight to the MES.
-    use_env_proxy=True: the normal environment/system proxy settings are used. Only needed when the
-    MES is reachable only through a corporate proxy; a token sent over plain http is visible to it.
-    """
     if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
         raise CriteriaFetchError("MES base URL must start with http:// or https://")
     if not token:
@@ -174,10 +145,8 @@ def fetch_criteria(base_url, token, part_number, timeout_s=10.0, use_env_proxy=F
         method="GET",
     )
     if use_env_proxy:
-        # Without an explicit ProxyHandler, build_opener adds one that reads the environment.
         opener = urllib.request.build_opener(_NoRedirect)
     else:
-        # No environment proxy: the bearer token must only go straight to the MES.
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
     try:
         with opener.open(req, timeout=timeout_s) as resp:
@@ -203,7 +172,6 @@ def fetch_criteria(base_url, token, part_number, timeout_s=10.0, use_env_proxy=F
 
 
 def load_criteria_json(path):
-    """Load a criteria list saved from the MES (same format as the API) for offline use."""
     p = Path(path)
     try:
         text = p.read_text(encoding="utf-8")
@@ -221,12 +189,8 @@ def load_criteria_json(path):
         raise CriteriaFileError(str(exc)) from None
 
 
-# ---------------------------------------------------------------------------
-# Naming and splitting
-# ---------------------------------------------------------------------------
 
 def slugify(name):
-    """Lowercase ASCII snake_case from a criteria name. Raises ValueError if nothing is left."""
     if not isinstance(name, str):
         raise ValueError("criteria name must be a string")
     folded = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
@@ -237,11 +201,6 @@ def slugify(name):
 
 
 def derive_class_names(criteria):
-    """Map every criterion id to a defect-class name.
-
-    Names that collide (within the given list) get an '_<id>' suffix on every member of the
-    collision, so the mapping does not depend on list order.
-    """
     criteria = _validate(criteria, "criteria")
     base = {}
     for c in criteria:
@@ -266,7 +225,6 @@ def derive_class_names(criteria):
 
 
 def split_by_type(criteria):
-    """Return (active visual, active measurement). Inactive criteria are in neither list."""
     criteria = _validate(criteria, "criteria")
     visual = [c for c in criteria if c["active"] and c["check_type"] == "visual"]
     measurement = [c for c in criteria if c["active"] and c["check_type"] == "measurement"]
@@ -274,7 +232,6 @@ def split_by_type(criteria):
 
 
 def summarize(criteria):
-    """Counts, class names and warnings for the station owner and Quality."""
     criteria = _validate(criteria, "criteria")
     visual, measurement = split_by_type(criteria)
     names = derive_class_names(criteria)
@@ -297,22 +254,15 @@ def summarize(criteria):
     }
 
 
-# ---------------------------------------------------------------------------
-# Outputs
-# ---------------------------------------------------------------------------
 
 def build_config_pieces(criteria):
-    """Config values for config.json's mes section. Keys are derived from MES unless noted."""
     criteria = _validate(criteria, "criteria")
     names = derive_class_names(criteria)
     visual, _ = split_by_type(criteria)
     summary = summarize(criteria)
     return {
-        # Derived from MES: the MES needs a result for every active criterion.
         "criteria_ids": [_key(c) for c in criteria if c["active"]],
-        # Derived from MES: active visual criteria only.
         "class_to_criterion": {names[_key(c)]: _key(c) for c in visual},
-        # Decision for Quality, not derived from MES.
         "default_criterion_id": None,
         "_notes": {
             "derived_from_mes": ["criteria_ids", "class_to_criterion"],
@@ -324,7 +274,6 @@ def build_config_pieces(criteria):
 
 
 def build_checklist_rows(criteria):
-    """Sample-collection rows for every active criterion. Sample counts are never filled in."""
     criteria = _validate(criteria, "criteria")
     names = derive_class_names(criteria)
     rows = []
@@ -348,7 +297,6 @@ def build_checklist_rows(criteria):
 
 
 def safe_part_name(part):
-    """A part number safe for file names on Windows and Linux."""
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(part).strip())
     s = s.strip("._ ")[:100].rstrip("._ ")
     if not s:
@@ -359,7 +307,6 @@ def safe_part_name(part):
 
 
 def write_outputs(criteria, part, out_dir):
-    """Write criteria_<part>.json, class_map.json and collection_checklist.csv into out_dir."""
     criteria = _validate(criteria, "criteria")
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -379,9 +326,6 @@ def write_outputs(criteria, part, out_dir):
     return paths
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def _format_summary(part, source, summary, paths):
     lines = [

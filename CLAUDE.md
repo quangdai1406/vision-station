@@ -30,3 +30,4 @@ Do not use JSON for design, debugging, or writing code. Use normal reasoning the
 ## Rules
 - No success claim without verification output. Never skip or delete tests to get green.
 - Read only what the task needs. Be terse. Load a skill only when its trigger applies.
+- Never write comments or docstrings in code (any language). Run `python tools/nocomments.py check` before every commit. Enable the hook once per clone: `git config core.hooksPath .githooks`.

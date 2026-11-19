@@ -1,11 +1,3 @@
-"""Durable outbox for inspection events waiting to be posted to the MES.
-
-Layout under root:
-  root/outbox.db                      SQLite table of items (one row per session)
-  root/outbox/<session_id>/<n>.bin    raw bytes of each photo file
-
-Standard library only.
-"""
 from __future__ import annotations
 
 import json
@@ -49,7 +41,6 @@ class Outbox:
         self._db.row_factory = sqlite3.Row
         with self._db:
             self._db.execute(_SCHEMA)
-            # Additive migration: outboxes made before the MES session column existed.
             cols = {row["name"] for row in self._db.execute("PRAGMA table_info(items)")}
             if "station_session" not in cols:
                 self._db.execute("ALTER TABLE items ADD COLUMN station_session TEXT")
@@ -64,8 +55,6 @@ class Outbox:
         files: Sequence[tuple[str, str, bytes]],
         station_session: Optional[str] = None,
     ) -> bool:
-        """Store one post. Returns False (and changes nothing) if session_id is already queued.
-        station_session is the inspector's MES session, sent as the Station-Session header."""
         if not _SESSION_ID_RE.match(session_id):
             raise ValueError(f"unsafe session_id: {session_id!r}")
         if self._db.execute(
@@ -106,7 +95,6 @@ class Outbox:
         max_delay_s: float = 600.0,
         max_items: int = 50,
     ) -> dict[str, int]:
-        """Post due items oldest first. Stops at the first retryable failure."""
         now = time.time() if now is None else float(now)
         counts = {"sent": 0, "failed_permanent": 0, "retry_later": 0}
         rows = self._db.execute(
@@ -125,11 +113,10 @@ class Outbox:
                 continue
 
             try:
-                # Only mes_ticket parts carry a session; other posts keep the plain call.
                 extra = {"station_session": row["station_session"]} if row["station_session"] else {}
                 result: PostResult = client.post(fields, files, idempotency_key=row["session_id"],
                                                  **extra)
-            except Exception as e:  # never lose the queue to a client bug; retry later
+            except Exception as e:
                 result = PostResult(
                     status=0, ok=False, replay=False, event_id=None,
                     error=f"unexpected client error: {type(e).__name__}", retryable=True,
@@ -143,7 +130,7 @@ class Outbox:
                 counts["failed_permanent"] += 1
             else:
                 attempts = row["attempts"] + 1
-                exponent = min(attempts, 60)  # keep the power bounded
+                exponent = min(attempts, 60)
                 delay = min(base_delay_s * (2 ** exponent), max_delay_s)
                 with self._db:
                     self._db.execute(
@@ -152,7 +139,7 @@ class Outbox:
                         (attempts, result.error, now + delay, row["seq"]),
                     )
                 counts["retry_later"] += 1
-                break  # keep order: MES is probably down, do not post later items
+                break
 
         return counts
 
@@ -194,7 +181,6 @@ class Outbox:
                 "mes_event_id", "created_at", "sent_at")
         return [{k: r[k] for k in keys} for r in rows]
 
-    # internals
 
     def _load_files(self, files_json: str) -> list[tuple[str, str, bytes]]:
         out = []

@@ -1,16 +1,3 @@
-"""Compare-with-a-good-part model for the one-camera proof of concept.
-
-DEMO HEURISTIC, NOT A VALIDATED QUALITY MODEL. GoldenBuilder learns a per-pixel
-mean and standard deviation from good parts photographed on a fixed rig;
-GoldenModel scores a new image by how far its pixels stray from that golden
-image. The constants (std_floor, z_ref, max_width_px, the z_ref/2 region
-cut-off and the 4-pixel minimum region) are engineering settings that make the
-demo behave. They are NOT quality thresholds or acceptance limits. The real
-t_low and t_img are chosen later from labelled scores and approved by Quality.
-
-numpy is imported lazily inside functions, and cv2 only by cv2_decoder(), so
-this module imports cleanly without either. Standard library otherwise.
-"""
 from __future__ import annotations
 
 import io
@@ -23,12 +10,12 @@ from typing import Any, Callable, Mapping, Optional
 from station.contracts import Defect, Frame, ImageResult, Side, StationError
 
 SCHEMA = "golden-v1"
-DEFAULT_STD_FLOOR = 2.0  # gray levels; stops a perfectly still training set giving infinite scores
-DEFAULT_Z_REF = 8.0  # z value that maps to score 1.0
-DEFAULT_MAX_WIDTH_PX = 160  # working image is at most this wide (integer block averaging)
+DEFAULT_STD_FLOOR = 2.0
+DEFAULT_Z_REF = 8.0
+DEFAULT_MAX_WIDTH_PX = 160
 DEFECT_CLASS = "difference_from_golden"
-_MIN_REGION_PX = 4  # downscaled pixels
-_NPZ_DATE = (1980, 1, 1, 0, 0, 0)  # fixed zip timestamp so saves are byte-deterministic
+_MIN_REGION_PX = 4
+_NPZ_DATE = (1980, 1, 1, 0, 0, 0)
 
 Decode = Callable[[Frame], Any]
 Key = tuple[str, str]
@@ -36,7 +23,7 @@ Key = tuple[str, str]
 
 def _np() -> Any:
     try:
-        import numpy  # noqa: PLC0415 - imported lazily on purpose
+        import numpy
     except ImportError as exc:
         raise StationError("numpy is required for the golden-image model; install numpy") from exc
     return numpy
@@ -44,7 +31,7 @@ def _np() -> Any:
 
 def _import_cv2() -> Any:
     try:
-        import cv2  # noqa: PLC0415 - imported lazily on purpose
+        import cv2
     except ImportError as exc:
         raise StationError(
             "OpenCV (cv2) is not installed; install opencv-python or inject cv2_module"
@@ -69,7 +56,7 @@ def _check_settings(max_width_px: int, std_floor: float, z_ref: float) -> None:
 
 
 def _block_factor(width: int, max_width_px: int) -> int:
-    return max(1, -(-width // max_width_px))  # ceiling division
+    return max(1, -(-width // max_width_px))
 
 
 def _block_mean(arr: Any, block: int) -> Any:
@@ -97,7 +84,6 @@ def _clip01(value: float) -> float:
 
 
 def _largest_region(mask: Any) -> list[tuple[int, int]]:
-    """Pixels (y, x) of the largest 4-connected True region, by pixel count."""
     np = _np()
     h, w = mask.shape
     seen = np.zeros((h, w), dtype=bool)
@@ -123,11 +109,11 @@ def _largest_region(mask: Any) -> list[tuple[int, int]]:
 
 @dataclass(frozen=True)
 class LearnedKey:
-    mean: Any  # downscaled per-pixel mean, float64 2D
-    std: Any  # downscaled per-pixel sample standard deviation, float64 2D
+    mean: Any
+    std: Any
     block_factor: int
     frames: int
-    source_shape: tuple[int, int]  # decoded (full-size) image shape
+    source_shape: tuple[int, int]
 
 
 class _Running:
@@ -140,12 +126,6 @@ class _Running:
 
 
 class GoldenBuilder:
-    """Accumulates good frames per (camera_id, side) and builds a GoldenModel.
-
-    Uses Welford's running mean and sum of squared deviations, so no frames are
-    kept. Each frame is decoded, block-averaged to the key's working size and
-    then folded in. All frames for one key must decode to the same shape.
-    """
 
     def __init__(
         self,
@@ -170,7 +150,7 @@ class GoldenBuilder:
         if run is not None and arr.shape != run.source_shape:
             raise ValueError(f"{where}: frame shape {arr.shape} differs from {run.source_shape}")
         block = run.block if run is not None else _block_factor(arr.shape[1], self._max_width_px)
-        small = _block_mean(arr, block)  # may raise before the key is registered
+        small = _block_mean(arr, block)
         if run is None:
             run = _Running(block, (int(arr.shape[0]), int(arr.shape[1])))
             self._running[key] = run
@@ -214,18 +194,6 @@ class GoldenBuilder:
 
 
 class GoldenModel:
-    """InferenceModel: score = clip(p99(z) / z_ref, 0, 1), z = |img - mean| / max(std, std_floor).
-
-    Defect: the bounding box, in original pixels, of the largest region of
-    pixels with z >= z_ref / 2 (at least 4 downscaled pixels). Its score is the
-    region's peak z over z_ref, clipped to 0..1. No defect when the image
-    score is 0 or no region is large enough.
-
-    Note: the image score is p99-based, so it can differ from the defect peak, and an
-    image can reach a high score with no box (no region of at least 4 downscaled
-    pixels). Defects smaller than about 1 % of the working pixels barely move p99.
-    All constants are demo heuristics, not quality thresholds.
-    """
 
     def __init__(
         self,
@@ -354,7 +322,7 @@ class GoldenModel:
                     expected = (shape[0] // block, shape[1] // block)
                     if mean.shape != expected or std.shape != expected:
                         raise StationError(f"golden arrays for {_key_text(key)} have the wrong shape")
-                    keys[key] = LearnedKey(mean, std, block, frames, shape)  # type: ignore[arg-type]
+                    keys[key] = LearnedKey(mean, std, block, frames, shape)
                 return cls(
                     str(meta["version"]),
                     keys,
@@ -383,7 +351,6 @@ def _read_meta(data: Any) -> dict[str, Any]:
 
 
 def _write_npz(np: Any, path: Any, arrays: Mapping[str, Any]) -> None:
-    """Write an .npz with a fixed zip timestamp, so identical models give identical bytes."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as archive:
         for name in sorted(arrays):
@@ -400,7 +367,6 @@ def _write_npz(np: Any, path: Any, arrays: Mapping[str, Any]) -> None:
 
 
 def cv2_decoder(cv2_module: Optional[Any] = None) -> Decode:
-    """Decode function for real frames: cv2.imdecode, then grayscale, as float64 2D."""
     cv2 = cv2_module if cv2_module is not None else _import_cv2()
 
     def decode(frame: Frame) -> Any:

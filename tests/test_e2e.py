@@ -1,10 +1,3 @@
-"""End-to-end: real session, store, outbox and MES client, driven through the UI HTTP API.
-
-The MES is a fake http.server on 127.0.0.1 that records every request and can
-answer 201, 500 or 422. Cameras are FakeCameraSet frames whose bytes carry score
-markers, read by the real MarkerModel. Nothing here touches the network beyond
-127.0.0.1.
-"""
 from __future__ import annotations
 
 import contextlib
@@ -36,10 +29,9 @@ SUPERVISOR = ("supervisor1", "supervisor-pass-1")
 GOOD_MARKER = b"SCORE:0.05"
 
 
-# ------------------------------------------------------------------ fake MES
 
 class _MesHandler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format, *args):  # noqa: A002 - no request logging in tests
+    def log_message(self, format, *args):
         pass
 
     def do_POST(self) -> None:
@@ -58,7 +50,7 @@ class _MesHandler(http.server.BaseHTTPRequestHandler):
             }
             srv.requests.append(record)
             if srv.mode == 201 and key in srv.accepted:
-                status, payload = 200, {"id": srv.accepted[key]}  # replay of a stored key
+                status, payload = 200, {"id": srv.accepted[key]}
             elif srv.mode == 201:
                 srv.next_id += 1
                 srv.accepted[key] = srv.next_id
@@ -84,7 +76,7 @@ class FakeMes(http.server.ThreadingHTTPServer):
         self.lock = threading.Lock()
         self.mode = 201
         self.requests: list[dict] = []
-        self.accepted: dict[str, int] = {}  # Idempotency-Key -> event id
+        self.accepted: dict[str, int] = {}
         self.next_id = 0
 
     @property
@@ -93,7 +85,6 @@ class FakeMes(http.server.ThreadingHTTPServer):
 
 
 def parse_multipart(content_type: str, body: bytes) -> tuple[dict, dict]:
-    """Return (text fields, files) where files maps field name -> (filename, bytes)."""
     raw = b"Content-Type: " + content_type.encode("ascii") + b"\r\nMIME-Version: 1.0\r\n\r\n" + body
     msg = email.parser.BytesParser(policy=email.policy.default).parsebytes(raw)
     fields: dict[str, str] = {}
@@ -108,7 +99,6 @@ def parse_multipart(content_type: str, body: bytes) -> tuple[dict, dict]:
     return fields, files
 
 
-# ------------------------------------------------------------------ UI client
 
 class Ui:
     def __init__(self, app) -> None:
@@ -148,22 +138,19 @@ class FakeClock:
         return self.now
 
 
-FLIP_GAP_S = 2.5  # past the default min_flip_s (2.0 s) that a BOTTOM press waits after TOP
+FLIP_GAP_S = 2.5
 
 
 def press_part(ui: Ui, token: str, clock: FakeClock) -> None:
-    """One part: a TOP press, the flip gap, then a BOTTOM press. Both must be accepted."""
-    for gap in (1.0, FLIP_GAP_S):  # 1.0 s is past the 0.3 s debounce
+    for gap in (1.0, FLIP_GAP_S):
         clock.now += gap
         status, body, _ = ui.req("POST", "/api/press", token=token)
         if (status, body) != (200, {"accepted": True}):
             raise AssertionError(f"press not accepted: {status} {body}")
 
 
-# ------------------------------------------------------------------ harness
 
 class _StationHarness(unittest.TestCase):
-    """Shared setup and helpers for the station tests. Holds no test methods."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="station-e2e-")
@@ -186,7 +173,7 @@ class _StationHarness(unittest.TestCase):
         self.markers: dict[tuple[str, str], bytes] = {}
         self.clock = FakeClock()
         self.outputs = RecordingOutputs()
-        self.top_capture_delay_s = 0.0  # a test may set this: the next TOP capture takes that long
+        self.top_capture_delay_s = 0.0
         self.t0 = time.time()
         self.app = self.start_app()
         self.ui = Ui(self.app)
@@ -212,7 +199,7 @@ class _StationHarness(unittest.TestCase):
                 "criteria_ids": ["CR-1", "CR-2"],
                 "class_to_criterion": {"scratch": "CR-1"},
                 "default_criterion_id": None,
-                "sync_interval_s": 3600,  # the tests call sync_once() themselves
+                "sync_interval_s": 3600,
                 "default_bad_disposition": "quarantine",
             },
             "cameras": {"kind": "fake"},
@@ -223,7 +210,6 @@ class _StationHarness(unittest.TestCase):
 
     def _frame_bytes(self, camera_id: str, side: Side, n: int) -> bytes:
         if side is Side.TOP and camera_id == "C1" and self.top_capture_delay_s:
-            # A slow TOP capture: the fake clock moves while the frames are taken (once per capture).
             self.clock.now += self.top_capture_delay_s
             self.top_capture_delay_s = 0.0
         marker = self.markers.get((camera_id, side.value), GOOD_MARKER)
@@ -241,18 +227,15 @@ class _StationHarness(unittest.TestCase):
         self.addCleanup(app.stop)
         return app
 
-    # helpers
     def press(self, token=None, ui=None) -> None:
-        self.clock.now += 1.0  # past the 0.3 s debounce
+        self.clock.now += 1.0
         status, body, _ = (ui or self.ui).req("POST", "/api/press", token=token or self.op)
         self.assertEqual((status, body), (200, {"accepted": True}))
 
     def press_part(self, token=None, ui=None) -> None:
-        """TOP press, flip gap, BOTTOM press (module press_part)."""
         press_part(ui or self.ui, token or self.op, self.clock)
 
     def try_press(self, advance_s: float) -> bool:
-        """Advance the fake clock, POST /api/press as the operator and return its accepted flag."""
         self.clock.now += advance_s
         status, body, _ = self.ui.req("POST", "/api/press", token=self.op)
         self.assertEqual(status, 200, body)
@@ -292,9 +275,7 @@ class _StationHarness(unittest.TestCase):
         return sorted(p.name for p in part_dir.iterdir() if p.suffix == ".png")
 
 class StationE2E(_StationHarness):
-    """The full 4-camera station through the UI: good, bad, review, MES outage, 422, restart."""
 
-    # 1. GOOD
     def test_good_part_is_saved_and_posted_once(self) -> None:
         self.press_part()
 
@@ -319,10 +300,9 @@ class StationE2E(_StationHarness):
         self.assertEqual(post["fields"]["visionSessionId"], session_id)
         self.assertEqual(post["fields"]["archiveRef"], str(part_dir))
         self.assertEqual(json.loads(post["fields"]["checklistResults"]), {"CR-1": "pass", "CR-2": "pass"})
-        self.assertEqual(post["files"], {})  # no defect photo for a GOOD part
+        self.assertEqual(post["files"], {})
         self.assert_no_token_on_disk()
 
-    # 2. BAD
     def test_bad_part_waits_for_ack_then_posts_with_one_defect_photo(self) -> None:
         self.markers[("C2", "TOP")] = b"SCORE:0.92;CLASS:scratch;BOX:10,20,30,40"
         self.press_part()
@@ -330,7 +310,7 @@ class StationE2E(_StationHarness):
         st = self.state()
         self.assertEqual(st["state"], "VERDICT")
         self.assertEqual(st["verdict"], "BAD")
-        self.assertEqual(st["counters"]["total"], 0)  # not counted until acknowledged
+        self.assertEqual(st["counters"]["total"], 0)
         self.assertTrue(self.outputs.red)
         self.assertTrue(self.outputs.alarm)
         self.assertFalse(self.outputs.green)
@@ -362,9 +342,8 @@ class StationE2E(_StationHarness):
         self.assertEqual(filename, "C2_TOP.png")
         self.assertEqual(data, b"SCORE:0.92;CLASS:scratch;BOX:10,20,30,40 |C2|TOP|0")
 
-    # 3. REVIEW
     def test_review_part_is_never_green_until_a_supervisor_resolves_it(self) -> None:
-        self.markers[("C3", "BOTTOM")] = b"SCORE:0.6"  # between t_low 0.5 and t_img 0.8
+        self.markers[("C3", "BOTTOM")] = b"SCORE:0.6"
         self.press_part()
 
         st = self.state()
@@ -395,7 +374,7 @@ class StationE2E(_StationHarness):
         self.assertEqual(self.app.store.verify_part(part_dir), [])
 
         self.app.sync_once()
-        self.assertEqual(len(self.mes.requests), 1)  # posted once, after resolution
+        self.assertEqual(len(self.mes.requests), 1)
         post = self.posted()[0]
         f = post["fields"]
         self.assertEqual(f["verdict"], "GOOD")
@@ -405,7 +384,6 @@ class StationE2E(_StationHarness):
         self.assertEqual(f["disposition"], "released")
         self.assertEqual(post["files"], {})
 
-    # 4. MES down, then back
     def test_mes_down_keeps_the_item_then_sends_it_exactly_once(self) -> None:
         self.mes.mode = 500
         self.press_part()
@@ -416,7 +394,6 @@ class StationE2E(_StationHarness):
         self.assertEqual(self.app.outbox.pending_count(), 1)
         self.assertEqual([r["status"] for r in self.mes.requests], [500])
 
-        # The station keeps working while MES is down.
         st = self.state()
         self.assertEqual(st["counters"], {"total": 1, "good": 1, "bad": 0})
         self.assertTrue(self.outputs.green)
@@ -429,13 +406,11 @@ class StationE2E(_StationHarness):
         self.assertEqual({r["key"] for r in self.mes.requests}, {session_id})
         self.assertEqual([r["status"] for r in self.mes.requests], [500, 201])
 
-        # Nothing is left to send: a repeat sends nothing.
         self.assertEqual(self.app.sync_once(now=self.t0 + 7200),
                          {"sent": 0, "failed_permanent": 0, "retry_later": 0})
         self.assertEqual(len(self.mes.requests), 2)
         self.assertEqual(self.app.outbox.list_items()[0]["status"], "sent")
 
-    # 5. 422 is permanent
     def test_422_marks_the_item_failed_and_it_is_not_retried(self) -> None:
         self.mes.mode = 422
         self.press_part()
@@ -454,7 +429,6 @@ class StationE2E(_StationHarness):
         self.assertEqual(len(self.mes.requests), 1)
         self.assertEqual(len(self.mes.accepted), 0)
 
-    # 6. restart keeps counters and the unsent item
     def test_restart_keeps_counters_and_the_unsent_outbox_item(self) -> None:
         self.mes.mode = 500
         self.press_part()
@@ -474,7 +448,6 @@ class StationE2E(_StationHarness):
         self.assertEqual(len(self.mes.accepted), 1)
         self.assertEqual({r["key"] for r in self.mes.requests}, {session_id})
 
-        # The next part after the restart is counted and gets a new id.
         self.press_part(token=op2, ui=ui2)
         self.assertEqual(ui2.req("GET", "/api/state", token=op2)[1]["counters"]["total"], 2)
         rows = app2.store.recent_parts(2)
@@ -484,16 +457,14 @@ class StationE2E(_StationHarness):
 
 
 class DoubleCaptureE2E(_StationHarness):
-    """Regression: one Enter never takes both sides; the prompt says what to do next."""
 
     def test_one_enter_never_takes_both_sides_when_the_top_capture_is_slow(self) -> None:
-        self.top_capture_delay_s = 5.0  # the TOP capture takes 5 s of fake time
+        self.top_capture_delay_s = 5.0
         self.clock.now += 1.0
         status, body, _ = self.ui.req("POST", "/api/press", token=self.op)
         self.assertEqual((status, body), (200, {"accepted": True}))
         self.assertEqual(self.state()["state"], "WAIT_FLIP")
 
-        # A second press right after the slow TOP capture is refused: no BOTTOM, no part.
         self.assertFalse(self.try_press(0.1))
         st = self.state()
         self.assertEqual(st["state"], "WAIT_FLIP")
@@ -504,7 +475,6 @@ class DoubleCaptureE2E(_StationHarness):
         self.assertEqual(self.app.store.recent_parts(5), [])
         self.assertFalse(self.outputs.green)
 
-        # Once the flip gap has passed, the BOTTOM press is accepted and the part completes.
         self.assertTrue(self.try_press(FLIP_GAP_S))
         st = self.state()
         self.assertEqual(st["state"], "IDLE")
@@ -513,9 +483,9 @@ class DoubleCaptureE2E(_StationHarness):
         self.assertEqual(len(self.app.store.recent_parts(5)), 1)
 
     def test_double_tap_on_a_fast_capture_is_ignored_and_logged(self) -> None:
-        self.press()  # TOP, fast capture
-        self.assertFalse(self.try_press(0.1))  # double tap: inside the debounce
-        self.assertFalse(self.try_press(0.5))  # 0.6 s after TOP: still inside the flip gap
+        self.press()
+        self.assertFalse(self.try_press(0.1))
+        self.assertFalse(self.try_press(0.5))
         self.assertEqual([e["reason"] for e in self.events("press_ignored")],
                          ["debounce", "flip_too_soon"])
         self.assertEqual(self.state()["counters"], {"total": 0, "good": 0, "bad": 0})

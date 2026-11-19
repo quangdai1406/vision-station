@@ -25,7 +25,7 @@ from trainer.weekly import QUALITY, run_weekly
 try:
     import numpy as np
     from station.anomaly import PatchCoreBuilder, PatchCoreModel, _write_npz
-except ImportError:  # numpy missing: the numpy-dependent tests are skipped
+except ImportError:
     np = None
 
 NOW_1 = "2026-10-04T00:00:00Z"
@@ -34,7 +34,6 @@ PAIRS = [(cam, side) for side in (Side.TOP, Side.BOTTOM) for cam in CAMERA_IDS]
 
 
 def save_part(store, session, pn, started, final=Verdict.GOOD, *, poison=False):
-    """One saved part with 8 images. The image bytes come from the session id, so each part differs."""
     tag = "POISON" if poison else "OK"
     frames, results = [], []
     for seq, (cam, side) in enumerate(PAIRS):
@@ -67,7 +66,6 @@ class FakeExtractor:
 
 
 def as_v1(src, dst):
-    """Rewrite a saved v2 model file as the old patchcore-v1 format (same arrays, older schema tag)."""
     with np.load(str(src), allow_pickle=False) as data:
         arrays = {name: data[name] for name in data.files}
     meta = json.loads(str(arrays["meta"]))
@@ -135,7 +133,6 @@ class TestWeeklyRuns(WeeklyBase):
         self.assertEqual(part["evaluation"]["held_out_good"]["images_scored"], IMAGES_PER_PART)
         self.assertEqual(part["evaluation"]["t_img"], QUALITY)
         self.assertEqual(part["evaluation"]["held_out_good_parts_flagged"], QUALITY)
-        # keys that trainer.purge reads
         self.assertEqual(part["candidate_version"], versions[0]["version"])
         self.assertIs(part["training_succeeded"], True)
         self.assertEqual(len(part["holdout_session_ids"]), 1)
@@ -150,12 +147,12 @@ class TestWeeklyRuns(WeeklyBase):
         self.assertEqual(code, 0)
         report = next(self.reports.glob("weekly-*.json"))
         refused = plan_purge(self.store_root, self.models, part_number="PN-1", report_path=report)
-        self.assertIn("not approved", refused.refusal)  # a candidate nobody promoted is never purged
+        self.assertIn("not approved", refused.refusal)
         ms = ModelStore(self.models)
         ms.approve("PN-1", ms.list_versions("PN-1")[0]["version"], "Admin Test", "test", NOW_1)
         plan = plan_purge(self.store_root, self.models, part_number="PN-1", report_path=report)
         self.assertIsNone(plan.refusal)
-        self.assertEqual(len(plan.parts), 3)  # the 3 trained good parts; the held-out one is kept
+        self.assertEqual(len(plan.parts), 3)
 
     def test_incremental_update_uses_only_new_pictures(self):
         for day in (1, 2, 3):
@@ -177,8 +174,8 @@ class TestWeeklyRuns(WeeklyBase):
         model = PatchCoreModel.load(
             ms.root / safe_part("PN-1") / second["version"] / "patchcore.npz", fake_decode, FakeExtractor())
         bank = model.describe()["banks"]["C1/TOP"]
-        self.assertEqual(bank["train_images"], 2)   # only the two new pictures
-        self.assertEqual(bank["images_seen"], 3 + 2)  # parent's 3 plus the 2 new
+        self.assertEqual(bank["train_images"], 2)
+        self.assertEqual(bank["images_seen"], 3 + 2)
 
     def test_v1_parent_trains_fresh_and_says_so(self):
         for day in (1, 2, 3):
@@ -201,7 +198,7 @@ class TestWeeklyRuns(WeeklyBase):
         new = next(m for m in ms.list_versions("PN-1") if m["version"] not in (first["version"], "legacy-v1"))
         model = PatchCoreModel.load(
             ms.root / safe_part("PN-1") / new["version"] / "patchcore.npz", fake_decode, FakeExtractor())
-        self.assertEqual(model.describe()["banks"]["C1/TOP"]["train_images"], 4)  # all good parts, not just new
+        self.assertEqual(model.describe()["banks"]["C1/TOP"]["train_images"], 4)
 
     def test_report_files_written_atomically(self):
         for day in (1, 2):
@@ -267,7 +264,7 @@ class TestWeeklyRuns(WeeklyBase):
         ms = ModelStore(self.models)
         model = PatchCoreModel.load(
             ms.root / safe_part("PN-1") / part["version"] / "patchcore.npz", fake_decode, FakeExtractor())
-        self.assertEqual(model.describe()["banks"]["C1/TOP"]["train_images"], 3)  # the scan is not used
+        self.assertEqual(model.describe()["banks"]["C1/TOP"]["train_images"], 3)
 
 
 class TestWeeklyArguments(unittest.TestCase):

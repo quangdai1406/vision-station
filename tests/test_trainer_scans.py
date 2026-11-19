@@ -1,8 +1,3 @@
-"""Tests for trainer/scans.py (Taking-data scans read for the weekly trainer) and the --scans-too path.
-
-Fake scans are written with station.scanstore.ScanStore in temporary folders. The weekly runs use
-the same fake extractor and decoder as tests/test_trainer_weekly.py, so no torch is needed.
-"""
 import contextlib
 import io
 import json
@@ -31,7 +26,7 @@ from tests.test_trainer_weekly import FakeExtractor, fake_decode, save_part
 try:
     import numpy as np
     from station.anomaly import PatchCoreModel
-except ImportError:  # numpy missing: the weekly runs are skipped
+except ImportError:
     np = None
 
 CAMS = ["C1", "C2", "C3", "C4"]
@@ -62,7 +57,6 @@ def label_for(verdict, status, defects=()):
 
 def make_scan(store, scan_id, toy, *, verdict="GOOD", status="official", defects=("doh_small",),
               steps=None, part="PN-S", started=STARTED, visible=None):
-    """Write one finished scan. BAD pictures alternate defect_visible unless `visible` is given."""
     steps = steps or {"TOP": 2, "BOTTOM": 2}
     writer = store.begin_scan(scan_id, part, toy, label_for(verdict, status, defects),
                               "op-1", list(CAMS), started)
@@ -78,7 +72,6 @@ def make_scan(store, scan_id, toy, *, verdict="GOOD", status="official", defects
 
 
 def fake_scan(scan_id, toy, *, part="PN-S", steps=None, verdict="GOOD"):
-    """A ScanSample built in memory, for the split tests (no files)."""
     steps = steps or {"TOP": 1}
     images = tuple(
         ScanImageRef(path=pathlib.Path(f"/nowhere/{scan_id}-{cam}-{side}-{step}.png"), camera_id=cam,
@@ -112,7 +105,7 @@ class TestReadScans(ScanFolderCase):
         self.assertEqual(scans.problems, [])
         sample = scans.good[0]
         self.assertEqual(sample.toy_id, "toy-1")
-        self.assertEqual(len(sample.images), 2 * 4 * 2)  # 2 steps, 4 cameras, 2 sides
+        self.assertEqual(len(sample.images), 2 * 4 * 2)
         self.assertTrue(all(isinstance(img, ImageRef) for img in sample.images))
         self.assertTrue(all(img.score is None for img in sample.images))
         self.assertEqual(image_counts(scans.good), {"C1/BOTTOM": 2, "C1/TOP": 2, "C2/BOTTOM": 2,
@@ -142,12 +135,12 @@ class TestReadScans(ScanFolderCase):
         self.assertIn("BAD label, status proposed: not used (only official labels are evaluated)",
                       scans.excluded_reasons())
         counts = bad_defect_counts(scans.bad)
-        pictures = 2 * 4 * 2  # per scan
+        pictures = 2 * 4 * 2
         self.assertEqual(counts["doh_small"]["scans"], 2)
-        self.assertEqual(counts["doh_edge"]["scans"], 1)  # the proposed scan is not counted
+        self.assertEqual(counts["doh_edge"]["scans"], 1)
         self.assertEqual(counts["doh_small"]["visible_true"] + counts["doh_small"]["visible_false"],
                          2 * pictures)
-        self.assertEqual(counts["doh_edge"]["visible_false"], pictures)  # SC-B2 was all not visible
+        self.assertEqual(counts["doh_edge"]["visible_false"], pictures)
         self.assertEqual(counts["doh_edge"]["visible_true"], 0)
         self.assertTrue(all(img.defect_visible in (True, False) for s in scans.bad for img in s.images))
 
@@ -182,7 +175,7 @@ class TestReadScans(ScanFolderCase):
     def test_scans_root_accepts_the_store_folder_too(self):
         make_scan(self.store, "SC-1", "toy-1")
         self.assertEqual(scans_root_for(self.root), self.root)
-        self.assertEqual(scans_root_for(self.root / "store"), self.root)  # store/ without a scans folder
+        self.assertEqual(scans_root_for(self.root / "store"), self.root)
         self.assertTrue(has_scans(self.root))
         self.assertFalse(has_scans(self.root / "nothing-here"))
 
@@ -201,7 +194,7 @@ class TestSplitByToy(unittest.TestCase):
                 self.assertFalse(train_toys & hold_toys, (seed, fraction))
                 self.assertEqual(len(train) + len(hold), len(scans))
                 self.assertEqual(set(held), hold_toys)
-                self.assertTrue(train, (seed, fraction))  # at least one toy always trains
+                self.assertTrue(train, (seed, fraction))
                 if fraction == 0:
                     self.assertEqual(hold, [])
 
@@ -244,7 +237,6 @@ class TestInventory(ScanFolderCase):
         self.assertEqual(inv["by_status"], {"official": 3, "proposed": 1, "rejected": 1})
         self.assertEqual(inv["excluded"]["total"], 2)
         self.assertEqual(inv["training_images_by_camera_side"]["C1/TOP"], 4)
-        # One official BAD scan: 2 steps x 4 cameras x 2 sides = 16 pictures, half marked visible.
         self.assertEqual(inv["bad_defects_official"], {"doh_small": {"scans": 1, "visible_true": 8,
                                                                     "visible_false": 8}})
         self.assertEqual(inv["scans_by_side"], {"TOP": 5, "BOTTOM": 5})
@@ -266,7 +258,7 @@ class TestInventoryCommand(ScanFolderCase):
         return code, out.getvalue()
 
     def test_no_scans_folder_leaves_the_output_as_before(self):
-        plain = self.root / "plain"  # a store with no scans/ folder (setUp creates one under self.root)
+        plain = self.root / "plain"
         (plain / "store").mkdir(parents=True)
         code, text = self.run_inventory(plain)
         self.assertEqual(code, 0)
@@ -278,7 +270,7 @@ class TestInventoryCommand(ScanFolderCase):
         make_scan(self.store, "SC-1", "toy-1")
         code, text = self.run_inventory(self.root)
         self.assertEqual(code, 0)
-        self.assertIn("problems: 0", text)  # existing part line is still there
+        self.assertIn("problems: 0", text)
         self.assertIn("scans (", text)
         self.assertIn("toy-1", text)
         self.assertIn("scan problems: 0", text)
@@ -346,7 +338,7 @@ class TestWeeklyWithScans(ScanFolderCase):
         self.assertEqual(part["scans"]["train_scans"], 2)
         self.assertEqual(len(part["holdout_scan_ids"]), 1)
         self.assertEqual(sorted(part["trained_scan_ids"]), ["SC-T1", "SC-T2"])
-        self.assertEqual(len(part["trained_session_ids"]), 3)  # purge keys: parts only
+        self.assertEqual(len(part["trained_session_ids"]), 3)
         held = part["evaluation"]["scans"]["held_out_good"]
         self.assertEqual(held["scans"], 1)
         self.assertEqual(list(held["per_toy"]), ["T3"])
@@ -369,8 +361,6 @@ class TestWeeklyWithScans(ScanFolderCase):
         version = ms.list_versions("PN-1")[0]["version"]
         model = PatchCoreModel.load(ms.root / safe_part("PN-1") / version / "patchcore.npz",
                                     fake_decode, FakeExtractor())
-        # Bank C1/TOP: 3 part pictures (one per part) plus 2 train scans with 2 TOP steps each.
-        # The held-out toy T3 adds nothing to the training bank.
         self.assertEqual(model.describe()["banks"]["C1/TOP"]["train_images"], 3 + 2 * 2)
 
     def test_scans_excluded_are_counted_in_the_report(self):

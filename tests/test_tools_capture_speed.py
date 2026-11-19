@@ -1,4 +1,3 @@
-"""Tests for tools/capture_speed.py with a stub camera set (no camera, no numpy)."""
 import unittest
 
 from station.contracts import CameraError, Frame, Side

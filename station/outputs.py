@@ -1,13 +1,3 @@
-"""Output drivers for lights and the alarm (implements contracts.OutputDriver).
-
-Invariants, identical for every driver:
-- show_good:   green only (alarm off)
-- show_bad:    red and alarm on, never green
-- show_review: amber only, never green, no alarm
-- show_fault:  fault light only
-- alarm_off:   turns only the alarm off
-- clear:       everything off
-"""
 from __future__ import annotations
 
 from typing import Callable, Mapping, Optional
@@ -24,7 +14,6 @@ _OFF = {lamp: False for lamp in LAMPS}
 
 
 class _OutputBase:
-    """Holds the five lamp booleans and applies the invariant table above."""
 
     def __init__(self) -> None:
         self.green = False
@@ -57,11 +46,10 @@ class _OutputBase:
         self._emit(action, tuple(values))
 
     def _emit(self, action: str, lamps: tuple[str, ...]) -> None:
-        """Hook for subclasses; lamps are the outputs this action wrote, in LAMPS order."""
+        pass
 
 
 class RecordingOutputs(_OutputBase):
-    """Test double: lamp booleans plus a history of the calls made."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -72,7 +60,6 @@ class RecordingOutputs(_OutputBase):
 
 
 class ConsoleOutputs(_OutputBase):
-    """Writes one line per output call, e.g. 'OUTPUTS show_bad: green=OFF red=ON ...'."""
 
     def __init__(self, write: Optional[Callable[[str], None]] = None) -> None:
         super().__init__()
@@ -89,11 +76,6 @@ DEFAULT_CHANNEL_MAP: dict[str, int] = {"green": 1, "red": 2, "alarm": 3, "amber"
 
 
 class SerialRelayOutputs(_OutputBase):
-    """Drives a USB relay board by writing b'ON<n>\\n' / b'OFF<n>\\n' bytes.
-
-    show_* and clear write one line for each of the five channels, in LAMPS
-    order. alarm_off writes only the alarm channel.
-    """
 
     def __init__(
         self,

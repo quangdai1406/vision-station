@@ -1,0 +1,4 @@
+#!/bin/sh
+root=$(git rev-parse --show-toplevel)
+py=$(command -v python3 || command -v python)
+exec "$py" "$root/tools/nocomments.py" check --staged --root "$root"

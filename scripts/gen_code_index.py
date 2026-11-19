@@ -1,10 +1,3 @@
-"""Write docs/CODE_INDEX.md: every Python file and its classes and functions, one line each.
-
-    python3 scripts/gen_code_index.py            # rewrite docs/CODE_INDEX.md
-    python3 scripts/gen_code_index.py --check    # exit 1 when the file is stale
-
-Standard library only. Test files list the file and its test classes only.
-"""
 from __future__ import annotations
 
 import ast

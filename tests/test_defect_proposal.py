@@ -1,7 +1,3 @@
-"""Tests for human defect proposals (plan S3): rules, session, MES post, storage, UI routes, page.
-
-Fakes only (see tests/test_session.py and tests/test_ui.py); no network, no sleeping.
-"""
 import json
 import pathlib
 import tempfile
@@ -30,7 +26,6 @@ def _row(criterion="C-1", camera="C1", side=Side.TOP, by="anna", note=""):
 
 
 def _with_proposal_store(h):
-    """The test FakeStore predates defect_proposals: accept the keyword like station.storage does."""
     orig = h.store.save_part
 
     def save(record, defect_proposals=None):
@@ -42,7 +37,6 @@ def _with_proposal_store(h):
 
 
 def _bad_harness():
-    """A part the model judges BAD, shown in VERDICT with its 8 pictures."""
     h = _with_proposal_store(Harness(fuse_verdict=Verdict.BAD))
     h.complete_part(0.0)
     assert h.session.state is State.VERDICT
@@ -55,7 +49,6 @@ class ProposalRuleTests(unittest.TestCase):
         self.assertIs(check_proposal(p, criteria_ids=CRITERIA, image_keys=[("C2", Side.BOTTOM)]), p)
 
     def test_unknown_or_inactive_criterion_is_refused(self):
-        # inactive criteria are not in criteria_ids (build_part_config leaves them out)
         with self.assertRaisesRegex(ValueError, "not an active criterion"):
             check_proposal(DefectProposal("C-9", "C1", Side.TOP), criteria_ids=CRITERIA,
                            image_keys=[("C1", Side.TOP)])
@@ -104,7 +97,7 @@ class SessionProposalTests(unittest.TestCase):
         h = Harness()
         with self.assertRaises(InvalidTransition):
             h.session.propose_defect(DefectProposal("C-1", "C1", Side.TOP), by="anna", criteria_ids=CRITERIA)
-        h.press_at(0.0)  # WAIT_FLIP
+        h.press_at(0.0)
         with self.assertRaises(InvalidTransition):
             h.session.propose_defect(DefectProposal("C-1", "C1", Side.TOP), by="anna", criteria_ids=CRITERIA)
 
@@ -155,7 +148,7 @@ class SessionProposalTests(unittest.TestCase):
         self.assertEqual(saved_rows[0]["proposed_by"], "anna")
         rows = h.session.proposals_for(h.store.saved[-1].part_id)
         self.assertEqual([r.criterion_id for r in rows], ["C-2"])
-        self.assertEqual(h.session.proposals_for(h.store.saved[-1].part_id), [])  # handed over once
+        self.assertEqual(h.session.proposals_for(h.store.saved[-1].part_id), [])
 
     def test_a_bad_part_cannot_be_flipped_to_good_by_a_proposal_path(self):
         h = _bad_harness()
@@ -189,17 +182,16 @@ class SessionProposalTests(unittest.TestCase):
         h.session.propose_defect(DefectProposal("C-1", "C1", Side.TOP), by="anna", criteria_ids=CRITERIA)
         h.session.ack_alarm()
         self.assertEqual(h.session.snapshot()["defect_proposals"], [])
-        h.fuse.verdict = Verdict.GOOD  # the next part is judged GOOD
-        h.press_at(5.0)  # the next part's TOP press
+        h.fuse.verdict = Verdict.GOOD
+        h.press_at(5.0)
         self.assertEqual(h.session.state, State.WAIT_FLIP)
         self.assertEqual(h.session.snapshot()["defect_proposals"], [])
-        h.press_at(6.0)  # its BOTTOM press: GOOD, saved without proposals
+        h.press_at(6.0)
         self.assertEqual(h.store.saved[-1].final_verdict, Verdict.GOOD)
         self.assertEqual(h.session.proposals_for(h.store.saved[-1].part_id), [])
         self.assertEqual(h.session.snapshot()["defect_proposals"], [])
 
     def test_proposal_on_a_good_part_is_refused_and_changes_nothing(self):
-        # Owner decision: a defect on a part the model passed is not supported yet.
         h = _with_proposal_store(Harness(fuse_verdict=Verdict.GOOD))
         h.complete_part(0.0)
         before = (h.session.state, dict(h.session.counters), list(h.outputs.calls),
@@ -243,7 +235,7 @@ class MesPostTests(unittest.TestCase):
         self.assertIn("C-2", fields["rejectionReason"])
         photos = {name: data for name, _fn, data in files}
         self.assertEqual(photos["defectPhoto_C-2"], b"BOTTOM-C3")
-        self.assertIn("defectPhoto_C-1", photos)  # the model's own photo for C-1 stays
+        self.assertIn("defectPhoto_C-1", photos)
 
     def test_proposal_picture_replaces_the_model_picture_for_the_same_criterion(self):
         record = self._record()
@@ -280,7 +272,7 @@ class StorageProposalTests(unittest.TestCase):
             part_dir = store.save_part(record, defect_proposals=rows)
             doc = json.loads((part_dir / "part.json").read_text(encoding="utf-8"))
         self.assertEqual(doc["defect_proposals"], rows)
-        self.assertIsNone(doc["operator_label"])  # training reads operator_label only: proposals are not labels
+        self.assertIsNone(doc["operator_label"])
         self.assertEqual(doc["final_verdict"], "BAD")
 
     def test_no_proposals_key_when_there_are_none(self):
@@ -314,7 +306,6 @@ class EvidencePlannedDestinationTests(tes.EvidenceSyncTestCase):
 
 
 class DefectSession(FakeSession):
-    """FakeSession with the proposal calls the UI routes use."""
 
     def __init__(self):
         super().__init__()

@@ -1,8 +1,3 @@
-"""Tests for station/features_torch.py using FAKE torch and torchvision modules.
-
-These prove the call sequence, shapes and device choice only. The real torch
-path is UNPROVEN UNTIL RUN ON THE GPU LAPTOP (python -m trainer selftest).
-"""
 import contextlib
 import importlib.util
 import os
@@ -21,7 +16,6 @@ if HAS_NUMPY:
 
 
 class FakeTensor:
-    """A numpy array with just enough torch-like methods for the extractor and backend."""
 
     def __init__(self, data, rec=None):
         self.data = np.asarray(data)
@@ -33,7 +27,7 @@ class FakeTensor:
 
     def to(self, device, *args, **kwargs):
         if self.rec is not None:
-            self.rec.log("to", device, self.shape)  # counts device uploads
+            self.rec.log("to", device, self.shape)
         return self
 
     def cpu(self):
@@ -71,7 +65,6 @@ class Recorder:
 
 
 class FakeLayer:
-    """Subsamples by `stride` and expands to `channels` channels (values are stand-ins)."""
 
     def __init__(self, rec, name, stride, channels):
         self.rec, self.name, self.stride, self.channels = rec, name, stride, channels
@@ -101,8 +94,8 @@ class FakeBackbone:
         self.relu = FakeIdentity(rec, "relu")
         self.maxpool = FakeLayer(rec, "maxpool", 2, 4)
         self.layer1 = FakeLayer(rec, "layer1", 1, 4)
-        self.layer2 = FakeLayer(rec, "layer2", 2, 6)  # stride 8 overall, 6 channels
-        self.layer3 = FakeLayer(rec, "layer3", 2, 10)  # stride 16 overall, 10 channels
+        self.layer2 = FakeLayer(rec, "layer2", 2, 6)
+        self.layer3 = FakeLayer(rec, "layer3", 2, 10)
 
     def eval(self):
         self.rec.log("eval")
@@ -222,7 +215,7 @@ class TorchExtractorTests(unittest.TestCase):
         extractor, rec = self._extractor()
         image = np.full((64, 64), 128.0)
         feats = extractor.extract(image)
-        self.assertEqual(feats.shape, (8, 8, 16))  # 6 (layer2) + 10 (layer3)
+        self.assertEqual(feats.shape, (8, 8, 16))
         self.assertEqual(feats.dtype, np.float32)
         self.assertEqual(extractor.name, "resnet18-l2l3-aa-64x64-letterbox-imagenet-default")
         self.assertEqual(extractor.stride, 8)
@@ -293,7 +286,7 @@ class TorchExtractorTests(unittest.TestCase):
         self.assertEqual(a.name, a_again.name)
         self.assertNotEqual(a.name, b.name)
         self.assertNotIn("imagenet-default", a.name)
-        self.assertNotIn(tmp, a.name)  # the path itself is not in the name
+        self.assertNotIn(tmp, a.name)
 
     def test_missing_weights_file_is_station_error(self):
         with self.assertRaises(StationError) as ctx:
@@ -305,12 +298,11 @@ class TorchExtractorTests(unittest.TestCase):
         extractor.extract(np.zeros((128, 128, 3)))
         interp = [c for c in rec.calls if c[0] == "interpolate"]
         self.assertTrue(interp)
-        # the first interpolate is the input resize; later ones are feature-map upsampling
         self.assertEqual(interp[0], ("interpolate", (64, 64), "bilinear", True))
 
     def test_letterbox_keeps_aspect_and_pads_the_short_side(self):
-        extractor, rec = self._extractor(input_hw=(64, 64))  # keep_aspect defaults to True
-        feats = extractor.extract(np.zeros((64, 32)))  # tall-narrow: scale 1, width 32 -> pad 16 each side
+        extractor, rec = self._extractor(input_hw=(64, 64))
+        feats = extractor.extract(np.zeros((64, 32)))
         self.assertEqual(feats.shape, (8, 8, 16))
         self.assertIn(("interpolate", (64, 32), "bilinear", True), rec.calls)
         self.assertIn(("pad", (16, 16, 0, 0), 0.0), rec.calls)

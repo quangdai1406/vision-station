@@ -1,39 +1,3 @@
-"""Weekly PatchCore candidates for the trainer: ``python3 -m trainer weekly ...``.
-
-For each part number: read its good parts (strict policy), split held-out good
-parts by whole UTC day, build one PatchCore candidate for all (camera, side)
-keys, evaluate it, and register it with ModelStore.add_candidate. A candidate
-is never approved or promoted here; a person does that.
-
-Incremental update: when the part's approved model is patchcore-v2, the builder
-starts from it (PatchCoreBuilder.from_model) and only good parts that started
-after the parent's manifest trained_until_utc are added. A patchcore-v1 parent,
-an incompatible parent or a non-patchcore parent means a fresh build, and the
-report says why.
-
-Thresholds (t_img, t_low) and the count of held-out good parts that would be
-flagged are NOT chosen here; the report leaves them as "[Quality to define]".
---min-good and --min-holdout have no defaults on purpose; they are Quality's.
-
---scans-too (off by default) adds the official GOOD Taking-data scans of the same part
-number to the banks as training images. Scans are split by whole toy_id (never by
-picture): --holdout-toys names the toys held out, otherwise whole toys are chosen by the
-seeded split with holdout_fraction. Parts keep the day split. With scans included, min-good
-and min-holdout count parts and scans together, and the candidate is built fresh (an
-approved parent is not updated yet). Held-out scan images are scored and reported
-separately, by part and by toy. Official BAD scans are only evaluated, never trained.
-
-Reports: weekly-<UTC date>.json and weekly-<UTC date>.txt in --reports, written
-atomically. --dry-run prints the plan and writes nothing.
-
-Exit codes: 0 ok (skipped parts are fine), 1 at least one part failed,
-2 usage error or missing dependency (numpy, cv2, torch).
-
-numpy, cv2 and torch are imported only when a real run needs them. The feature
-extractor can be injected (extractor_factory) and so can the image decoder
-(decoder_factory), which is how the tests run without torch. Nothing here reads
-secrets or touches the network.
-"""
 from __future__ import annotations
 
 import argparse
@@ -85,22 +49,22 @@ REPORT_PREFIX = "weekly-"
 REPORT_SCHEMA = "trainer-weekly-report/1"
 PROBLEMS_SHOWN = 5
 SCANS_FRESH_NOTE = "scans included: built fresh (incremental updates do not include scans yet)"
-_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)  # cutoff when no good parts were trained
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 Extractor = Any
 Decode = Callable[[Frame], Any]
 
 
 class UsageError(Exception):
-    """Bad command line or inputs. Exit code 2."""
+    pass
 
 
 class DependencyError(Exception):
-    """A needed package is missing. Exit code 2."""
+    pass
 
 
 class _Skip(Exception):
-    """A part is left out on purpose; the reason goes in the report."""
+    pass
 
 
 @dataclass
@@ -109,7 +73,6 @@ class _Runtime:
     decode: Decode
 
 
-# ------------------------------------------------------------------ arguments
 def _at_least(minimum: int) -> Callable[[str], int]:
     def parse(text: str) -> int:
         try:
@@ -165,7 +128,6 @@ def add_arguments(sub: Any) -> None:
 
 
 def _toy_list(text: str) -> list:
-    """'A, B,C' -> ['A', 'B', 'C']. Empty entries are dropped; duplicates keep their first place."""
     toys = list(dict.fromkeys(part.strip() for part in text.split(",") if part.strip()))
     if not toys:
         raise UsageError("--holdout-toys needs at least one toy id")
@@ -176,7 +138,6 @@ def run(args: argparse.Namespace) -> int:
     return run_weekly(args)
 
 
-# ----------------------------------------------------------------- settings
 def _parse_utc(text: str) -> datetime:
     dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
     if dt.tzinfo is None:
@@ -198,7 +159,6 @@ def _parse_now(text: Optional[str]) -> datetime:
 
 
 def _load_config(path: str) -> dict:
-    """Validate the extractor config. Its contents are never printed."""
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValueError) as exc:
@@ -231,7 +191,7 @@ def _make_runtime(args: argparse.Namespace, extractor_factory, decoder_factory) 
             raise UsageError("--extractor-config is required for a real run (not needed with --dry-run)")
         cfg = _load_config(args.extractor_config)
         try:
-            from station.features_torch import TorchExtractor  # noqa: PLC0415 - needs torch, lazily
+            from station.features_torch import TorchExtractor
             extractor = TorchExtractor(cfg["arch"], device=cfg["device"], input_hw=cfg["input_hw"],
                                        weights_path=cfg["weights_path"])
         except ImportError as exc:
@@ -258,7 +218,6 @@ def _new_builder(runtime: _Runtime, args: argparse.Namespace) -> PatchCoreBuilde
     )
 
 
-# ------------------------------------------------------------------- parts
 def _frame(ref: Any, sample: Any, seq: int) -> Frame:
     return Frame(
         camera_id=ref.camera_id,
@@ -275,7 +234,6 @@ def _when(sample: Any) -> datetime:
 
 
 def _parent_plan(parent: Any) -> tuple[Optional[datetime], str, Optional[str]]:
-    """(cutoff or None for fresh, note, parent version). The v1/compatibility check needs the file; see _load_base."""
     if parent is None:
         return None, "no approved model: trained fresh", None
     version = parent.version
@@ -293,7 +251,6 @@ def _parent_plan(parent: Any) -> tuple[Optional[datetime], str, Optional[str]]:
 
 
 def _load_base(parent: Any, runtime: _Runtime, args: argparse.Namespace) -> tuple[Optional[PatchCoreBuilder], str]:
-    """Builder seeded from the approved parent, or (None, why a fresh build is needed)."""
     version = parent.version
     try:
         base = PatchCoreModel.load(parent.path, runtime.decode, runtime.extractor)
@@ -369,7 +326,6 @@ def _evaluate(model: Any, held_out: list, bad: list, runtime: _Runtime) -> dict:
 
 
 def _scored_scans(model: Any, samples: list) -> list:
-    """(scan, [(picture, score), ...]) for each scan."""
     return [
         (scan, [(ref, model.predict(_frame(ref, scan, seq)).score) for seq, ref in enumerate(scan.images)])
         for scan in samples
@@ -382,10 +338,6 @@ def _scan_group(rows: list) -> dict:
 
 
 def _evaluate_scans(model: Any, held: list, bad: list) -> dict:
-    """Held-out GOOD scans and official BAD scans, scored like held-out parts, kept apart from parts.
-
-    BAD pictures are grouped per defect name and by their 'defect visible' mark.
-    """
     held_rows = _scored_scans(model, held)
     bad_rows = _scored_scans(model, bad)
     held_toys = sorted({scan.toy_id for scan in held})
@@ -467,7 +419,6 @@ def _manifest(*, model: Any, mode: str, note: str, parent_version: Optional[str]
 
 
 class _Context:
-    """Per-run values shared by every part."""
 
     def __init__(self, args: argparse.Namespace, ms: ModelStore, runtime: Optional[_Runtime],
                  now: datetime, dry_run: bool, scans: Optional[ScanSet] = None,
@@ -479,11 +430,10 @@ class _Context:
         self.now_iso = _iso(now)
         self.version = "weekly-" + now.strftime("%Y%m%dT%H%M%SZ")
         self.dry_run = dry_run
-        # Scans are used only when --scans-too was given (scans is then a ScanSet).
         self.scans_too = scans is not None
-        self.holdout_toys = holdout_toys  # None: the seeded split chooses the toys
-        self.scan_good: dict = {}  # part number -> official GOOD scans
-        self.scan_bad: dict = {}  # part number -> official BAD scans (evaluation only)
+        self.holdout_toys = holdout_toys
+        self.scan_good: dict = {}
+        self.scan_bad: dict = {}
         if scans is not None:
             for scan in scans.good:
                 self.scan_good.setdefault(scan.part_number, []).append(scan)
@@ -525,10 +475,9 @@ def _run_part(part_number: str, samples: list, ctx: _Context, result: dict) -> N
 
     builder: Optional[PatchCoreBuilder] = None
     if ctx.scans_too:
-        # Scans are not part of the incremental update yet, so the candidate is always built fresh.
         cutoff, note, parent_version = None, SCANS_FRESH_NOTE, None
     else:
-        parent = ctx.ms.current(part_number)  # ModelError when the approved model is unusable: a part error
+        parent = ctx.ms.current(part_number)
         cutoff, note, parent_version = _parent_plan(parent)
         if cutoff is not None:
             if ctx.dry_run:
@@ -536,7 +485,7 @@ def _run_part(part_number: str, samples: list, ctx: _Context, result: dict) -> N
             else:
                 builder, note = _load_base(parent, ctx.runtime, args)
                 if builder is None:
-                    cutoff = None  # v1, incompatible or unreadable parent: fresh build
+                    cutoff = None
     mode = "incremental" if cutoff is not None else "fresh"
 
     if cutoff is not None:
@@ -571,8 +520,6 @@ def _run_part(part_number: str, samples: list, ctx: _Context, result: dict) -> N
         _feed(builder, scan, True, ctx.runtime, scan_tally)
     model = builder.build(ctx.version)
 
-    # Parts only: the cutoff is read by the next incremental run, which picks up parts after it.
-    # Scans are not in the incremental path, so they must not move the cutoff.
     trained_until = max((_when(s) for s in good), default=_EPOCH)
     cutoff_iso = _iso(trained_until)
     evaluation = _evaluate(model, hold_all, ds.bad, ctx.runtime)
@@ -586,8 +533,6 @@ def _run_part(part_number: str, samples: list, ctx: _Context, result: dict) -> N
         args=args, now_iso=ctx.now_iso, counts=counts, evaluation=evaluation, runtime=ctx.runtime,
     )
     _register(ctx.ms, part_number, ctx.version, model, manifest, ctx.now_iso)
-    # Keys read by trainer.purge: only pictures fed to the builder this run are listed as trained.
-    # Scan ids have their own keys: they are not parts and purge never deletes them.
     result.update(status="candidate", version=ctx.version, trained_until_utc=cutoff_iso,
                   counts=counts, evaluation=evaluation,
                   candidate_version=ctx.version, training_succeeded=True,
@@ -615,12 +560,11 @@ def _process_part(part_number: str, samples: list, ctx: _Context) -> dict:
         _run_part(part_number, samples, ctx, result)
     except _Skip as exc:
         result["status"], result["reason"] = "skipped", str(exc)
-    except Exception as exc:  # one bad part must not stop the others; the report names it
+    except Exception as exc:
         result["status"], result["reason"] = "error", f"{type(exc).__name__}: {exc}"
     return result
 
 
-# ------------------------------------------------------------------ report
 def _write_atomic(path: Path, text: str) -> None:
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
     try:
@@ -709,7 +653,6 @@ def _fmt_summary(s: dict) -> str:
 
 
 def _scan_eval_lines(block: dict) -> list:
-    """Held-out scan scores under one part (kept apart from the part pictures)."""
     held = block["held_out_good"]
     bad = block["bad"]
     lines = [f"  held-out good scans ({held['scans']} scans): {_fmt_scores(held)}"]
@@ -724,7 +667,6 @@ def _scan_eval_lines(block: dict) -> list:
 
 
 def _build_scans_section(ctx: _Context, parts: list) -> dict:
-    """The report's 'scans' section: what was read, excluded, held out and scored."""
     scan_set = ctx.scan_set
     inv = summarize(scan_set)
     per_part: dict = {}
@@ -839,10 +781,8 @@ def _build_report(ctx: _Context, store: Path, models: Path, reports: Path, parts
     return report
 
 
-# -------------------------------------------------------------------- run
 def run_weekly(args: argparse.Namespace, *, extractor_factory: Optional[Callable[[], Any]] = None,
                decoder_factory: Optional[Callable[[], Decode]] = None) -> int:
-    """Run the weekly job. extractor_factory/decoder_factory are for tests and alternative backends."""
     try:
         now = _parse_now(args.now_utc)
         store = Path(args.store)
@@ -858,7 +798,7 @@ def run_weekly(args: argparse.Namespace, *, extractor_factory: Optional[Callable
                 raise UsageError("--holdout-toys needs --scans-too")
             holdout_toys = _toy_list(args.holdout_toys)
         if args.extractor_config and not args.dry_run:
-            _load_config(args.extractor_config)  # validate early; contents are not printed
+            _load_config(args.extractor_config)
         runtime = None
         if not args.dry_run:
             runtime = _make_runtime(args, extractor_factory, decoder_factory)

@@ -1,8 +1,3 @@
-"""Tests for the optional `scan` block and the Taking-data wiring in station/app.py.
-
-Fake cameras, a marker model and a temporary data folder only. Time is injected
-(FakeClock), so nothing sleeps. Plan: docs/26_1027_PLAN_taking_data_mode.md, step 3.
-"""
 from __future__ import annotations
 
 import json
@@ -140,17 +135,16 @@ class ScanAppTests(unittest.TestCase):
         return app, clock, cameras
 
     def _good_scan(self, app, clock, label=None) -> pathlib.Path:
-        """2 TOP steps, flip, 2 BOTTOM steps, finish. Returns the saved scan folder."""
         app.scan.start("PN-100", "TOY-1", dict(GOOD_LABEL if label is None else label), "sup1")
-        app.scan.press()          # TOP step 1
+        app.scan.press()
         clock.now += 0.5
-        app.scan.press()          # TOP step 2
+        app.scan.press()
         clock.now += 0.5
         self.assertEqual(app.scan.done_side(), ScanState.WAIT_FLIP.value)
-        clock.now += 2.5          # past min_flip_s (2.0)
-        self.assertTrue(app.scan.press())  # flip press: BOTTOM step 1
+        clock.now += 2.5
+        self.assertTrue(app.scan.press())
         clock.now += 0.5
-        app.scan.press()          # BOTTOM step 2
+        app.scan.press()
         clock.now += 0.5
         self.assertEqual(app.scan.done_side(), ScanState.SAVING.value)
         return app.scan.finish()
@@ -161,7 +155,6 @@ class ScanAppTests(unittest.TestCase):
         self.assertIsNone(app._scan_session)
         self.assertFalse((self.data_dir / "scans").exists())
         self.assertFalse(app.scan_active())
-        # Inspection still works exactly as before.
         self.assertTrue(app._locked.press())
         self.assertEqual(app.session.state, State.WAIT_FLIP)
 
@@ -187,19 +180,19 @@ class ScanAppTests(unittest.TestCase):
         self.assertIsInstance(load_scan(scan_dir), dict)
         pictures = [p for p in scan_dir.rglob("*") if p.is_file() and p.name != "scan.json"
                     and p.name != "manifest.sha256"]
-        self.assertEqual(len(pictures), 16)  # 2 TOP steps + 2 BOTTOM steps, 4 cameras each
+        self.assertEqual(len(pictures), 16)
         app.scan.reset()
         self.assertEqual(app.scan.snapshot()["state"], ScanState.IDLE.value)
 
     def test_scan_refused_while_an_inspection_part_is_in_progress(self) -> None:
         app, clock, _ = self._app({"enabled": True})
-        self.assertTrue(app._locked.press())  # TOP captured: the part is in progress
+        self.assertTrue(app._locked.press())
         self.assertNotEqual(app.session.state, State.IDLE)
         with self.assertRaises(ScanError) as ctx:
             app.scan.start("PN-100", "TOY-1", dict(GOOD_LABEL), "sup1")
         self.assertIn("inspection", str(ctx.exception))
         self.assertEqual(app.scan.snapshot()["state"], ScanState.IDLE.value)
-        self.assertEqual(list((self.data_dir / "scans" / "L1").iterdir()), [])  # nothing saved
+        self.assertEqual(list((self.data_dir / "scans" / "L1").iterdir()), [])
 
     def test_busy_is_true_in_every_inspection_state_except_idle(self) -> None:
         app, _, _ = self._app({"enabled": True})
@@ -216,7 +209,6 @@ class ScanAppTests(unittest.TestCase):
         self.assertFalse(app._locked.press())
         self.assertEqual(app.session.state, State.IDLE)
         self.assertEqual(app.session.counters["total"], 0)
-        # Still refused in the middle of a side, and while waiting for the flip.
         app.scan.press()
         self.assertFalse(app._locked.press())
         clock.now += 0.5
@@ -234,19 +226,18 @@ class ScanAppTests(unittest.TestCase):
         self.assertEqual(app.session.state, State.WAIT_FLIP)
 
         app2, clock2, _ = self._app({"enabled": True})
-        self._good_scan(app2, clock2)  # DONE: the cameras are free, inspection may run
+        self._good_scan(app2, clock2)
         self.assertFalse(app2.scan_active())
         self.assertTrue(app2._locked.press())
 
     def test_label_rules_are_enforced_by_the_store_through_the_app(self) -> None:
         app, _, _ = self._app({"enabled": True})
-        # A BAD label needs at least one defect name (station/scanstore.py label rules).
         with self.assertRaises(ScanError):
             app.scan.start("PN-100", "TOY-1", {"verdict": "BAD", "defects": [], "status": "proposed",
                                                "labelled_by": "sup1",
                                                "labelled_at": "2026-10-27T08:42:00Z"}, "sup1")
         self.assertEqual(app.scan.snapshot()["state"], ScanState.IDLE.value)
-        app.scan.start("PN-100", "TOY-1", dict(BAD_LABEL), "sup1")  # a valid BAD label starts
+        app.scan.start("PN-100", "TOY-1", dict(BAD_LABEL), "sup1")
         self.assertEqual(app.scan.snapshot()["state"], ScanState.SCAN_SIDE.value)
         app.scan.cancel()
 
@@ -256,7 +247,7 @@ class ScanAppTests(unittest.TestCase):
         app.scan.press()
         clock.now += 0.5
         app.scan.done_side()
-        clock.now += 2.5  # enough for the 2.0 default, not for 10
+        clock.now += 2.5
         self.assertFalse(app.scan.press())
         with self.assertRaises(ScanError):
             app.scan.flip_ready()
@@ -284,8 +275,6 @@ class ScanAppTests(unittest.TestCase):
             return exc.code, exc.headers, exc.read()
 
     def test_scan_routes_are_served_by_the_real_app_over_http(self) -> None:
-        # regression: the UI server must get the scan object from the app, and the scan wrapper
-        # must offer step_picture, or the Taking-data screen never works on the real station
         app, _, _ = self._app({"enabled": True})
         app.start()
         status, headers, _ = self._http(app, "POST", "/api/login",

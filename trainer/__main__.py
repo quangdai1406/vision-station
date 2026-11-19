@@ -1,8 +1,3 @@
-"""Command line for the weekly trainer: ``python3 -m trainer <command> ...``.
-
-Commands live in COMMANDS: name -> (add_arguments(subparsers), run(args) -> int).
-Add a command by writing both functions and one entry in that dict.
-"""
 from __future__ import annotations
 
 import argparse
@@ -69,7 +64,6 @@ def _run_inventory(args: argparse.Namespace) -> int:
         print("no usable parts found")
     for ds in datasets:
         _print_dataset(ds)
-    # Problems are store-wide: an unreadable part.json cannot be tied to one part.
     print(f"problems: {len(problems)}")
     for line in problems[:PROBLEM_LINES_SHOWN]:
         print(f"  {line}")
@@ -79,7 +73,6 @@ def _run_inventory(args: argparse.Namespace) -> int:
 
 
 def _print_scans(scan_set: ScanSet) -> None:
-    """Taking-data scans, after the part output. Part filters (--part, --since, --until) do not apply."""
     inv = summarize(scan_set)
     print(f"scans ({inv['scans_root']}; all scans, --part/--since/--until do not apply)")
     print(f"  folders {inv['folders']}, intact {inv['intact']}, problems {inv['problems']}")
@@ -108,7 +101,6 @@ def _print_scans(scan_set: ScanSet) -> None:
 
 
 def _lazy_module(module_name: str) -> tuple[Any, Optional[str]]:
-    """Import a command module by name. (module, None) or (None, reason) when it is missing."""
     try:
         return importlib.import_module(module_name), None
     except ImportError as exc:
@@ -127,8 +119,6 @@ def _first_callable(module: Any, names: Sequence[str]) -> Optional[Callable[...,
 
 def _lazy_command(command: str, module_name: str, add_names: Sequence[str],
                   run_names: Sequence[str]) -> tuple[Callable[[Any], None], Callable[[argparse.Namespace], int]]:
-    """Wire a command whose module may not exist yet. The module is imported when the command is
-    registered and again when it runs; a missing module gives a clear error instead of breaking the CLI."""
 
     def add_arguments(sub: Any) -> None:
         module, _reason = _lazy_module(module_name)
@@ -151,7 +141,6 @@ def _lazy_command(command: str, module_name: str, add_names: Sequence[str],
     return add_arguments, run
 
 
-# name -> (add_arguments(subparsers), run(args) -> int)
 COMMANDS: dict = {
     "inventory": (_add_inventory, _run_inventory),
     "weekly": (weekly.add_arguments, weekly.run),
@@ -179,7 +168,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
-    except SystemExit as exc:  # argparse exits on --help and on usage errors
+    except SystemExit as exc:
         if exc.code is None:
             return 0
         return exc.code if isinstance(exc.code, int) else 2

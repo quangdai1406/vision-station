@@ -1,4 +1,3 @@
-"""Tests for the mes_ticket additions in station/auth.py: role mapping and MES-bound sessions."""
 import copy
 import os
 import sqlite3
@@ -46,7 +45,7 @@ class RoleMapTests(unittest.TestCase):
         self.assertEqual(map_role(ROLE_MAP, ["inspector", "supervisor"]), "supervisor")
 
     def test_admin_is_only_given_by_the_map(self):
-        self.assertIsNone(map_role(ROLE_MAP, ["admin"]))  # not in the map: no access
+        self.assertIsNone(map_role(ROLE_MAP, ["admin"]))
         self.assertEqual(map_role({"lead": "admin"}, ["lead"]), "admin")
 
     def test_validate_accepts_good_map(self):

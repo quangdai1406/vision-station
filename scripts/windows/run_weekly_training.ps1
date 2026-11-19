@@ -1,32 +1,3 @@
-# run_weekly_training.ps1
-# Weekly training run for the vision-station laptop (Windows 10/11, i7 10th gen, 32 GB RAM,
-# 8 GB NVIDIA GPU). Scheduled by install_weekly_task.ps1 for every Sunday at 06:00 local time.
-#
-# In order, this script:
-#   1. reads the settings from the config JSON (-Config),
-#   2. checks that the evidence folder exists, is not empty and is not online-only
-#      (OneDrive placeholder files), so it never trains on a partial set,
-#   3. checks the GPU with nvidia-smi when it is installed,
-#   3b. asks the inference service (optional key inference_health_url) whether it is busy.
-#      Busy: training does not start (exit 4). Unreachable: training continues and says so.
-#   4. runs the trainer: python -m trainer weekly (it writes a candidate model and a report).
-#      The trainer runs at BelowNormal process priority, so the laptop stays usable for the
-#      inference service and the MES. Its output is written to files in the logs folder and
-#      copied into the transcript when it ends.
-#   5. writes a transcript log (the last 26 are kept) and exits with the trainer's exit code.
-#
-# Exit codes: 3 = preflight check failed (nothing was trained); 4 = inference service busy
-# (nothing was trained); any other code is the trainer's own exit code.
-#
-# This script never approves or deploys a model, and it never deletes evidence.
-# Approval is a named person's manual step, taken after Quality has reviewed the report.
-#
-# ---------------------------------------------------------------------------
-# PURGE SWITCH: OFF. This script has no purge step and must not gain one by default.
-# Deleting evidence is a separate MANUAL command that an engineer runs by hand: dry run
-# first, then the confirm step. It is never run from this scheduled task.
-# See docs/weekly_training.md, section "Purging old evidence".
-# ---------------------------------------------------------------------------
 
 [CmdletBinding()]
 param(
@@ -36,8 +7,6 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# OneDrive "online-only" attribute bits. A file with either bit set is a placeholder whose
-# content is not on this laptop yet.
 $RECALL_ON_DATA_ACCESS = 0x00400000
 $RECALL_ON_OPEN        = 0x00040000
 $LOG_KEEP              = 26
@@ -49,8 +18,6 @@ $transcriptStarted = $false
 function Step([string]$Message) { Write-Host ""; Write-Host "== $Message" }
 function Warn([string]$Message) { Write-Host "WARNING: $Message" }
 
-# Returns the string value of a key, expands %VARS%, and refuses a missing, empty or
-# placeholder value. Only the key name is printed, never a value.
 function Get-RequiredValue($Obj, [string]$Key, [string]$Prefix = '') {
     $name = if ($Prefix) { "$Prefix.$Key" } else { $Key }
     $prop = $Obj.PSObject.Properties[$Key]
@@ -73,7 +40,6 @@ function Get-Section($Obj, [string]$Key) {
 }
 
 try {
-    # 1. Settings -------------------------------------------------------------
     Step 'Reading settings'
     if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) {
         throw "config file not found: $Config. Copy scripts\windows\trainer.example.json there and fill it in."
@@ -87,7 +53,6 @@ try {
     $python  = Get-RequiredValue $cfg 'python'
 
     $extractor = Get-Section $cfg 'extractor'
-    # input_hw is a JSON list [height, width]; it must stay a list of two whole numbers.
     $hwProp = $extractor.PSObject.Properties['input_hw']
     $hwRaw = if ($hwProp) { @($hwProp.Value) } else { @() }
     if ($hwRaw.Count -ne 2 -or ($hwRaw | Where-Object { $_ -isnot [int] -and $_ -isnot [long] })) {
@@ -101,13 +66,11 @@ try {
         device       = Get-RequiredValue $extractor 'device' 'extractor'
     }
 
-    # No defaults for these two: a missing value stops the run.
     $minGood    = Get-RequiredValue $cfg 'min_good'
     $minHoldout = Get-RequiredValue $cfg 'min_holdout'
     if ($minGood -notmatch '^\d+$')    { throw "config: 'min_good' must be a whole number" }
     if ($minHoldout -notmatch '^\d+$') { throw "config: 'min_holdout' must be a whole number" }
 
-    # holdout_fraction: Quality owns it, no default. Must be a number from just above 0 up to 0.9.
     $holdoutRaw = Get-RequiredValue $cfg 'holdout_fraction'
     $holdoutValue = 0.0
     $holdoutOk = [double]::TryParse($holdoutRaw, [Globalization.NumberStyles]::Float,
@@ -118,7 +81,6 @@ try {
     $holdoutFraction = $holdoutValue.ToString([Globalization.CultureInfo]::InvariantCulture)
     Write-Host "  settings ok (values not printed here; see the config file)"
 
-    # Log folder and rotation: keep the last 26 transcripts, including this run.
     New-Item -ItemType Directory -Force -Path $logs | Out-Null
     $oldLogs = @(Get-ChildItem -LiteralPath $logs -Filter 'weekly-*.log' -File |
         Sort-Object LastWriteTime -Descending)
@@ -129,7 +91,6 @@ try {
     $transcriptStarted = $true
     Write-Host "Weekly training started $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') on $env:COMPUTERNAME"
 
-    # 2. Evidence folder ------------------------------------------------------
     Step 'Checking the evidence folder'
     if (-not (Test-Path -LiteralPath $store -PathType Container)) {
         throw "evidence folder not found: $store. Is the SharePoint folder synced by OneDrive?"
@@ -154,7 +115,6 @@ try {
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
     }
 
-    # 3. GPU ------------------------------------------------------------------
     Step 'GPU check'
     $smi = Get-Command -Name 'nvidia-smi' -ErrorAction SilentlyContinue
     if (-not $smi) {
@@ -172,9 +132,6 @@ try {
         }
     }
 
-    # 3b. Inference service busy check ----------------------------------------
-    # Optional key. Not set (key missing or empty): the check is skipped and the transcript says so.
-    # Set: the URL is called with a short timeout. The URL is never printed (it may carry a secret).
     Step 'Inference service check'
     $inferenceBusy = $false
     $healthProp = $cfg.PSObject.Properties['inference_health_url']
@@ -183,8 +140,6 @@ try {
     } else {
         $healthUrl = Get-RequiredValue $cfg 'inference_health_url'
         try {
-            # /v1/health needs no token and answers busy as a JSON boolean. Anything else
-            # (no busy, or not a boolean) is not an answer: it is reported, never read as idle.
             $health = Invoke-RestMethod -Uri $healthUrl -Method Get -TimeoutSec 5
             if (-not $health.PSObject.Properties['busy'] -or $health.busy -isnot [bool]) {
                 Warn 'inference service answer has no boolean busy; continuing with training.'
@@ -204,9 +159,7 @@ try {
         Write-Host 'Start the task again when the service is idle, or run the script by hand.'
         $exitCode = 4
     } else {
-        # 4. Trainer ------------------------------------------------------------
         Step 'Running the trainer'
-        # The trainer reads the extractor section from its own JSON file; write it to the logs folder.
         $extractorFile = Join-Path $logs 'extractor-config.json'
         $extractorSettings | ConvertTo-Json -Depth 4 |
             Set-Content -LiteralPath $extractorFile -Encoding UTF8
@@ -221,7 +174,6 @@ try {
             '--holdout-fraction', $holdoutFraction,
             '--extractor-config', $extractorFile
         )
-        # Start-Process joins the arguments without quoting, so quote any that contain spaces.
         $trainerLine = ($trainerArgs | ForEach-Object {
             $a = [string]$_
             if ($a -match '\s') { '"' + $a + '"' } else { $a }
@@ -231,9 +183,8 @@ try {
 
         $proc = Start-Process -FilePath $python -ArgumentList $trainerLine -WorkingDirectory $RepoRoot `
             -NoNewWindow -PassThru -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
-        # Below normal priority: the inference service and the MES keep their CPU and disk time.
         $proc.PriorityClass = [Diagnostics.ProcessPriorityClass]::BelowNormal
-        $null = $proc.Handle   # cache the process handle so ExitCode can be read after exit
+        $null = $proc.Handle
         $proc.WaitForExit()
         $exitCode = $proc.ExitCode
 

@@ -1,7 +1,3 @@
-"""Tests for station/mes_session.py and the Station-Session header on MES posts.
-
-Runs against a local fake MES on 127.0.0.1, port 0. No network.
-"""
 from __future__ import annotations
 
 import http.server
@@ -25,8 +21,8 @@ SID = "sess-abc-123"
 
 class _State:
     def __init__(self):
-        self.routes = {}  # (method, path) -> (status, body dict or None)
-        self.requests = []  # (method, path, headers, body bytes)
+        self.routes = {}
+        self.requests = []
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -69,7 +65,6 @@ class _FakeMesCase(unittest.TestCase):
         self.thread.join(5)
 
     def dead_base(self):
-        """A base URL where nothing listens (connection refused)."""
         probe = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         port = probe.server_address[1]
         probe.server_close()
@@ -204,7 +199,6 @@ def _record() -> PartRecord:
 
 
 class PostHeaderTests(_FakeMesCase):
-    """MesClient.post sends Station-Session when a session id is given."""
 
     def _post(self, **kwargs) -> dict:
         cfg = MesConfig(base_url=self.base, token=TOKEN, criteria_ids=["CR-1"],
@@ -234,7 +228,6 @@ class PostHeaderTests(_FakeMesCase):
 
 
 class OutboxSessionColumnTests(unittest.TestCase):
-    """The outbox keeps each part's MES session and migrates outboxes made before the column."""
 
     def test_old_outbox_gains_the_column_and_keeps_its_rows(self):
         with tempfile.TemporaryDirectory() as tmp:

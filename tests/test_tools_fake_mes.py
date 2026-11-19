@@ -1,4 +1,3 @@
-"""Tests for the HOME TRIAL fake MES (tools/fake_mes.py). Loopback only, standard library."""
 from __future__ import annotations
 
 import http.client
@@ -16,7 +15,7 @@ from station.parts import MesPartsClient, PartsError
 from tools.fake_mes import FakeMesServer, load_criteria, load_parts
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-TOKEN = "fake-mes-test-" + secrets.token_hex(12)  # made up per run, never written anywhere
+TOKEN = "fake-mes-test-" + secrets.token_hex(12)
 UNSET_ENV = "VISION_FAKE_MES_TEST_UNSET_TOKEN"
 BOUNDARY = "fakemesboundary7d3f"
 
@@ -154,7 +153,7 @@ class TestInspectionEvents(FakeMesTestCase):
 
     def test_one_jsonl_line_per_accepted_event_without_photo_bytes(self) -> None:
         self.post_event("key-1")
-        self.post_event("key-1")  # replay: not written again
+        self.post_event("key-1")
         self.post_event("key-2")
         lines = self.events_lines()
         self.assertEqual(len(lines), 2)

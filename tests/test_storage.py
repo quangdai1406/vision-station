@@ -195,7 +195,7 @@ class TestSavePart(StoreTestCase):
         def worker(rec):
             try:
                 self.store.save_part(rec)
-            except Exception as exc:  # noqa: BLE001 - collected for the assertion
+            except Exception as exc:
                 errors.append(exc)
 
         threads = [threading.Thread(target=worker, args=(r,)) for r in recs]
@@ -211,7 +211,6 @@ class TestSavePart(StoreTestCase):
 
 
 def make_pairs_record(pairs, session_id="S-P1", part_id="P-P1", final=Verdict.GOOD):
-    """A PartRecord whose frames/results are exactly the given (camera, side) pairs."""
     frames, results = [], []
     for seq, (cam, side) in enumerate(pairs):
         frames.append(
@@ -472,7 +471,7 @@ class TestOperatorLabel(StoreTestCase):
     def test_part_json_without_the_field_still_loads_and_takes_a_label(self):
         part_dir = self.save_collected()
         doc = self.part_json(part_dir)
-        del doc["operator_label"]  # what a part.json saved before this field looks like
+        del doc["operator_label"]
         (part_dir / "part.json").write_text(json.dumps(doc), encoding="utf-8")
         self.assertEqual(self.store.verify_part(part_dir), [])
         previous = self.store.set_operator_label(
@@ -489,7 +488,6 @@ class TestOperatorLabel(StoreTestCase):
         self.assertEqual(self.store.collected_session_id_for_part("P-c1"), "S-c1")
         self.assertIsNone(self.store.collected_session_id_for_part("P-g4"))
 
-    # ---- two-step approval: statuses, proposal fields, action in the event log
 
     def proposal(self, verdict=Verdict.BAD, criterion="CR-1", by="op-1"):
         return OperatorLabel(verdict, by, TS_LABEL, criterion_id=criterion, status=LABEL_PROPOSED,
@@ -543,15 +541,15 @@ class TestOperatorLabel(StoreTestCase):
         self.save_collected()
         bad = [
             OperatorLabel(Verdict.GOOD, "op-1", TS_LABEL, status="maybe"),
-            OperatorLabel(Verdict.GOOD, "op-1", TS_LABEL, status=LABEL_PROPOSED),  # no proposed_by
+            OperatorLabel(Verdict.GOOD, "op-1", TS_LABEL, status=LABEL_PROPOSED),
             OperatorLabel(Verdict.GOOD, "op-1", TS_LABEL, status=LABEL_PROPOSED,
                           proposed_by="op-1", proposed_at=TS_LABEL, approved_by="admin"),
             OperatorLabel(Verdict.GOOD, "op-1", TS_LABEL, status=LABEL_OFFICIAL,
-                          approved_by="admin"),  # approved_by without approved_at
+                          approved_by="admin"),
             OperatorLabel(Verdict.GOOD, "op-1", TS_LABEL, status=LABEL_OFFICIAL,
                           reject_reason="no"),
             OperatorLabel(Verdict.GOOD, "op-1", TS_LABEL, status=LABEL_REJECTED,
-                          approved_by="admin", approved_at=TS_LABEL),  # no reason
+                          approved_by="admin", approved_at=TS_LABEL),
         ]
         for label in bad:
             with self.subTest(label=label):
@@ -592,7 +590,7 @@ class TestOperatorLabel(StoreTestCase):
         pending = self.store.collected_labels(status=LABEL_PROPOSED)
         self.assertEqual([r["session_id"] for r in pending], ["S-c1"])
         self.assertEqual(pending[0]["part_id"], "P-c1")
-        self.assertEqual(len(self.store.collected_labels()), 2)  # S-c3 has no label
+        self.assertEqual(len(self.store.collected_labels()), 2)
 
 
 if __name__ == "__main__":

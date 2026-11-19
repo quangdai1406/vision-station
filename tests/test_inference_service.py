@@ -1,8 +1,3 @@
-"""Tests for inference_service (L1): the laptop model server.
-
-Fake model and fake extractor only: no torch, numpy or cv2 is needed. Each test runs the
-real HTTP server on 127.0.0.1 with port 0 and a real ModelStore in a temporary folder.
-"""
 from __future__ import annotations
 
 import contextlib
@@ -27,22 +22,22 @@ from station import modelstore as ms
 from station.contracts import Defect, ImageResult, Side, StationError
 
 ROOT = Path(__file__).resolve().parent.parent
-TOKEN = "test-token-7f3a9c1e5b2d4a6f8e0c"  # a fake token, used only in these tests
+TOKEN = "test-token-7f3a9c1e5b2d4a6f8e0c"
 TOKEN_ENV = "INFERENCE_TEST_TOKEN_NAME"
 PART = "PN-100-A"
 NOW = "2026-11-04T08:00:00Z"
 
 
 class OutOfMemoryError(RuntimeError):
-    """Stands in for torch.cuda.OutOfMemoryError: the registry matches it by class name."""
+    pass
 
 
 class FakeModel:
     def __init__(self, version, score, faults, gate):
         self.version = version
         self._score = score
-        self._faults = faults  # list of exceptions, one raised per predict call
-        self._gate = gate  # optional threading.Event that predict waits on
+        self._faults = faults
+        self._gate = gate
 
     def predict(self, frame):
         if self._gate is not None:
@@ -58,7 +53,6 @@ class FakeModel:
 
 
 def auth(token):
-    """Headers for a bearer token; no header at all when token is None."""
     return {} if token is None else {"Authorization": "Bearer " + token}
 
 
@@ -69,8 +63,8 @@ class ServiceCase(unittest.TestCase):
         self.store = ms.ModelStore(self.tmp / "models")
         self.loads: list[str] = []
         self.scores: dict[str, float] = {}
-        self.faults: list[BaseException] = []  # raised by the next predict calls
-        self.load_faults: list[BaseException] = []  # raised by the next loads
+        self.faults: list[BaseException] = []
+        self.load_faults: list[BaseException] = []
         self.gate = None
         self.registry = reg.ModelRegistry(self.store, self._loader)
         self.server = build_server(self.registry, token=TOKEN, host="127.0.0.1", port=0)
@@ -158,7 +152,7 @@ class PredictStatusTests(ServiceCase):
         self.add_approved("v1")
         status, data, _ = self.predict()
         self.assertEqual(json.loads(data)["model_version"], "v1")
-        self.add_approved("v2")  # approve writes current.json with a new file
+        self.add_approved("v2")
         status, data, _ = self.predict()
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(data)["model_version"], "v2")
@@ -168,7 +162,7 @@ class PredictStatusTests(ServiceCase):
     def test_never_falls_back_to_older_version(self):
         self.add_approved("v1")
         self.assertEqual(self.predict()[0], 200)
-        self.add_approved("v2")  # approved and verified, then changed on disk before any request loads it
+        self.add_approved("v2")
         self.model_file("v2").write_bytes(b"tampered")
         status, data, _ = self.predict()
         self.assertEqual(status, 503)
@@ -185,7 +179,7 @@ class PredictStatusTests(ServiceCase):
         self.assertEqual(body["model_version"], "v1")
         self.assertEqual(body["score"], 0.42)
         self.assertEqual(body["defects"], [{"defect_class": "anomaly", "score": 0.42, "box": [1, 2, 3, 4]}])
-        self.assertNotIn("t_low", body)  # raw scores only; the station applies thresholds
+        self.assertNotIn("t_low", body)
         self.assertNotIn("t_img", body)
         rebuilt = ImageResult(
             camera_id=body["camera_id"],
@@ -205,8 +199,8 @@ class PredictStatusTests(ServiceCase):
         status, data, _ = self.predict()
         self.assertEqual(status, 503)
         self.assertIn("memory", json.loads(data)["error"])
-        self.assertEqual(self.health()[0], 200)  # the server still answers
-        self.assertEqual(self.predict()[0], 200)  # next request reloads the model
+        self.assertEqual(self.health()[0], 200)
+        self.assertEqual(self.predict()[0], 200)
         self.assertEqual(self.loads, ["v1", "v1"])
 
     def test_out_of_memory_while_loading_is_503(self):
@@ -289,8 +283,8 @@ class ModelLookupTests(ServiceCase):
 
     def test_plus_sign_is_not_read_as_a_space(self):
         self.add_approved("v1", part="A+B")
-        self.assertEqual(self.model_lookup("A+B")[0], 200)  # the raw '+' is the part's own character
-        self.assertEqual(self.request("GET", "/v1/models/A%20B", headers=auth(TOKEN))[0], 404)  # a space is not '+'
+        self.assertEqual(self.model_lookup("A+B")[0], 200)
+        self.assertEqual(self.request("GET", "/v1/models/A%20B", headers=auth(TOKEN))[0], 404)
 
     def test_unencoded_slash_in_the_part_is_400(self):
         self.add_approved("v1", part="PN/100")
@@ -361,7 +355,6 @@ class HealthTests(ServiceCase):
         self.assertEqual(body["in_flight"], 0)
 
     def test_health_busy_is_a_json_boolean_for_the_weekly_script_call(self):
-        # The same call run_weekly_training.ps1 makes: GET with no Authorization header.
         status, data, headers = self.request("GET", "/v1/health")
         self.assertEqual(status, 200)
         self.assertEqual(headers["content-type"], "application/json")

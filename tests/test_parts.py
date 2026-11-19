@@ -10,9 +10,9 @@ from unittest import mock
 from station import parts
 from station.contracts import StationError
 
-try:  # the mirror test needs tools.criteria; skip it cleanly if that import ever fails
+try:
     from tools import criteria as tools_criteria
-except Exception:  # noqa: BLE001
+except Exception:
     tools_criteria = None
 
 FAKE_TOKEN = "fake-token-for-tests-only-0001"
@@ -21,8 +21,8 @@ SEARCH = "/api/machine/parts/search"
 
 class _State:
     def __init__(self):
-        self.routes = {}  # path (no query) -> (status, headers, body bytes)
-        self.requests = []  # (raw path, Authorization header)
+        self.routes = {}
+        self.requests = []
 
     def route(self, path):
         return self.routes.get(path, (404, {}, b'{"error":"not found"}'))
@@ -41,7 +41,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *args):  # keep test output quiet
+    def log_message(self, *args):
         pass
 
 
@@ -129,7 +129,7 @@ class ErrorTests(_FakeMesCase):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-        sock.close()  # nothing listens on this port now
+        sock.close()
         client = parts.MesPartsClient(f"http://127.0.0.1:{port}", FAKE_TOKEN, timeout_s=2)
         with self.assertRaises(parts.PartsError) as ctx:
             client.search("x")

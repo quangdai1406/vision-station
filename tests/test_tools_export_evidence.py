@@ -1,7 +1,3 @@
-"""Tests for tools/export_evidence.py. Run from the project root:
-
-    python3 -m unittest discover -s tests
-"""
 import contextlib
 import io
 import json
@@ -64,7 +60,6 @@ def make_record(session_id, part_id, started):
 
 
 def snapshot(root):
-    """Map every file under root to its bytes, for before/after comparisons."""
     out = {}
     for dirpath, _dirs, files in os.walk(root):
         for name in files:
@@ -80,7 +75,6 @@ class ExportEvidenceTestCase(unittest.TestCase):
         self.pi = base / "pi"
         self.dest = base / "laptop_evidence"
         self.store = Store(self.pi, site="SITE", line="L1")
-        # Two parts on 2026-10-23 and one on 2026-10-25, all real layout.
         self.parts = {
             "P-1": self._save("S-1", "P-1", "2026-10-23T08:30:12Z"),
             "P-2": self._save("S-2", "P-2", "2026-10-23T09:00:00Z"),
@@ -172,7 +166,7 @@ class ExportTests(ExportEvidenceTestCase):
         for part_id, day in (("P-1", "2026-10-23"), ("P-2", "2026-10-23"), ("P-3", "2026-10-25")):
             dst = self._dest_part(part_id, day)
             self.assertTrue((dst / ee.MANIFEST).is_file())
-            self.assertEqual(self.store.verify_part(dst), [])  # real storage verifier agrees
+            self.assertEqual(self.store.verify_part(dst), [])
 
     def test_report_file_written_with_counts_and_no_extra_secrets(self):
         self._export()
@@ -209,7 +203,6 @@ class ExportTests(ExportEvidenceTestCase):
         self.assertEqual((c["copied"], c["purged"]), (2, 1))
 
     def test_interrupted_copy_is_completed_on_next_run(self):
-        # A copy that stopped before the manifest was written has no manifest at the destination.
         dst = self._dest_part("P-1", "2026-10-23")
         dst.mkdir(parents=True)
         (dst / ee.PART_JSON).write_text("partial", encoding="utf-8")

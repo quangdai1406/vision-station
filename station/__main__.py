@@ -1,9 +1,3 @@
-"""Entry point.
-
-    python -m station --config config.json [--demo]
-    python -m station users add <username> <role> [--config config.json | --users-file FILE]
-    python -m station teach --config config.json [--frames-per-side N] [--parts K] [--out PATH] [--force]
-"""
 from __future__ import annotations
 
 import argparse
@@ -23,7 +17,6 @@ EPILOG = (
 
 
 def build_demo_station(config: dict) -> StationApp:
-    """Fake cameras, the marker model and console outputs. MES posting is off."""
     from station.cameras import FakeCameraSet
     from station.inference import MarkerModel
     from station.outputs import ConsoleOutputs
@@ -58,7 +51,7 @@ def _run(argv: Sequence[str]) -> int:
 
     try:
         app = build_demo_station(config) if args.demo else build_station(config)
-    except Exception as exc:  # StationError, camera and file errors: one line, no traceback
+    except Exception as exc:
         print(f"startup error: {exc}", file=sys.stderr)
         return 2
 
@@ -67,7 +60,7 @@ def _run(argv: Sequence[str]) -> int:
     print(f"station running{mode}. UI: {app.url}   Ctrl-C to stop", flush=True)
     stop = threading.Event()
     try:
-        while not stop.wait(1.0):  # a short timeout keeps Ctrl-C responsive on every platform
+        while not stop.wait(1.0):
             pass
     except KeyboardInterrupt:
         pass

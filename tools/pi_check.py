@@ -1,34 +1,3 @@
-"""Raspberry Pi check: cameras, laptop round trip, evidence share, versions. Run on the Pi.
-
-    python3 -m tools.pi_check [--max-index 5] [--no-cameras]
-        [--inference-url http://LAPTOP:8765 --token-env NAME --part-number PN
-         [--images 8] [--image PICTURE.png] [--timeout-s 30]]
-        [--evidence-dest PATH] [--out pi_check_report.json]
-
-It decides nothing and installs nothing. It reports what it measured: which camera indexes
-work, how long the laptop takes to score pictures, whether the evidence share takes a file,
-and the software versions. There are no pass/fail limits here; Quality owns the operator
-wait limit, shown as [Quality to define].
-
-Cameras: on Linux the OpenCV V4L2 backend (cv2.CAP_V4L2) is used, because Linux cameras are
-V4L2 devices (DirectShow is Windows only). Each index 0..--max-index is opened, warmed up
-and asked for one picture. Dead indexes are reported by number. cv2 is imported lazily and
-can be injected (the tests do this).
-
-Laptop: GET /v1/health (no token: reachability and busy), GET /v1/status (with the token: version
-and model count), then --images predict calls (one per picture of a part: cameras C1..C4,
-sides TOP and BOTTOM in turn). Pictures are synthetic PNGs unless --image gives a real one.
-The token is read only from the environment variable named by --token-env and is never
-printed, written or returned in an error. Requests ignore proxy environment variables, so the
-LAN address is reached directly.
-
-Exit codes: 0 when the report was written and every requested check ran; 1 when a requested
-check failed (laptop unreachable or refused, a predict call failed, OpenCV missing for the
-camera check, evidence share not writable) or the report could not be written; 2 when an
-argument is wrong. Dead cameras are data, not an error.
-
-JSON report, schema 1, written atomically to --out (no token, no secret).
-"""
 from __future__ import annotations
 
 import argparse
@@ -56,29 +25,28 @@ from station.contracts import CAMERA_IDS
 
 SCHEMA_VERSION = 1
 TOOL_NAME = "tools.pi_check"
-DEFAULT_MAX_INDEX = 5  # engineering setting: how many camera indexes are probed (0..N)
-DEFAULT_IMAGES = 8  # one part: 4 cameras x 2 sides
-DEFAULT_TIMEOUT_S = 30.0  # socket timeout for this tool's requests; NOT the RemoteModel timeout
+DEFAULT_MAX_INDEX = 5
+DEFAULT_IMAGES = 8
+DEFAULT_TIMEOUT_S = 30.0
 DEFAULT_OUT = "pi_check_report.json"
 OPERATOR_WAIT_LIMIT = "[Quality to define]"
 OPERATOR_WAIT_LINE = f"Operator wait limit: {OPERATOR_WAIT_LIMIT}"
-HEALTH_PATH = "/v1/health"  # no token
-STATUS_PATH = "/v1/status"  # token
+HEALTH_PATH = "/v1/health"
+STATUS_PATH = "/v1/status"
 PREDICT_PATH = "/v1/predict"
-PART_MAX = 128  # same limit as the laptop service (Part-Number header)
+PART_MAX = 128
 TOKEN_REDACTED = "[token redacted]"
 SERVER_DETAIL_MAX = 120
 SIDES = ("TOP", "BOTTOM")
 SYNTHETIC_SIZE = 64
 INSTALL_NOTE = "see docs/pi_setup.md for the OpenCV install step; this tool installs nothing"
 CONTENT_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
-# Requests must not pick up proxy settings from the environment (the laptop is on the LAN).
 _OPENER = urlrequest.build_opener(urlrequest.ProxyHandler({}))
 _TRANSPORT_ERRORS = (OSError, http.client.HTTPException)
 
 
 class ReportWriteError(Exception):
-    """The report could not be turned into JSON, so nothing was written (exit 1)."""
+    pass
 
 
 def utc_now_iso() -> str:
@@ -91,20 +59,18 @@ def _err_text(exc: BaseException) -> str:
 
 def _try_import_cv2() -> Any:
     try:
-        import cv2  # noqa: PLC0415 - lazy on purpose
+        import cv2
     except ImportError:
         return None
     return cv2
 
 
-# ---------------------------------------------------------------- secrets
 
 def _scrub_text(text: str, token: str) -> str:
     return text.replace(token, TOKEN_REDACTED) if token else text
 
 
 def _scrub_obj(obj: Any, token: str) -> Any:
-    """Replace the token in every string of a report (defence in depth: no path should carry it)."""
     if not token:
         return obj
     if isinstance(obj, str):
@@ -116,13 +82,8 @@ def _scrub_obj(obj: Any, token: str) -> Any:
     return obj
 
 
-# ---------------------------------------------------------------- report file
 
 def write_report_atomic(path: Path, report: dict) -> None:
-    """Write the JSON report to a temporary file in the same folder, then replace the target.
-
-    Raises ReportWriteError when json cannot encode the report (ValueError or TypeError).
-    """
     try:
         data = json.dumps(report, indent=2, allow_nan=False) + "\n"
     except (ValueError, TypeError) as exc:
@@ -140,7 +101,6 @@ def write_report_atomic(path: Path, report: dict) -> None:
         raise
 
 
-# ---------------------------------------------------------------- versions
 
 def versions(cv2: Any) -> dict:
     return {
@@ -150,10 +110,8 @@ def versions(cv2: Any) -> dict:
     }
 
 
-# ---------------------------------------------------------------- cameras
 
 def _backend_for(cv2: Any, platform_name: str) -> tuple[Any, str, str]:
-    """(api, backend name, plain-language reason). api None means OpenCV's default backend."""
     if platform_name.startswith("linux"):
         api = getattr(cv2, "CAP_V4L2", None)
         if api is not None:
@@ -243,10 +201,8 @@ def _cameras_without_opencv(max_index: int) -> dict:
             "not_working": [], "details": [], "error": msg}
 
 
-# ---------------------------------------------------------------- laptop
 
 def _base_url(text: str) -> str:
-    """http(s)://HOST:PORT with no user name, password, path, query or fragment."""
     parsed = urlparse.urlsplit(text)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError("--inference-url must start with http:// or https:// and name a host")
@@ -259,7 +215,6 @@ def _base_url(text: str) -> str:
 
 
 def _request(url: str, *, method: str, headers: dict, body: Optional[bytes], timeout: float) -> tuple[int, bytes]:
-    """(HTTP status, body). HTTP error answers are returned, transport errors are raised."""
     req = urlrequest.Request(url, data=body, headers=headers, method=method)
     try:
         with _OPENER.open(req, timeout=timeout) as resp:
@@ -267,13 +222,12 @@ def _request(url: str, *, method: str, headers: dict, body: Optional[bytes], tim
     except urlerror.HTTPError as exc:
         try:
             data = exc.read()
-        except Exception:  # noqa: BLE001 - the status is what matters
+        except Exception:
             data = b""
         return exc.code, data
 
 
 def _server_detail(data: bytes) -> str:
-    """The server's own short error text (the laptop never echoes the token)."""
     try:
         payload = json.loads(data.decode("utf-8"))
         if isinstance(payload, dict) and isinstance(payload.get("error"), str):
@@ -294,8 +248,6 @@ def _json_object(data: bytes) -> Optional[dict]:
 
 
 def check_health(base: str, token: str, timeout: float) -> dict:
-    """Reachability and busy from GET /v1/health (no token); version and model count from
-    GET /v1/status (bearer token). A failed status call makes the check fail: nothing is sent."""
     result: dict = {"ok": False, "http_status": None, "error": None, "version": None,
                     "models": None, "busy": None}
     try:
@@ -335,12 +287,11 @@ def check_health(base: str, token: str, timeout: float) -> dict:
 
 
 def synthetic_png(width: int = SYNTHETIC_SIZE, height: int = SYNTHETIC_SIZE) -> bytes:
-    """A plain grey-gradient PNG, written with the standard library only."""
     if width < 1 or height < 1:
         raise ValueError("the synthetic picture needs a positive size")
     rows = bytearray()
     for y in range(height):
-        rows.append(0)  # filter type: none
+        rows.append(0)
         for x in range(width):
             v = (x * 4 + y * 3) % 256
             rows += bytes((v, v, v))
@@ -348,7 +299,7 @@ def synthetic_png(width: int = SYNTHETIC_SIZE, height: int = SYNTHETIC_SIZE) -> 
     def chunk(tag: bytes, data: bytes) -> bytes:
         return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
 
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)  # 8-bit RGB
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
             + chunk(b"IDAT", zlib.compress(bytes(rows), 9)) + chunk(b"IEND", b""))
 
@@ -395,7 +346,6 @@ def timing_stats(seconds: list[float]) -> dict:
 
 
 def _load_picture(path: Optional[str]) -> tuple[bytes, str, str]:
-    """(bytes, content type, description). The synthetic PNG is used when no file is given."""
     if path is None:
         return synthetic_png(), "image/png", f"synthetic {SYNTHETIC_SIZE}x{SYNTHETIC_SIZE} PNG (no --image given)"
     p = Path(path)
@@ -450,7 +400,6 @@ def check_laptop(base: str, token: str, token_env: str, part: str, n: int,
     return inf
 
 
-# ---------------------------------------------------------------- evidence share
 
 def check_evidence(dest: str) -> dict:
     result: dict = {"path": dest, "writable": False, "free_bytes": None, "error": None}
@@ -486,12 +435,10 @@ def check_evidence(dest: str) -> dict:
     return result
 
 
-# ---------------------------------------------------------------- run
 
 def _validate(*, max_index: int, inference_url: Optional[str], token_env: Optional[str],
               part_number: Optional[str], images: int, image_path: Optional[str],
               timeout_s: float) -> Optional[str]:
-    """Returns the normalised base URL, or None when no laptop check was asked for."""
     if max_index < 0:
         raise ValueError("--max-index must be 0 or more")
     if images < 1:
@@ -530,12 +477,6 @@ def run_pi_check(
     clock: Callable[[], float] = time.monotonic,
     out: Callable[[str], Any] = print,
 ) -> dict:
-    """Run the requested checks, write the JSON report and return it.
-
-    Raises ValueError for bad arguments (before anything runs), ReportWriteError when the
-    report cannot be encoded and OSError when it cannot be written. Failed checks never raise;
-    they are in the report.
-    """
     base = _validate(max_index=max_index, inference_url=inference_url, token_env=token_env,
                      part_number=part_number, images=images, image_path=image_path, timeout_s=timeout_s)
     env = os.environ if environ is None else environ

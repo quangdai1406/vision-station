@@ -1,4 +1,5 @@
-"""Timing probe for the keep-open camera session: N rounds of one picture per camera.
+from __future__ import annotations
+DOC_TEXT = """Timing probe for the keep-open camera session: N rounds of one picture per camera.
 
     python -m tools.capture_speed --devices 0 2 4 6 --width 1280 --height 720 \\
         --mjpg --threaded --flush 1 --rounds 20
@@ -12,7 +13,6 @@ already queued, so it may be older than the shot; a wait of about one frame
 period means the grab waited for a fresh frame. No threshold is applied here.
 The wall clock cannot tell the true age of a frame.
 """
-from __future__ import annotations
 
 import argparse
 import statistics
@@ -25,8 +25,8 @@ from tools import ToolDependencyError
 
 def _decode_mean(data: bytes) -> float:
     try:
-        import cv2  # noqa: PLC0415
-        import numpy as np  # noqa: PLC0415
+        import cv2
+        import numpy as np
     except ImportError as exc:
         raise ToolDependencyError("numpy and OpenCV (cv2) are needed for the capture-speed probe") from exc
     img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -43,7 +43,6 @@ def run_rounds(
     sleep: Callable[[float], None] = time.sleep,
     log: Callable[[str], None] = print,
 ) -> dict:
-    """Run `rounds` captures; return a summary dict. A failing round is counted, not fatal."""
     ids = list(cams.camera_ids)
     rows: list[dict] = []
     failures: dict[str, int] = {c: 0 for c in ids}
@@ -110,7 +109,7 @@ def _summary(rows: list[dict], ids: Sequence[str], failures: dict, log: Callable
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(description=DOC_TEXT.split("\n")[0])
     ap.add_argument("--devices", type=int, nargs="+", default=[0, 2, 4, 6])
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
@@ -120,7 +119,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--threaded", action="store_true")
     ap.add_argument("--flush", type=int, default=1)
     args = ap.parse_args(argv)
-    from station.cameras import OpenCvCameraSet  # noqa: PLC0415
+    from station.cameras import OpenCvCameraSet
 
     cams = OpenCvCameraSet(args.devices, width=args.width, height=args.height,
                            session_mode="keep_open", mjpg=args.mjpg, threaded=args.threaded,

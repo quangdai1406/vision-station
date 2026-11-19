@@ -1,4 +1,3 @@
-"""Tests for tools/hubtest.py. A fake cv2 stands in for OpenCV; numpy is real when installed."""
 from __future__ import annotations
 
 import contextlib
@@ -12,7 +11,7 @@ from unittest import mock
 
 try:
     import numpy as np
-except ImportError:  # pragma: no cover - numpy is required only for these tests
+except ImportError:
     np = None
 
 from station import cameras as station_cameras
@@ -20,12 +19,10 @@ from tools import hubtest
 from tools.hubtest import MODE_ORDER, MODE_TITLES, main, recommend, run_hubtest, wait_text
 
 DEVICES = [0, 1, 2, 3]
-# Real grabs per picture in the station: one picture grab after FLUSH_FRAMES flush grabs.
 FLUSH = station_cameras.STALE_FLUSH_FRAMES
 
 
 class FakeClock:
-    """Monotonic clock that advances a fixed step on every call, so timings are deterministic."""
 
     def __init__(self) -> None:
         self.t = 0.0
@@ -66,7 +63,6 @@ class FakeCap:
         if self.index in self.hub.dead:
             return False
         if self.hub.overlap_fails and (self.hub.pending - {self.index}):
-            # Shared hub: a second camera asked for a picture before the first was read.
             return False
         self.hub.pending.add(self.index)
         self.grabbed = True
@@ -108,7 +104,6 @@ class FakeHubCv2:
         self.released: list[int] = []
         self.imwrite_ok = True
         self.saved: list[str] = []
-        # Optional: a clock the fake advances on every open, to simulate slow opening.
         self.clock: FakeClock | None = None
         self.open_cost = 0.0
 
@@ -170,7 +165,7 @@ class HubTestRuns(unittest.TestCase):
         hub = FakeHubCv2(overlap_fails=True)
         report = _run(hub, self.dir, rounds=2)
         sim = report["modes"]["simultaneous"]
-        self.assertEqual(sim["summary"]["pictures_ok"], 2)  # only device 0 per round
+        self.assertEqual(sim["summary"]["pictures_ok"], 2)
         failed = {c["device"] for c in _cams(report, "simultaneous", 2).values() if not c["ok"]}
         self.assertEqual(failed, {1, 2, 3})
         self.assertIn("device 1", _cams(report, "simultaneous")[1]["error"])
@@ -208,7 +203,7 @@ class HubTestRuns(unittest.TestCase):
             self.assertIn("all-black", cam["error"], mode)
             self.assertEqual(cam["mean_grey"], 0.0, mode)
         self.assertTrue(_cams(report, "sequential_open_per_shot")[0]["ok"])
-        self.assertIsNone(report["sample_pictures"]["3"])  # no sample for a black camera
+        self.assertIsNone(report["sample_pictures"]["3"])
 
     def test_exception_in_one_camera_does_not_stop_the_others(self) -> None:
         hub = FakeHubCv2(raise_grab={1})
@@ -222,7 +217,6 @@ class HubTestRuns(unittest.TestCase):
         hub = FakeHubCv2()
         _run(hub, self.dir, rounds=3, backend="dshow")
         opened = [index for index, _ in hub.open_calls]
-        # A1: 4 devices x 3 rounds; A2: 4 once; B: 4 x 3 rounds
         self.assertEqual(opened.count(0), 3 + 1 + 3)
         self.assertEqual(len(opened), 12 + 4 + 12)
         self.assertEqual(hub.open_calls[0][1], FakeHubCv2.CAP_DSHOW)
@@ -230,7 +224,7 @@ class HubTestRuns(unittest.TestCase):
     def test_default_backend_is_the_station_backend_and_prints_no_warning(self) -> None:
         hub = FakeHubCv2()
         lines: list[str] = []
-        report = _run(hub, self.dir, rounds=1, out=lines.append)  # no backend given
+        report = _run(hub, self.dir, rounds=1, out=lines.append)
         self.assertTrue(all(api is None for _, api in hub.open_calls))
         self.assertEqual(report["requested"]["backend"], "default")
         self.assertEqual(report["station_backend"], "default")
@@ -259,7 +253,7 @@ class HubTestRuns(unittest.TestCase):
         report = json.loads(out_path.read_text(encoding="utf-8"))
         self.assertEqual(report["schema"], 1)
         self.assertEqual(report["devices"], DEVICES)
-        self.assertEqual(report["requested"]["backend"], "default")  # the station's backend
+        self.assertEqual(report["requested"]["backend"], "default")
         self.assertEqual(report["station_backend"], "default")
         self.assertEqual(set(report["modes"]), set(MODE_ORDER))
         self.assertEqual(report["recommended_mode"], "sequential_keep_open")
@@ -296,7 +290,7 @@ class HubTestRuns(unittest.TestCase):
         hub = FakeHubCv2()
         _run(hub, self.dir, rounds=2)
         opened = sorted(index for index, _ in hub.open_calls)
-        self.assertEqual(len(opened), 20)  # A1 8 + A2 4 + B 8
+        self.assertEqual(len(opened), 20)
         self.assertEqual(sorted(index for index, _ in hub.buffer_sets), opened)
         self.assertTrue(all(value == 1 for _, value in hub.buffer_sets))
         self.assertEqual(hubtest.STATION_BUFFER_FRAMES, 1)
@@ -309,7 +303,6 @@ class HubTestRuns(unittest.TestCase):
         self.assertEqual(report["recommended_mode"], "simultaneous")
 
     def test_flush_and_warm_up_grabs_match_the_station_in_each_mode(self) -> None:
-        # Per device: warm-up 1 grab after each open, FLUSH grabs before each picture, 1 picture grab.
         hub = FakeHubCv2()
         snapshots: dict[str, dict] = {}
 
@@ -333,11 +326,11 @@ class HubTestRuns(unittest.TestCase):
         clock = FakeClock()
         hub = FakeHubCv2()
         hub.clock = clock
-        hub.open_cost = 100.0  # every open takes 100 s on the fake clock
+        hub.open_cost = 100.0
         report = _run(hub, self.dir, rounds=3, clock=clock)
         keep = report["modes"]["sequential_keep_open"]
         summary = keep["summary"]
-        self.assertGreater(summary["round1_s"], 400)  # four opens in round 1
+        self.assertGreater(summary["round1_s"], 400)
         self.assertEqual(summary["round1_s"], keep["rounds"][0]["round_s"])
         later = [r["round_s"] for r in keep["rounds"][1:]]
         self.assertAlmostEqual(summary["later_round_s_mean"], sum(later) / len(later))
@@ -345,7 +338,7 @@ class HubTestRuns(unittest.TestCase):
 
     def test_operator_wait_for_keep_open_uses_rounds_two_and_later(self) -> None:
         clock = FakeClock()
-        hub = FakeHubCv2(overlap_fails=True)  # simultaneous fails, keep-open and A1 work
+        hub = FakeHubCv2(overlap_fails=True)
         hub.clock = clock
         hub.open_cost = 100.0
         out_path = Path(self.dir) / "r.json"

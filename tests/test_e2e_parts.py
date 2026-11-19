@@ -1,13 +1,3 @@
-"""End-to-end: the multi-part (parts.mode 'mes') flow over the real UI HTTP server.
-
-The MES is a fake http.server on 127.0.0.1 that answers the part search, part lookup,
-criteria and inspection-event routes. Cameras are FakeCameraSet frames. The model is a
-real approved golden model in a temporary ModelStore (cv2 decoding is patched out, as in
-tests/test_app.py), except the REVIEW test, which registers a marker loader so the score
-can be set exactly. Nothing touches the network beyond 127.0.0.1. The tokens are made-up
-strings generated inside this file and are passed to build_station() directly: no
-environment variable is read or written.
-"""
 from __future__ import annotations
 
 import contextlib
@@ -43,8 +33,8 @@ from station.outputs import RecordingOutputs
 
 OP = ("op-parts-e2e", "op-parts-pass-1")
 SUP = ("sup-parts-e2e", "sup-parts-pass-1")
-TOKEN_ENV = "VISION_TEST_PARTS_E2E_TOKEN"  # a name only: the token is passed in, not read
-PAST_MIN_FLIP = 2.5  # past the default min_flip_s (2.0 s) between the TOP and BOTTOM press
+TOKEN_ENV = "VISION_TEST_PARTS_E2E_TOKEN"
+PAST_MIN_FLIP = 2.5
 GOOD_MARKER = b"SCORE:0.05"
 
 PARTS = {
@@ -64,10 +54,9 @@ CRITERIA = {
 }
 
 
-# ------------------------------------------------------------------ fake MES
 
 class _FakeMesHandler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format, *args):  # noqa: A002 - keep test output quiet
+    def log_message(self, format, *args):
         pass
 
     def _send(self, status: int, payload) -> None:
@@ -123,7 +112,7 @@ class _FakeMesHandler(http.server.BaseHTTPRequestHandler):
             if not self._authorized():
                 status, payload = 401, {"error": "unauthorized"}
             elif key in srv.accepted:
-                status, payload = 200, {"id": srv.accepted[key]}  # replay of a stored key
+                status, payload = 200, {"id": srv.accepted[key]}
             else:
                 srv.next_id += 1
                 srv.accepted[key] = srv.next_id
@@ -160,7 +149,6 @@ class FakeMes(http.server.ThreadingHTTPServer):
 
 
 def parse_multipart(content_type: str, body: bytes) -> tuple[dict, dict]:
-    """Return (text fields, files) where files maps field name -> (filename, bytes)."""
     raw = b"Content-Type: " + content_type.encode("ascii") + b"\r\nMIME-Version: 1.0\r\n\r\n" + body
     msg = email.parser.BytesParser(policy=email.policy.default).parsebytes(raw)
     fields: dict[str, str] = {}
@@ -175,7 +163,6 @@ def parse_multipart(content_type: str, body: bytes) -> tuple[dict, dict]:
     return fields, files
 
 
-# ------------------------------------------------------------------ fakes for the station
 
 class FakeClock:
     def __init__(self) -> None:
@@ -186,7 +173,6 @@ class FakeClock:
 
 
 class SpyOutputs(RecordingOutputs):
-    """Records how many parts were already saved each time a GOOD light is lit."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -200,7 +186,6 @@ class SpyOutputs(RecordingOutputs):
 
 
 class ClosedCameras(FakeCameraSet):
-    """A camera set whose device is closed, as OpenCvCameraSet reports after a failed open."""
 
     @property
     def is_open(self) -> bool:
@@ -212,22 +197,20 @@ class ClosedCameras(FakeCameraSet):
 
 
 def good_bytes(camera_id: str, side: Side, n: int) -> bytes:
-    return bytes([100])  # the golden decoder reads one grey value: 100 is the good value
+    return bytes([100])
 
 
 def marker_loader(info, decode):
-    """Test loader for a 'marker' model type: lets a test set each image's score exactly."""
     return MarkerModel(version=info.version)
 
 
-# ------------------------------------------------------------------ tests
 
 class PartsFlowE2E(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="station-parts-e2e-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
-        self.token = "parts-e2e-token-" + secrets.token_hex(8)  # made up, per test run
+        self.token = "parts-e2e-token-" + secrets.token_hex(8)
         self.mes = FakeMes(self.token)
         self.addCleanup(self.mes.close)
 
@@ -241,7 +224,6 @@ class PartsFlowE2E(unittest.TestCase):
         self.models_dir = os.path.join(self.tmp, "models")
         os.makedirs(self.models_dir)
 
-        # A real golden model file, built from good frames of all four cameras.
         def decode(frame: Frame):
             return np.full((8, 8), float(frame.data[0]))
 
@@ -263,7 +245,6 @@ class PartsFlowE2E(unittest.TestCase):
         self.app = None
         self.port = None
 
-    # ---- helpers
 
     def approve(self, part_number: str, version: str, model_file: str,
                 model_type: str = "golden") -> None:
@@ -291,7 +272,7 @@ class PartsFlowE2E(unittest.TestCase):
                 "criteria_ids": ["CR-1", "CR-2"],
                 "class_to_criterion": {"scratch": "CR-1"},
                 "default_criterion_id": None,
-                "sync_interval_s": 3600,  # the tests call sync_once() themselves
+                "sync_interval_s": 3600,
                 "default_bad_disposition": "quarantine",
             },
             "cameras": {"kind": "fake"},
@@ -306,7 +287,6 @@ class PartsFlowE2E(unittest.TestCase):
         return marker + b" |" + camera_id.encode() + b"|" + side.value.encode() + b"|" + str(n).encode()
 
     def start(self, cameras=None) -> None:
-        """Build the station with the parts config, start the UI server and remember its port."""
         self.outputs.store = None
         self.app = build_station(
             self.config(),
@@ -344,11 +324,10 @@ class PartsFlowE2E(unittest.TestCase):
         return cookie.split(";", 1)[0].split("=", 1)[1]
 
     def press(self, token: str):
-        self.clock.now += 1.0  # past the 0.3 s debounce
+        self.clock.now += 1.0
         return self.req("POST", "/api/press", token=token)
 
     def press_part(self, token: str) -> None:
-        """TOP press, flip gap, BOTTOM press. Both must be accepted."""
         for gap in (1.0, PAST_MIN_FLIP):
             self.clock.now += gap
             status, body, _ = self.req("POST", "/api/press", token=token)
@@ -366,11 +345,9 @@ class PartsFlowE2E(unittest.TestCase):
         return [json.loads(row[0]) for row in rows]
 
     def selections(self) -> list[dict]:
-        """The app-level 'part_selected' events (they carry 'by'). The session logs its own too."""
         return [e for e in self.events("part_selected") if "by" in e]
 
     def saved_parts(self) -> list[dict]:
-        """Saved parts, oldest first."""
         return list(reversed(self.app.store.recent_parts(50)))
 
     def posted(self) -> list[dict]:
@@ -387,7 +364,6 @@ class PartsFlowE2E(unittest.TestCase):
                     with open(os.path.join(dirpath, name), "rb") as fh:
                         self.assertNotIn(self.token.encode(), fh.read(), name)
 
-    # ---- tests
 
     def test_full_flow_two_parts_each_with_its_own_model_and_criteria(self) -> None:
         self.approve_golden("PN-A", "2026-10-24-a")
@@ -395,7 +371,6 @@ class PartsFlowE2E(unittest.TestCase):
         self.start(FakeCameraSet(frame_bytes=good_bytes))
         op = self.login(OP)
 
-        # Identity fields only from the search.
         status, body, _ = self.req("GET", "/api/parts/search?q=PN", token=op)
         self.assertEqual(status, 200)
         self.assertEqual(len(body["results"]), 2)
@@ -403,13 +378,11 @@ class PartsFlowE2E(unittest.TestCase):
             self.assertEqual(set(row), {"part_number", "description", "part_type", "lifecycle"})
         self.assertNotIn("unit_cost", json.dumps(body))
 
-        # A press with no part is ignored and changes nothing.
         status, body, _ = self.press(op)
         self.assertEqual((status, body), (200, {"accepted": False}))
         self.assertEqual(self.state(op)["state"], "IDLE")
         self.assertEqual(self.app.store.recent_parts(5), [])
 
-        # Select part A: the snapshot shows it inspectable with its approved version.
         status, body, _ = self.req("POST", "/api/part/select", {"part_number": "PN-A"}, token=op)
         self.assertEqual(status, 200, body)
         self.assertEqual(body["model_version"], "2026-10-24-a")
@@ -419,14 +392,12 @@ class PartsFlowE2E(unittest.TestCase):
         self.assertEqual(st["model_version"], "2026-10-24-a")
         self.assertEqual(st["part_number"], "PN-A")
 
-        # A full GOOD inspection of part A.
         self.press_part(op)
         st = self.state(op)
         self.assertEqual(st["state"], "IDLE")
         self.assertEqual(st["verdict"], "GOOD")
         self.assertEqual(st["counters"], {"total": 1, "good": 1, "bad": 0})
 
-        # The record was on disk before the green light came on.
         self.assertEqual(self.outputs.saved_at_green, [1])
         self.assertTrue(self.outputs.green)
 
@@ -453,7 +424,6 @@ class PartsFlowE2E(unittest.TestCase):
                          {"CR-1": "pass", "CR-2": "pass"})
         self.assertEqual(post_a["files"], {})
 
-        # Switch to part B (its own approved version) and inspect it.
         status, body, _ = self.req("POST", "/api/part/select", {"part_number": "PN-B"}, token=op)
         self.assertEqual(status, 200, body)
         self.assertEqual(body["model_version"], "2026-10-24-b")
@@ -485,11 +455,11 @@ class PartsFlowE2E(unittest.TestCase):
                 for path, _auth in self.mes.gets if path.startswith("/api/machine/criteria/")]
 
     def test_part_without_an_approved_model_is_blocked_and_press_stays_refused(self) -> None:
-        self.start(FakeCameraSet(frame_bytes=good_bytes))  # no model is approved for PN-A
+        self.start(FakeCameraSet(frame_bytes=good_bytes))
         op = self.login(OP)
 
         status, body, _ = self.req("POST", "/api/part/select", {"part_number": "PN-A"}, token=op)
-        self.assertEqual(status, 200, body)  # a block is not an error
+        self.assertEqual(status, 200, body)
         self.assertIs(body["can_inspect"], False)
         self.assertEqual(body["reason"], "No approved model for part PN-A. Ask Quality to approve one.")
         self.assertNotIn("model_version", body)
@@ -507,7 +477,7 @@ class PartsFlowE2E(unittest.TestCase):
 
     def test_tampered_approved_model_blocks_the_part_with_no_fallback(self) -> None:
         self.approve_golden("PN-A", "2026-10-24-a")
-        self.approve_golden("PN-A", "2026-10-24-b")  # the current approved version
+        self.approve_golden("PN-A", "2026-10-24-b")
         tampered = os.path.join(self.models_dir, safe_part("PN-A"), "2026-10-24-b", "golden.npz")
         with open(tampered, "ab") as fh:
             fh.write(b"tampered")
@@ -519,7 +489,7 @@ class PartsFlowE2E(unittest.TestCase):
         self.assertIs(body["can_inspect"], False)
         self.assertIn("is not usable", body["reason"])
         self.assertIn("sha256", body["reason"])
-        self.assertNotIn("model_version", body)  # the older 2026-10-24-a is not used instead
+        self.assertNotIn("model_version", body)
         self.assertNotIn("2026-10-24-a", json.dumps(body))
 
         st = self.state(op)
@@ -536,7 +506,7 @@ class PartsFlowE2E(unittest.TestCase):
 
         status, body, _ = self.req("POST", "/api/part/select", {"part_number": "PN-A"}, token=op)
         self.assertEqual(status, 200, body)
-        self.assertEqual(self.press(op)[1], {"accepted": True})  # TOP: now WAIT_FLIP
+        self.assertEqual(self.press(op)[1], {"accepted": True})
         self.assertEqual(self.state(op)["state"], "WAIT_FLIP")
 
         status, body, _ = self.req("POST", "/api/part/select", {"part_number": "PN-B"}, token=op)
@@ -550,9 +520,6 @@ class PartsFlowE2E(unittest.TestCase):
         self.assertEqual([e["part_number"] for e in self.selections()], ["PN-A"])
 
     def test_viewer_cannot_select_and_no_cookie_is_401(self) -> None:
-        # The station has no 'viewer' role (auth.ROLES is operator, supervisor, admin). A
-        # role that may not select is simulated by removing select_part from the operator's
-        # policy, as tests/test_ui.py does.
         self.approve_golden("PN-A", "2026-10-24-a")
         self.start(FakeCameraSet(frame_bytes=good_bytes))
         op = self.login(OP)
@@ -563,7 +530,6 @@ class PartsFlowE2E(unittest.TestCase):
         self.assertEqual(self.app.session.part_number, "")
         self.assertEqual(self.selections(), [])
 
-        # No session cookie: 401 for the part routes and nothing reaches the MES.
         status, _, _ = self.req("POST", "/api/part/select", {"part_number": "PN-A"})
         self.assertEqual(status, 401)
         status, _, _ = self.req("GET", "/api/parts/search?q=PN")
@@ -575,8 +541,6 @@ class PartsFlowE2E(unittest.TestCase):
         self.assertEqual([path for path, _ in self.mes.gets if "/criteria/" in path], [])
 
     def test_review_outcome_is_never_green_and_never_posted_in_parts_mode(self) -> None:
-        # The marker loader lets this part score 0.6 on one BOTTOM image: between t_low (0.5)
-        # and t_img (0.8), so the verdict is REVIEW.
         self.markers[("C3", "BOTTOM")] = b"SCORE:0.6"
         marker_file = os.path.join(self.tmp, "marker.bin")
         with open(marker_file, "wb") as fh:
@@ -597,7 +561,7 @@ class PartsFlowE2E(unittest.TestCase):
         self.assertFalse(self.outputs.green)
         self.assertTrue(self.outputs.amber)
         self.assertNotIn("show_good", self.outputs.history)
-        self.assertEqual(self.app.store.recent_parts(5), [])  # nothing saved yet
+        self.assertEqual(self.app.store.recent_parts(5), [])
 
         self.assertEqual(self.app.sync_once(), {"sent": 0, "failed_permanent": 0, "retry_later": 0})
         self.assertEqual(self.app.outbox.pending_count(), 0)

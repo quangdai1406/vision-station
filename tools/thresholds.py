@@ -1,24 +1,3 @@
-"""Candidate thresholds (t_low, t_img) from labelled model scores.
-
-Standard library only. Input CSV: columns label (good|bad), score (0.0..1.0,
-higher = more defective), optional defect_class and part_id.
-
-Decision rule (station/contracts.py):
-    score >= t_img            -> BAD
-    t_low <= score < t_img    -> REVIEW
-    otherwise                 -> GOOD
-
-Every number here is computed from the labelled samples given. Nothing is an
-approved threshold: Quality approves the values and confirms the sample counts.
-
-CLI:
-    python -m tools.thresholds scores.csv --min-good N --min-bad N \
-        --review-from-good-percentile P [--model-version V] [--out report.md] [--json out.json] \
-        [--evaluate-t-img VALUE]
-
---evaluate-t-img evaluates a threshold Quality has chosen (recall, escapes and false rejects
-with Wilson intervals). It does not recommend a value.
-"""
 from __future__ import annotations
 
 import argparse
@@ -42,17 +21,11 @@ UNSPECIFIED_CLASS = "(unspecified)"
 
 
 class ThresholdInputError(ValueError):
-    """The scores file or an argument is unusable."""
+    pass
 
 
-# ---------------------------------------------------------------- input
 
 def load_scores(path) -> list[dict]:
-    """Read the labelled scores CSV.
-
-    Returns one dict per row: {"label": "good"|"bad", "score": float,
-    "defect_class": str|None, "part_id": str|None}.
-    """
     p = Path(path)
     try:
         text = p.read_text(encoding="utf-8-sig")
@@ -115,10 +88,8 @@ def load_scores(path) -> list[dict]:
     return rows
 
 
-# ---------------------------------------------------------- statistics
 
 def wilson_interval(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
-    """Wilson score interval for a proportion k/n. n == 0 gives (0.0, 1.0)."""
     if n < 0 or k < 0 or k > n:
         raise ValueError(f"need 0 <= k <= n, got k={k} n={n}")
     if n == 0:
@@ -132,17 +103,12 @@ def wilson_interval(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
 
 
 def rule_of_three_upper(n: int) -> float:
-    """95% upper bound on a rate after 0 events in n trials: 3/n.
-
-    Capped at 1.0 (a rate cannot exceed 1); n <= 0 returns 1.0.
-    """
     if n <= 0:
         return 1.0
     return min(1.0, 3.0 / n)
 
 
 def nearest_rank_percentile(values: Sequence[float], percentile: float) -> float:
-    """Nearest-rank percentile (0..100) of a non-empty sequence."""
     if not values:
         raise ValueError("percentile of an empty sequence")
     if not 0.0 <= percentile <= 100.0:
@@ -154,26 +120,14 @@ def nearest_rank_percentile(values: Sequence[float], percentile: float) -> float
 
 
 def t_low_candidate(good_scores: Sequence[float], percentile: float, t_img: float) -> tuple[float, bool]:
-    """Percentile of good scores, never above t_img.
-
-    Returns (value, capped). capped is True when the percentile was above t_img
-    and the value was set equal to t_img.
-    """
     raw = nearest_rank_percentile(good_scores, percentile)
     if raw > t_img:
         return (t_img, True)
     return (raw, False)
 
 
-# ------------------------------------------------------- candidate table
 
 def candidate_table(good: Sequence[float], bad: Sequence[float]) -> list[dict]:
-    """One row per candidate threshold, sorted ascending.
-
-    Candidates: 0.0, every observed distinct score, and a value just above the
-    maximum (the last row, where nothing is BAD). Escape: bad with score <
-    threshold. False reject: good with score >= threshold.
-    """
     good_sorted = sorted(float(s) for s in good)
     bad_sorted = sorted(float(s) for s in bad)
     n_good, n_bad = len(good_sorted), len(bad_sorted)
@@ -205,7 +159,6 @@ def candidate_table(good: Sequence[float], bad: Sequence[float]) -> list[dict]:
 
 
 def _count_below(sorted_values: Sequence[float], t: float) -> int:
-    """Number of values strictly below t in an ascending list."""
     lo, hi = 0, len(sorted_values)
     while lo < hi:
         mid = (lo + hi) // 2
@@ -217,7 +170,6 @@ def _count_below(sorted_values: Sequence[float], t: float) -> int:
 
 
 def _window(table: list[dict], lo: float, hi: float) -> list[dict]:
-    """Table rows with lo <= threshold <= hi, plus one neighbour on each side."""
     if not table:
         return []
     thresholds = [r["threshold"] for r in table]
@@ -229,11 +181,6 @@ def _window(table: list[dict], lo: float, hi: float) -> list[dict]:
 
 
 def per_class_counts(bad_rows: Sequence[dict]) -> list[dict]:
-    """Per defect class: n bad parts and the rule-of-three bound on the miss rate.
-
-    Recall is not computed here: at t_img = min(bad) it is 100% by construction.
-    Rows without a class are grouped as '(unspecified)'. Sorted by class name.
-    """
     counts: dict[str, int] = {}
     for r in bad_rows:
         key = r.get("defect_class") or UNSPECIFIED_CLASS
@@ -249,11 +196,6 @@ def per_class_counts(bad_rows: Sequence[dict]) -> list[dict]:
 
 
 def evaluate_threshold(good_scores: Sequence[float], bad_rows: Sequence[dict], t_img: float) -> dict:
-    """Recall, escapes and false rejects at a given t_img, with Wilson 95% intervals.
-
-    Escape: bad with score < t_img. False reject: good with score >= t_img.
-    Per-class figures are included only when the bad rows carry defect_class values.
-    """
     g = [float(s) for s in good_scores]
     n_good = len(g)
     false_rejects = sum(1 for s in g if s >= t_img)
@@ -305,9 +247,6 @@ def evaluate_threshold(good_scores: Sequence[float], bad_rows: Sequence[dict], t
 
 
 def per_class_recall(bad_rows: Sequence[dict], t_img: float) -> list[dict]:
-    """Per defect class: n bad parts, how many score >= t_img, recall, and the
-    rule-of-three bound on the miss rate. Rows without a class are grouped as
-    '(unspecified)'. Sorted by class name."""
     groups: dict[str, list[float]] = {}
     for r in bad_rows:
         key = r.get("defect_class") or UNSPECIFIED_CLASS
@@ -342,7 +281,6 @@ def _verdict_counts(scores: Sequence[float], t_low: float, t_img: float) -> dict
     return counts
 
 
-# ------------------------------------------------------------ suggest
 
 def _attach_evaluation(result: dict, good_scores, bad_rows, t_img) -> dict:
     if t_img is not None:
@@ -351,20 +289,11 @@ def _attach_evaluation(result: dict, good_scores, bad_rows, t_img) -> dict:
 
 
 def suggest(good, bad, *, min_good, min_bad, review_from_good_percentile, t_img=None) -> dict:
-    """Candidate thresholds from labelled rows.
-
-    good and bad are lists of row dicts as returned by load_scores().
-    min_good, min_bad and review_from_good_percentile are required keyword
-    arguments: they are Quality's decisions and have no defaults here.
-    t_img (optional, float 0..1) is a threshold Quality has chosen. When given,
-    the result also carries 'evaluation': recall, escapes and false rejects at that
-    value. It is an evaluation, not a recommendation. Refused results have no evaluation.
-    """
     if not isinstance(min_good, int) or not isinstance(min_bad, int) or min_good < 0 or min_bad < 0:
         raise ValueError("min_good and min_bad must be non-negative integers")
     if not 0.0 <= review_from_good_percentile <= 100.0:
         raise ValueError("review_from_good_percentile must be 0..100")
-    chosen = None  # Quality's t_img to evaluate; kept apart from the candidate t_img below.
+    chosen = None
     if t_img is not None:
         if isinstance(t_img, bool) or not isinstance(t_img, (int, float)) or not 0.0 <= float(t_img) <= 1.0:
             raise ValueError(f"t_img must be a number 0..1, got {t_img!r}")
@@ -429,7 +358,6 @@ def suggest(good, bad, *, min_good, min_bad, review_from_good_percentile, t_img=
         }
         return _attach_evaluation(result, g_scores, bad, chosen)
 
-    # Separable: t_img is the largest value that still catches every labelled bad part.
     t_img = lowest_bad
     t_low, capped = t_low_candidate(g_scores, review_from_good_percentile, t_img)
     at = next(r for r in table if r["threshold"] == t_img)
@@ -467,7 +395,6 @@ def suggest(good, bad, *, min_good, min_bad, review_from_good_percentile, t_img=
     return _attach_evaluation(result, g_scores, bad, chosen)
 
 
-# ------------------------------------------------------------- report
 
 LIMITS = [
     "The samples may not represent future production (other lots, operators, lighting, fixtures or part mix).",
@@ -518,7 +445,6 @@ PER_CLASS_COUNTS_LABEL = (
 
 
 def _evaluation_lines(ev: dict) -> list[str]:
-    """Markdown for evaluate_threshold() output: a chosen threshold, not a recommendation."""
     b, g = ev["bad"], ev["good"]
     lines = [
         "## Evaluation of a chosen threshold",
@@ -560,7 +486,6 @@ def _evaluation_lines(ev: dict) -> list[str]:
 
 
 def render_report(result: dict, *, source, model_version: Optional[str], n_rows: int) -> str:
-    """Markdown report for one suggest() result."""
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     counts = result["counts"]
     lines = [
@@ -665,7 +590,6 @@ def render_report(result: dict, *, source, model_version: Optional[str], n_rows:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------- CLI
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(

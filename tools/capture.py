@@ -1,17 +1,3 @@
-"""Real-webcam capture for the repeatability study. Run on the user's Windows PC.
-
-    python -m tools.capture --mode stationary --devices 0 --out sessions --name NAME
-    python -m tools.capture --list-devices [--max-index N] [--backend dshow|default]
-
-Writes the session folder described in tools/FORMAT.md. cv2 and numpy are
-imported lazily; a cv2 module can be injected (the tests do this).
-
-The exposure response check is a 'did the picture respond at all' check, NOT a
-quality threshold. It compares mean gray levels against an engineering epsilon of
-1.0 gray level (RESPONSE_EPS_GRAY). It can read as responsive under mains flicker
-or auto-drift, and as unresponsive in a saturated or black scene. Before trusting
-it, check that the scene is mid-grey and that the light is steady.
-"""
 from __future__ import annotations
 
 import argparse
@@ -32,15 +18,11 @@ MODES = ("stationary", "placement")
 DEFAULT_COUNT = {"stationary": 50, "placement": 30}
 PLACEMENT_PROMPT = "Remove the part, put it back in the fixture, then press Enter"
 INSTALL_HINT = "pip install opencv-python numpy"
-# V4L2: 0.25 is manual, 0.75 is auto. DirectShow may use 1 for manual instead.
 MANUAL_EXPOSURE_CANDIDATES = (0.25, 1.0)
 AUTOFOCUS_OFF = 0.0
 AUTO_WB_OFF = 0.0
-# Engineering setting, not a threshold: frames grabbed and discarded before each
-# real capture so that stale frames queued by the driver are not used. 0 disables.
 DEFAULT_FLUSH_FRAMES = 5
 BUFFERSIZE_WANTED = 1.0
-# Exposure response check: did the picture respond at all? NOT a quality threshold.
 RESPONSE_FRAMES = 3
 RESPONSE_EPS_GRAY = 1.0
 ECHO_NOTE = "DirectShow read-back can echo the value you set"
@@ -55,16 +37,11 @@ RESTORE_NOTE_FMT = (
     "exposure: restoring the requested value {requested:g} did not take (read back {readback}); "
     "later frames may keep the changed exposure"
 )
-# Engineering setting, not a threshold: how many camera indexes --list-devices probes (0..N).
 DEFAULT_MAX_INDEX = 5
-# Brightness settle check, after the timed warm-up and before the first recorded frame.
-# Engineering settings, NOT quality thresholds. The tolerance is a 'did it stop changing'
-# epsilon in gray levels, the same kind of epsilon as RESPONSE_EPS_GRAY.
 DEFAULT_SETTLE_MAX_S = 30.0
 DEFAULT_SETTLE_FRAMES = 5
 DEFAULT_SETTLE_TOL_GRAY = 1.0
 SETTLE_INTERVAL_S = 0.2
-# Engineering hint only: a first recorded frame this far (fraction of the median) off the median.
 SETTLE_HINT_FRACTION = 0.10
 SETTLE_WARNING_FMT = (
     "brightness had not settled after {max_s:g} s (last frame means: {means}); the first frames "
@@ -90,11 +67,11 @@ _REL_TOL = 0.02
 
 
 class CaptureError(RuntimeError):
-    """A camera could not be opened, configured, grabbed or retrieved."""
+    pass
 
 
 class SessionNameError(CaptureError, ValueError):
-    """A session name Windows cannot use as a folder name. The CLI exits with 2."""
+    pass
 
 
 @dataclass
@@ -115,7 +92,7 @@ class _Settings:
 class _DeviceLog:
     grays: list = field(default_factory=list)
     stamps: list = field(default_factory=list)
-    stats: list = field(default_factory=list)  # (mean, laplacian_var) per frame
+    stats: list = field(default_factory=list)
 
 
 def utc_now_iso() -> str:
@@ -128,7 +105,7 @@ def _is_windows() -> bool:
 
 def _import_numpy() -> Any:
     try:
-        import numpy  # noqa: PLC0415 - lazy on purpose
+        import numpy
     except ImportError as exc:
         raise ToolDependencyError(
             f"numpy is needed for capture. Install it with: {INSTALL_HINT}"
@@ -138,7 +115,7 @@ def _import_numpy() -> Any:
 
 def _import_cv2() -> Any:
     try:
-        import cv2  # noqa: PLC0415 - lazy on purpose
+        import cv2
     except ImportError as exc:
         raise ToolDependencyError(
             f"OpenCV is needed for capture. Install it with: {INSTALL_HINT}"
@@ -147,7 +124,6 @@ def _import_cv2() -> Any:
 
 
 def _check_session_name(name: str) -> None:
-    """Reject names Windows cannot use as a folder name, saying what to change."""
     hint = "use letters, digits, '-' or '_' instead"
     if not name.strip():
         raise SessionNameError("session name is empty; give the session a short name such as line1-run2")
@@ -198,18 +174,14 @@ def _open_device(cv2: Any, dev: int, api: Any) -> Any:
 
 
 def _configure(cv2: Any, np: Any, dev: int, cap: Any, s: _Settings) -> dict:
-    """Set buffer size, format, then manual controls, then read everything back."""
-    call = lambda fn, *args: _safe(dev, fn, *args)  # noqa: E731
+    call = lambda fn, *args: _safe(dev, fn, *args)
 
-    # Small driver queue so grab() returns fresher frames. Best effort: a refused
-    # set is visible in the read-back below, so it is not raised here.
     buffersize_readback: Optional[float] = None
     with contextlib.suppress(Exception):
         cap.set(cv2.CAP_PROP_BUFFERSIZE, BUFFERSIZE_WANTED)
     with contextlib.suppress(Exception):
         buffersize_readback = float(cap.get(cv2.CAP_PROP_BUFFERSIZE))
 
-    # Format first: MJPG must be set before width/height/fps for 2K on USB webcams.
     if s.fourcc:
         call(cap.set, cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*s.fourcc))
     call(cap.set, cv2.CAP_PROP_FRAME_WIDTH, s.width)
@@ -217,7 +189,6 @@ def _configure(cv2: Any, np: Any, dev: int, cap: Any, s: _Settings) -> dict:
     if s.fps is not None:
         call(cap.set, cv2.CAP_PROP_FPS, s.fps)
 
-    # Then manual mode. Every auto-exposure candidate is recorded with its read-back.
     call(cap.set, cv2.CAP_PROP_AUTOFOCUS, AUTOFOCUS_OFF)
     chosen_exposure: Optional[float] = None
     attempts: list[dict] = []
@@ -353,7 +324,6 @@ def _retrieve(dev: int, cap: Any) -> Any:
 
 
 def _flush(caps: list, n: int) -> None:
-    """Grab and discard n frames from every device, so the next grab is fresh."""
     for dev, cap in caps:
         for _ in range(n):
             _grab(dev, cap)
@@ -383,7 +353,6 @@ def _frame_stats(np: Any, gray: Any) -> tuple[float, float]:
 
 
 def _mean_after_flush(np: Any, cv2: Any, dev: int, cap: Any, flush_frames: int) -> float:
-    """Mean gray level of a few fresh frames, after discarding stale ones."""
     _flush([(dev, cap)], flush_frames)
     means = []
     for _ in range(RESPONSE_FRAMES):
@@ -394,7 +363,6 @@ def _mean_after_flush(np: Any, cv2: Any, dev: int, cap: Any, flush_frames: int) 
 
 
 def _restore_exposure(cv2: Any, dev: int, cap: Any, requested: float, flush_frames: int) -> dict:
-    """Put the requested exposure back, read it back, then discard stale frames."""
     readback: Optional[float] = None
     restore_ok = False
     try:
@@ -402,18 +370,13 @@ def _restore_exposure(cv2: Any, dev: int, cap: Any, requested: float, flush_fram
         readback = float(cap.get(cv2.CAP_PROP_EXPOSURE))
         restore_ok = _value_ok(readback, requested)
     except Exception:
-        readback = None  # the driver refused the call: reported as not taken
+        readback = None
     _flush([(dev, cap)], flush_frames)
     return {"restored_to": requested, "restore_readback": readback, "restore_ok": restore_ok}
 
 
 def _exposure_response(np: Any, cv2: Any, dev: int, cap: Any, s: _Settings) -> tuple[bool, dict]:
-    """Change exposure and see whether the picture moves at all. Not a quality check.
-
-    Uses requested*2 if the driver reads it back, else requested/2. The requested
-    value is restored in a finally block, so it is restored even if a grab fails.
-    """
-    call = lambda fn, *args: _safe(dev, fn, *args)  # noqa: E731
+    call = lambda fn, *args: _safe(dev, fn, *args)
     requested = float(s.exposure)
     primary, fallback = (requested * 2, requested / 2) if requested != 0 else (1.0, -1.0)
     alt = primary
@@ -448,7 +411,6 @@ def _warm_up(caps: list, warmup_s: float, clock: Callable[[], float]) -> None:
 
 
 def _window_settled(means: list, frames: int, tol: float) -> bool:
-    """True when the last `frames` means differ from each other by at most `tol` gray levels."""
     if len(means) < frames:
         return False
     window = means[-frames:]
@@ -471,19 +433,10 @@ def _settle_record(*, checked: bool, settled: bool, seconds: float, frames_used:
 
 def _settle(np: Any, cv2: Any, caps: list, cameras: dict, *, max_s: float, frames: int,
             tol: float, clock: Callable[[], float], sleep: Callable[[float], Any]) -> None:
-    """Wait until each camera's brightness stops changing, then record cameras[dev]["settle"].
-
-    Grabs and retrieves every camera about every SETTLE_INTERVAL_S seconds. A camera has
-    settled when the means of its last `frames` frames differ by at most `tol` gray levels.
-    Stops when every camera has settled or `max_s` seconds have passed. These frames are
-    discarded, not recorded. The record is written even when a grab fails.
-    """
     means: dict[int, list] = {dev: [] for dev, _ in caps}
     settled_at: dict[int, float] = {}
     start = clock()
     elapsed = 0.0
-    # Hard cap on passes so a wall-clock that jumps backwards (or a stuck test clock)
-    # can never keep this loop running: max_s / interval, plus a few spare passes.
     max_passes = int(max_s / SETTLE_INTERVAL_S) + max(frames, 1) + 5
     passes = 0
     try:
@@ -521,7 +474,6 @@ def _settle(np: Any, cv2: Any, caps: list, cameras: dict, *, max_s: float, frame
 
 
 def _first_frame_hints(np: Any, devices: list, logs: dict) -> list[str]:
-    """Engineering hint only: a first recorded frame more than 10 % off the median of the frames."""
     hints: list[str] = []
     for dev in devices:
         means = [mean for mean, _ in logs[dev].stats]
@@ -554,8 +506,6 @@ def _capture_round(
     folder: Path,
     clock: Callable[[], float],
 ) -> None:
-    """Grab every device first (close in time), then retrieve, then record."""
-    # Stamps are taken at grab time (when grab() returns), not at exposure time.
     stamps: dict[int, float] = {}
     for dev, cap in caps:
         _grab(dev, cap)
@@ -692,14 +642,6 @@ def capture_session(
     sleep: Callable[[float], Any] = time.sleep,
     out: Callable[[str], Any] = print,
 ) -> dict:
-    """Capture one session and write its folder. Returns a summary dict.
-
-    Raises ValueError for bad arguments (SessionNameError, a ValueError, for a
-    bad session name), ToolDependencyError when numpy or cv2 is missing, and
-    CaptureError when the folder exists, cannot be created, or the cameras
-    cannot be opened. A failure during capture does not raise: the partial
-    data is kept and summary["aborted"] holds the reason.
-    """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
     devices = [int(d) for d in devices]
@@ -758,7 +700,7 @@ def capture_session(
         (folder / "samples").mkdir()
     except OSError as exc:
         with contextlib.suppress(OSError):
-            folder.rmdir()  # leave no half-made folder behind
+            folder.rmdir()
         raise CaptureError(
             f"could not create session folder {folder}: {exc.strerror or exc}. "
             "Check that the parent folder exists and is writable, or choose another --out"
@@ -850,12 +792,6 @@ def list_devices(
     cv2_module: Any = None,
     out: Callable[[str], Any] = print,
 ) -> list[dict]:
-    """Probe camera indexes 0..max_index and report those that open and deliver a frame.
-
-    Every camera that was opened is released again. Returns one dict per camera
-    found: index, width, height, not_black. Raises ValueError for bad arguments and
-    ToolDependencyError when numpy or cv2 is missing.
-    """
     if max_index < 0:
         raise ValueError("max-index must be 0 or more")
     if backend not in (None, "dshow", "default"):
@@ -876,7 +812,7 @@ def list_devices(
             if not cap.isOpened():
                 continue
             try:
-                _flush([(index, cap)], DEFAULT_FLUSH_FRAMES)  # let the camera settle
+                _flush([(index, cap)], DEFAULT_FLUSH_FRAMES)
                 _grab(index, cap)
                 image = _retrieve(index, cap)
             except CaptureError:

@@ -1,15 +1,3 @@
-"""End-to-end: the ONE-CAMERA proof-of-concept station through the real stack.
-
-Real StationApp, session, storage, outbox, MES client and UI HTTP server. Injected:
-the cameras (FakeCameraSet, whose frame bytes are small grey images) and the model
-(a GoldenModel built with GoldenBuilder and a fake decode function). The MES is a
-fake http.server on 127.0.0.1. Nothing touches the network beyond 127.0.0.1 and
-there are no real sleeps.
-
-The thresholds (t_low 0.5, t_img 0.8), the golden settings and the image sizes
-in this file exist only to exercise the flow. They have no quality meaning.
-Quality owns the real thresholds.
-"""
 from __future__ import annotations
 
 import contextlib
@@ -25,7 +13,7 @@ import unittest
 
 try:
     import numpy as np
-except ImportError:  # the proof-of-concept flow needs numpy (golden model); skip without it
+except ImportError:
     np = None
 
 from station.app import build_station
@@ -42,18 +30,16 @@ TOKEN = "poc-e2e-test-token-not-a-real-secret"
 OPERATOR = ("operator1", "operator-pass-1")
 SUPERVISOR = ("supervisor1", "supervisor-pass-1")
 
-DEFECT_CLASS = "difference_from_golden"  # the class GoldenModel reports
+DEFECT_CLASS = "difference_from_golden"
 MODEL_VERSION = "poc-golden-1"
 H, W = 40, 60
 BLOB_X, BLOB_Y, BLOB_W, BLOB_H = 20, 10, 8, 8
 BLOB_BOX = (BLOB_X, BLOB_Y, BLOB_W, BLOB_H)
-GOLDEN_FRAMES = 5  # good frames per (C1, side) used to learn the golden image
+GOLDEN_FRAMES = 5
 
 
-# ------------------------------------------------------------ image helpers
 
 def image_bytes(seed: int, blob: bool = False) -> bytes:
-    """A flat grey 40x60 image (128) with +-1 noise, optionally with a bright 8x8 blob."""
     rng = np.random.default_rng(seed)
     img = (128 + rng.integers(-1, 2, size=(H, W))).astype(np.uint8)
     if blob:
@@ -62,7 +48,6 @@ def image_bytes(seed: int, blob: bool = False) -> bytes:
 
 
 def decode_frame(frame: Frame) -> np.ndarray:
-    """Fake decode: the frame bytes are the raw 40x60 grey image."""
     if len(frame.data) != H * W:
         raise StationError(f"test frame has {len(frame.data)} bytes, expected {H * W}")
     return np.frombuffer(frame.data, dtype=np.uint8).reshape(H, W).astype(np.float64)
@@ -85,7 +70,6 @@ def _overlap_area(a, b) -> int:
     return max(0, w) * max(0, h)
 
 
-# ------------------------------------------------------------ harness
 
 @unittest.skipIf(np is None, "numpy not installed")
 class _Harness(unittest.TestCase):
@@ -107,7 +91,7 @@ class _Harness(unittest.TestCase):
                 SUPERVISOR[0]: {"password_hash": hash_password(SUPERVISOR[1]), "role": "supervisor"},
             }, fh)
 
-        self.blobs: set[tuple[str, str]] = set()  # (camera_id, side value) that get a blob
+        self.blobs: set[tuple[str, str]] = set()
         self.clock = FakeClock()
         self.outputs = RecordingOutputs()
 
@@ -124,7 +108,6 @@ class _Harness(unittest.TestCase):
             "site": "SITE1", "line": "L1", "station_id": "VIS-POC-1", "part_number": "PN-100",
             "lot": "LOT-7", "operator": "operator1", "supervisor": "supervisor1",
             "material_handler": "mh1",
-            # Test values: they only exercise the flow. They have no quality meaning.
             "thresholds": {"t_low": 0.5, "t_img": 0.8},
             "data_dir": os.path.join(self.tmp, "data"),
             "users_file": self.users_file,
@@ -135,7 +118,7 @@ class _Harness(unittest.TestCase):
                 "criteria_ids": ["CR-1", "CR-2"],
                 "class_to_criterion": {DEFECT_CLASS: "CR-1"},
                 "default_criterion_id": None,
-                "sync_interval_s": 3600,  # the tests call sync_once() themselves
+                "sync_interval_s": 3600,
                 "default_bad_disposition": "quarantine",
                 "allow_partial_cameras": allow_partial,
             },
@@ -156,7 +139,6 @@ class _Harness(unittest.TestCase):
         return app
 
     def one_camera(self, *, allow_partial: bool):
-        """A 1-camera station. The model is injected; the config model block is only validated."""
         cfg = self.config(
             allow_partial=allow_partial,
             cameras={"kind": "fake", "camera_count": 1},
@@ -165,9 +147,7 @@ class _Harness(unittest.TestCase):
         cameras = FakeCameraSet(frame_bytes=self._frame_bytes, camera_ids=("C1",))
         return self.start(cfg, cameras=cameras, model=build_golden_model())
 
-    # helpers
     def press_part(self) -> None:
-        """TOP press, flip gap, BOTTOM press (module press_part)."""
         press_part(self.ui, self.op, self.clock)
 
     def state(self) -> dict:
@@ -211,12 +191,10 @@ class _Harness(unittest.TestCase):
             conn.close()
 
 
-# ------------------------------------------------------------ one camera
 
 @unittest.skipIf(np is None, "numpy not installed")
 class OneCameraPocE2E(_Harness):
 
-    # 1. GOOD
     def test_good_part_is_saved_and_shows_green(self) -> None:
         self.one_camera(allow_partial=False)
         self.press_part()
@@ -240,12 +218,10 @@ class OneCameraPocE2E(_Harness):
         self.assertEqual(doc["final_verdict"], "GOOD")
         self.assertEqual(self.app.store.verify_part(part_dir), [])
 
-        # The supervisor sees the same station state.
         status, body, _ = self.ui.req("GET", "/api/state", token=self.sup)
         self.assertEqual(status, 200, body)
         self.assertEqual(body["verdict"], "GOOD")
 
-    # 2. BAD
     def test_bad_part_stays_red_until_ack_and_keeps_the_defect_box(self) -> None:
         self.one_camera(allow_partial=False)
         self.blobs.add(("C1", "TOP"))
@@ -254,7 +230,7 @@ class OneCameraPocE2E(_Harness):
         st = self.state()
         self.assertEqual(st["state"], "VERDICT")
         self.assertEqual(st["verdict"], "BAD")
-        self.assertEqual(st["counters"]["total"], 0)  # not counted until acknowledged
+        self.assertEqual(st["counters"]["total"], 0)
         self.assertTrue(self.outputs.red)
         self.assertTrue(self.outputs.alarm)
         self.assertFalse(self.outputs.green)
@@ -281,11 +257,10 @@ class OneCameraPocE2E(_Harness):
         bottom_doc = next(i for i in doc["images"] if i["camera_id"] == "C1" and i["side"] == "BOTTOM")
         self.assertTrue(top_doc["defects"])
         box = tuple(top_doc["defects"][0]["box"])
-        self.assertGreater(_overlap_area(box, BLOB_BOX), 0)  # in original pixel coordinates
-        self.assertEqual(box, BLOB_BOX)  # block factor 1 for a 60-pixel-wide image
+        self.assertGreater(_overlap_area(box, BLOB_BOX), 0)
+        self.assertEqual(box, BLOB_BOX)
         self.assertEqual(bottom_doc["defects"], [])
 
-    # 3a. MES safety: a partial station sends nothing, even with a token
     def test_partial_station_sends_nothing_to_mes_even_with_a_token(self) -> None:
         self.one_camera(allow_partial=False)
         self.blobs.add(("C1", "TOP"))
@@ -302,7 +277,6 @@ class OneCameraPocE2E(_Harness):
         self.assertTrue(any("partial station" in r for r in reasons), reasons)
         self.assertEqual(self.state()["counters"], {"total": 1, "good": 0, "bad": 1})
 
-    # 3b. MES: the user's explicit choice path
     def test_partial_station_with_allow_flag_posts_the_bad_part_once(self) -> None:
         self.one_camera(allow_partial=True)
         self.assertTrue(self.app.mes_enabled)
@@ -322,17 +296,16 @@ class OneCameraPocE2E(_Harness):
         self.assertEqual(post["fields"]["verdict"], "BAD")
         self.assertEqual(post["fields"]["visionSessionId"], session_id)
         self.assertEqual(json.loads(post["fields"]["checklistResults"]), {"CR-1": "fail", "CR-2": "pass"})
-        self.assertEqual(list(post["files"]), ["defectPhoto_CR-1"])  # exactly one defect photo
+        self.assertEqual(list(post["files"]), ["defectPhoto_CR-1"])
         filename, data = post["files"]["defectPhoto_CR-1"]
         self.assertEqual(filename, "C1_TOP.png")
-        self.assertEqual(data, image_bytes(0, blob=True))  # the TOP frame of the BAD part
+        self.assertEqual(data, image_bytes(0, blob=True))
         self.assertTrue(self.events("mes_partial_allowed"))
 
     def ack(self) -> None:
         status, body, _ = self.ui.req("POST", "/api/ack", token=self.op)
         self.assertEqual((status, body), (200, {"ok": True}))
 
-    # 5. Banner data and the served page
     def test_snapshot_and_page_carry_the_proof_of_concept_banner(self) -> None:
         self.one_camera(allow_partial=False)
         st = self.state()
@@ -344,16 +317,14 @@ class OneCameraPocE2E(_Harness):
         status, body = self.raw_get("/")
         self.assertEqual(status, 200)
         self.assertIn(b"PROOF OF CONCEPT", body)
-        self.assertIn(b'"keydown"', body)  # the Enter key handler
+        self.assertIn(b'"keydown"', body)
         self.assertIn(b'"Enter"', body)
 
 
-# ------------------------------------------------------------ four cameras
 
 @unittest.skipIf(np is None, "numpy not installed")
 class FourCameraDefaultE2E(_Harness):
 
-    # 4. The 4-camera default is untouched
     def test_four_camera_default_is_not_partial_and_posts_with_a_token(self) -> None:
         def frame_bytes(cam: str, side: Side, n: int) -> bytes:
             return f"SCORE:0.05 |{cam}|{side.value}|{n}".encode("ascii")
@@ -383,14 +354,11 @@ class FourCameraDefaultE2E(_Harness):
         self.assertEqual(self.mes.requests[0]["key"], session_id)
 
 
-# ------------------------------------------------------------ live view
 
 @unittest.skipIf(np is None, "numpy not installed")
 class OneCameraLiveViewE2E(_Harness):
-    """GET /api/preview: a read-only live view that never changes the station."""
 
     def preview_get(self, camera: str, token: str | None):
-        """Return (status, headers with lower-case names, body) for one live-view request."""
         conn = http.client.HTTPConnection(self.ui.host, self.ui.port, timeout=10)
         try:
             headers = {"Cookie": f"station_session={token}"} if token else {}
@@ -423,14 +391,14 @@ class OneCameraLiveViewE2E(_Harness):
         self.assertEqual(status, 400)
 
     def test_preview_of_a_camera_this_station_does_not_have_is_204(self) -> None:
-        self.one_camera(allow_partial=False)  # C1 only
+        self.one_camera(allow_partial=False)
         status, _, body = self.preview_get("C2", self.op)
         self.assertEqual((status, body), (204, b""))
 
     def test_previews_change_no_state_counters_or_events(self) -> None:
         self.one_camera(allow_partial=False)
         self.clock.now += 1.0
-        status, body, _ = self.ui.req("POST", "/api/press", token=self.op)  # TOP taken: WAIT_FLIP
+        status, body, _ = self.ui.req("POST", "/api/press", token=self.op)
         self.assertEqual((status, body), (200, {"accepted": True}))
         state_before = self.state()
         events_before = self.event_count()

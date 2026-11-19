@@ -1,33 +1,3 @@
-"""PatchCore-style anomaly detection trained on GOOD parts only.
-
-PatchCoreBuilder collects patch feature vectors from good images for each
-(camera_id, side), keeps a greedy k-center coreset as the memory bank, and
-calibrates a norm_ref from held-out good images (or from training residuals
-when no held-out images are given). A new image scores by its worst patch's
-distance to the bank, divided by norm_ref and clipped to 0..1.
-
-Incremental updates: training pictures are deleted after each weekly run, so
-PatchCoreBuilder.from_model(previous_model, ...) starts from the saved memory
-bank and the retained held-out features of the previous model. Only the NEW
-pictures are added. The coreset is then re-run over (old bank rows + new rows).
-Re-running the coreset on an existing coreset is a design choice that bounds
-memory; the coreset picks among old and new rows together (old rows can be
-dropped), and the size allowance is old rows + coreset_ratio x new patches,
-capped by max_bank. Held-out features are kept
-per key (newest max_holdout_images) so norm_ref is recalibrated from ALL
-retained held-out images against the new bank.
-
-Engineering settings, NOT quality thresholds: coreset_ratio (default 0.1),
-max_bank (100000), seed (0), norm_factor (2.0; a held-out good image scores
-about 1/norm_factor), max_holdout_images (20), the 0.5 region cut-off, the 10 %
-residual sample, and the 128-dimension random projection used by the coreset.
-The real t_low and t_img come from labelled scores via tools/thresholds.py and
-are approved by Quality.
-
-numpy is imported lazily inside functions. No torch here: the torch feature
-extractor and torch backend live in station/features_torch.py. cv2 is imported
-lazily by cv2_rgb_decoder. Standard library otherwise.
-"""
 from __future__ import annotations
 
 import importlib
@@ -41,29 +11,25 @@ from typing import Any, Callable, Mapping, Optional, Protocol
 from station.contracts import Defect, Frame, ImageResult, Side, StationError
 
 SCHEMA = "patchcore-v2"
-SCHEMA_V1 = "patchcore-v1"  # written before incremental updates: loads for scoring, cannot be updated
+SCHEMA_V1 = "patchcore-v1"
 DEFECT_CLASS = "anomaly"
 DEFAULT_CORESET_RATIO = 0.1
 DEFAULT_MAX_BANK = 100_000
 DEFAULT_SEED = 0
 DEFAULT_NORM_FACTOR = 2.0
-DEFAULT_MAX_HOLDOUT = 20  # held-out GOOD images kept per key for recalibration
+DEFAULT_MAX_HOLDOUT = 20
 PROJECTION_DIM = 128
-REGION_CUTOFF_FRACTION = 0.5  # cells >= 0.5 * raw form the defect region
-RESIDUAL_SAMPLE_FRACTION = 0.1  # share of training images scored for norm_ref without holdout
-CHUNK_BYTES = 256 * 1024 * 1024  # largest distance block held at once
-_MIN_NORM_REF = 1e-9  # divide-by-zero guard only, not a quality limit
-_NPZ_DATE = (1980, 1, 1, 0, 0, 0)  # fixed zip timestamp so saves are byte-deterministic
+REGION_CUTOFF_FRACTION = 0.5
+RESIDUAL_SAMPLE_FRACTION = 0.1
+CHUNK_BYTES = 256 * 1024 * 1024
+_MIN_NORM_REF = 1e-9
+_NPZ_DATE = (1980, 1, 1, 0, 0, 0)
 
 Key = tuple[str, str]
 Decode = Callable[[Frame], Any]
 
 
 class FeatureExtractor(Protocol):
-    """name: identifies the extractor in saved models. stride: input pixels per
-    feature cell (informational; box mapping uses original/feature shape ratios).
-    input_hw: the (h, w) the extractor resizes to. extract: one decoded image
-    (2D grey or 3D RGB, RGB channel order) -> float32 (H', W', C)."""
 
     name: str
     stride: int
@@ -74,12 +40,12 @@ class FeatureExtractor(Protocol):
 
 class Backend(Protocol):
     def nn_distance(self, queries: Any, bank: Any) -> Any:
-        """(N, C) queries, (M, C) bank -> (N,) float32 Euclidean distance to the nearest bank row."""
+        pass
 
 
 def _np() -> Any:
     try:
-        import numpy  # noqa: PLC0415 - imported lazily on purpose
+        import numpy
     except ImportError as exc:
         raise StationError("numpy is required for the PatchCore anomaly model; install numpy") from exc
     return numpy
@@ -118,11 +84,6 @@ def _input_hw_of(extractor: Any) -> Optional[tuple[int, int]]:
 
 
 class NumpyBackend:
-    """Nearest-neighbour distances in numpy. Distance blocks never exceed max_chunk_bytes.
-
-    Uses ||a-b||^2 = ||a||^2 + ||b||^2 - 2ab on data centred by the bank mean
-    (float32 matmul), so the square root is taken once per query at the end.
-    """
 
     def __init__(self, max_chunk_bytes: int = CHUNK_BYTES) -> None:
         self.max_chunk_bytes = _positive_int(max_chunk_bytes, "max_chunk_bytes")
@@ -130,7 +91,6 @@ class NumpyBackend:
             raise ValueError("max_chunk_bytes must hold at least one float32")
 
     def block_shape(self, n_queries: int, bank_rows: int) -> tuple[int, int]:
-        """(query rows, bank rows) per block so that rows * cols * 4 <= max_chunk_bytes."""
         max_elems = self.max_chunk_bytes // 4
         rows = min(max(1, n_queries), max(1, max_elems // max(1, bank_rows)))
         cols = min(max(1, bank_rows), max(1, max_elems // rows))
@@ -176,14 +136,6 @@ def _random_projection(x: Any, rng: Any) -> Any:
 
 
 def greedy_coreset(features: Any, n_select: int, seed: int = DEFAULT_SEED, *, progress: Optional[Callable[[int, int], None]] = None) -> Any:
-    """PatchCore greedy k-center selection on a seeded random projection to 128 dims.
-
-    Returns sorted unique row indices (int64). n_select >= N returns every index.
-    The first pick is seeded; each next pick is the point farthest from the
-    chosen set, so an outlier far from everything is always picked. Cost is
-    O(n_select * N * 128), which is slow for large sets. progress(done, total)
-    is optional.
-    """
     np = _np()
     x = np.asarray(features, dtype=np.float32)
     if x.ndim != 2 or x.shape[0] == 0:
@@ -198,7 +150,7 @@ def greedy_coreset(features: Any, n_select: int, seed: int = DEFAULT_SEED, *, pr
     chosen = np.empty(n_select, dtype=np.int64)
     chosen[0] = start
     min_d = _sq_dist(proj, proj[start])
-    min_d[start] = -1.0  # -1 marks chosen rows; they never win the argmax again
+    min_d[start] = -1.0
     report_every = max(1, n_select // 100)
     for i in range(1, n_select):
         idx = int(np.argmax(min_d))
@@ -218,7 +170,6 @@ def _sq_dist(points: Any, point: Any) -> Any:
 
 
 def _largest_region(mask: Any) -> tuple[Any, Any]:
-    """(ys, xs) index arrays of the largest 4-connected True region (first one wins ties)."""
     np = _np()
     h, w = mask.shape
     seen = np.zeros((h, w), dtype=bool)
@@ -245,7 +196,6 @@ def _largest_region(mask: Any) -> tuple[Any, Any]:
 
 
 def _cell_box(ys: Any, xs: Any, grid: tuple[int, int], shape: tuple[int, int]) -> tuple[int, int, int, int]:
-    """Bounding box of feature cells, scaled to original pixels (x, y, w, h)."""
     h_feat, w_feat = grid
     h_img, w_img = shape
     cx0, cx1 = int(xs.min()), int(xs.max()) + 1
@@ -277,27 +227,17 @@ def _to_grid(value: Any, where: str, error: type[Exception]) -> Any:
 
 @dataclass(frozen=True)
 class PatchCoreKey:
-    bank: Any  # float16 (M, C) memory bank
+    bank: Any
     norm_ref: float
-    norm_ref_source: str  # "holdout" | "training_residual"
-    train_images: int  # images in the build that produced this bank (new images for an update)
-    holdout_images: int  # retained held-out images used for calibration
-    calibration_raw: tuple[float, ...] = ()  # raw image scores used to set norm_ref
-    images_seen: int = 0  # cumulative training images behind the bank (old + new)
-    # Retained held-out GOOD features, oldest first: ((h*w, C) float16, (h, w)) per image.
+    norm_ref_source: str
+    train_images: int
+    holdout_images: int
+    calibration_raw: tuple[float, ...] = ()
+    images_seen: int = 0
     holdout_features: tuple[tuple[Any, tuple[int, int]], ...] = ()
 
 
 class PatchCoreBuilder:
-    """Accumulates good images per (camera_id, side) and builds a PatchCoreModel.
-
-    add() takes a station Frame (decoded with `decode`) or a decoded ndarray with
-    key=(camera_id, side). add_holdout() takes held-out GOOD images used only to
-    calibrate norm_ref; their features are kept (float16, newest max_holdout_images
-    per key) so a later update can recalibrate without the pictures.
-    Every key needs at least 2 training images, unless it is an update of a key
-    that already has a memory bank (then 1 new image is enough).
-    """
 
     def __init__(
         self,
@@ -325,9 +265,9 @@ class PatchCoreBuilder:
         self._max_holdout = _positive_int(max_holdout_images, "max_holdout_images")
         self._train: dict[Key, list[tuple[Any, tuple[int, int]]]] = {}
         self._holdout: dict[Key, list[tuple[Any, tuple[int, int]]]] = {}
-        self._given_holdout: set[Key] = set()  # keys with held-out images added in this call
+        self._given_holdout: set[Key] = set()
         self._dims: dict[Key, int] = {}
-        self._pinned: set[Key] = set()  # keys whose dimension comes from a saved model
+        self._pinned: set[Key] = set()
         self._base: Optional["PatchCoreModel"] = None
 
     @classmethod
@@ -344,11 +284,6 @@ class PatchCoreBuilder:
         norm_factor: float = DEFAULT_NORM_FACTOR,
         max_holdout_images: int = DEFAULT_MAX_HOLDOUT,
     ) -> "PatchCoreBuilder":
-        """Builder pre-seeded with an earlier model's banks and held-out features.
-
-        Checks extractor name, input_hw and feature dimension against the model.
-        add() then appends NEW images; build(version) extends the banks.
-        """
         if not isinstance(model, PatchCoreModel):
             raise StationError("from_model needs a PatchCoreModel")
         if model.legacy:
@@ -419,7 +354,7 @@ class PatchCoreBuilder:
             items = self._holdout.setdefault(k, [])
             items.append((flat.astype(np.float16), grid))
             if len(items) > self._max_holdout:
-                del items[: len(items) - self._max_holdout]  # keep the newest
+                del items[: len(items) - self._max_holdout]
         else:
             self._train.setdefault(k, []).append((flat, grid))
 
@@ -434,7 +369,7 @@ class PatchCoreBuilder:
         keys: dict[Key, PatchCoreKey] = {}
         for k in sorted(set(self._train) | set(base_keys)):
             if k not in self._train:
-                keys[k] = base_keys[k]  # only in the old model: kept unchanged
+                keys[k] = base_keys[k]
                 continue
             keys[k] = self._build_key(k, base_keys.get(k), progress)
         settings = {
@@ -446,7 +381,7 @@ class PatchCoreBuilder:
         }
         clear = getattr(self._backend, "clear", None)
         if callable(clear):
-            clear()  # drop cached bank tensors made while building; scoring re-caches what it needs
+            clear()
         return PatchCoreModel(
             version,
             keys,
@@ -471,7 +406,7 @@ class PatchCoreBuilder:
             n_select = min(self._max_bank, max(1, int(round(self._ratio * feats.shape[0]))))
             images_seen = len(images)
         else:
-            old_rows = np.asarray(old.bank, dtype=np.float32)  # the old bank rows are raw rows here
+            old_rows = np.asarray(old.bank, dtype=np.float32)
             n_new_rows = sum(f.shape[0] for f in new_feats)
             feats = np.concatenate([old_rows] + new_feats, axis=0)
             image_ids = np.concatenate(
@@ -482,7 +417,7 @@ class PatchCoreBuilder:
             images_seen = old.images_seen + len(images)
         chosen = greedy_coreset(feats, n_select, self._seed, progress=progress)
         bank = feats[chosen].astype(np.float16)
-        bank32 = bank.astype(np.float32)  # what predict() will search
+        bank32 = bank.astype(np.float32)
         holdout = self._holdout.get(k, [])
         if holdout:
             raw = [self._image_score(f.astype(np.float32), bank32) for f, _ in holdout]
@@ -490,7 +425,7 @@ class PatchCoreBuilder:
         else:
             ids = image_ids[chosen]
             counts = np.bincount(ids[ids >= 0], minlength=len(images))
-            order = np.lexsort((np.arange(len(images)), counts))  # fewest bank patches first
+            order = np.lexsort((np.arange(len(images)), counts))
             n_res = max(1, int(math.ceil(RESIDUAL_SAMPLE_FRACTION * len(images))))
             raw = [self._image_score(images[int(i)][0], bank32) for i in order[:n_res]]
             value, source = float(np.percentile(raw, 99)), "training_residual"
@@ -514,12 +449,6 @@ class PatchCoreBuilder:
 
 
 class PatchCoreModel:
-    """InferenceModel: score = clip(max patch distance / norm_ref, 0, 1).
-
-    Defect: the largest 4-connected region of anomaly-map cells >= 0.5 * raw,
-    as a box in original pixels, with Defect('anomaly', region peak / norm_ref).
-    No defect when the score is 0. Unknown camera/side -> StationError.
-    """
 
     def __init__(
         self,
@@ -562,14 +491,12 @@ class PatchCoreModel:
 
     @property
     def legacy(self) -> bool:
-        """True for a file saved before incremental updates (scores only, cannot be updated)."""
         return self._legacy
 
     def keys(self) -> list[Key]:
         return sorted(self._keys)
 
     def bank(self, key: Any) -> Any:
-        """float16 (M, C) memory bank for (camera_id, side). Not copied."""
         return self._learned(key[0], key[1])[1].bank
 
     def norm_ref(self, key: Any) -> float:
@@ -620,7 +547,6 @@ class PatchCoreModel:
         )
 
     def anomaly_map(self, frame: Frame) -> Any:
-        """Normalised anomaly map (H', W') float32, 0..1, for heatmap overlays."""
         np = _np()
         key, learned = self._learned(frame.camera_id, frame.side)
         raw_map, _, _ = self._raw_map(self._decode(frame), key, learned)
@@ -775,7 +701,6 @@ def _read_meta(data: Any) -> dict[str, Any]:
 
 
 def _write_npz(np: Any, path: Any, arrays: Mapping[str, Any]) -> None:
-    """Write an .npz with a fixed zip timestamp, so identical models give identical bytes."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as archive:
         for name in sorted(arrays):
@@ -792,15 +717,9 @@ def _write_npz(np: Any, path: Any, arrays: Mapping[str, Any]) -> None:
 
 
 def cv2_rgb_decoder(cv2_module: Any = None) -> Decode:
-    """Decoder for encoded image bytes in Frame.data (JPEG/PNG/BMP), returning RGB uint8 (H, W, 3).
-
-    cv2.imdecode returns BGR; this converts to RGB, which is the channel order
-    the feature extractors expect. cv2 is imported lazily; a missing install is
-    a StationError. A payload cv2 cannot decode is a StationError.
-    """
     if cv2_module is None:
         try:
-            import cv2 as imported  # noqa: PLC0415 - imported lazily on purpose
+            import cv2 as imported
         except ImportError as exc:
             raise StationError("opencv (cv2) is required to decode camera images; install opencv-python") from exc
         cv2_module = imported
@@ -817,16 +736,8 @@ def cv2_rgb_decoder(cv2_module: Any = None) -> Decode:
 
 
 def register_patchcore_loader(extractor_factory: Callable[[], Any]) -> Callable[..., PatchCoreModel]:
-    """Return a loader(info_or_path, decode, backend=None) for saved PatchCore models.
-
-    Call this from the application. It imports station.modelstore only at call
-    time, and registers the loader with modelstore.register_loader('patchcore', ...)
-    when that module and function exist. Otherwise the loader is returned
-    unregistered. The extractor is built by extractor_factory() at load time.
-    """
 
     def loader(source: Any, decode: Decode, backend: Any = None) -> PatchCoreModel:
-        # modelstore passes a ModelInfo; direct callers may pass the model path itself.
         path = getattr(source, "path", source)
         return PatchCoreModel.load(path, decode, extractor_factory(), backend=backend)
 
